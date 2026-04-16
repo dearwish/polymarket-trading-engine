@@ -21,7 +21,9 @@ def test_execution_engine_skips_non_approved_trade() -> None:
 
 
 def test_execution_engine_executes_paper_trade() -> None:
-    engine = ExecutionEngine(ExecutionMode.PAPER)
+    from polymarket_ai_agent.types import OrderBookSnapshot
+
+    engine = ExecutionEngine(ExecutionMode.PAPER, paper_entry_slippage_bps=10)
     decision = TradeDecision(
         market_id="123",
         status=DecisionStatus.APPROVED,
@@ -31,9 +33,18 @@ def test_execution_engine_executes_paper_trade() -> None:
         rationale=["trade"],
         rejected_by=[],
     )
-    result = engine.execute_trade(decision)
+    orderbook = OrderBookSnapshot(
+        bid=0.51,
+        ask=0.52,
+        midpoint=0.515,
+        spread=0.01,
+        depth_usd=500.0,
+        last_trade_price=0.515,
+    )
+    result = engine.execute_trade(decision, orderbook)
     assert result.success
     assert result.status == "FILLED_PAPER"
+    assert result.fill_price > 0.52
 
 
 def test_execution_engine_blocks_live_trade_in_scaffold() -> None:

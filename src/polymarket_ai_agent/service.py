@@ -31,7 +31,10 @@ class AgentService:
         self.research = ResearchEngine()
         self.scoring = ScoringEngine(settings)
         self.risk = RiskEngine(settings)
-        self.execution = ExecutionEngine(ExecutionMode(settings.trading_mode))
+        self.execution = ExecutionEngine(
+            ExecutionMode(settings.trading_mode),
+            paper_entry_slippage_bps=settings.paper_entry_slippage_bps,
+        )
         self.journal = Journal(settings.db_path, settings.events_path)
         self.portfolio = PortfolioEngine(settings.db_path, settings.paper_starting_balance_usd)
 
@@ -83,7 +86,7 @@ class AgentService:
         account_state = self.portfolio.get_account_state(ExecutionMode.PAPER)
         decision = self.risk.decide_trade(snapshot, assessment, account_state)
         self.journal.log_event("trade_decision", decision)
-        result = self.execution.execute_trade(decision)
+        result = self.execution.execute_trade(decision, snapshot.orderbook)
         self.portfolio.record_execution(decision, result)
         self.journal.log_event("execution_result", result)
         return snapshot, assessment, decision, result
@@ -110,9 +113,14 @@ class AgentService:
         due_positions = self.portfolio.positions_due_for_close(self.settings.paper_position_ttl_seconds)
         for position in due_positions:
             snapshot = self.build_market_snapshot(position.market_id)
+            exit_price = self.portfolio.estimate_exit_price(
+                position,
+                snapshot.orderbook,
+                self.settings.paper_exit_slippage_bps,
+            )
             action = self.portfolio.close_position(
                 position.market_id,
-                exit_price=snapshot.orderbook.midpoint,
+                exit_price=exit_price,
                 reason="ttl_expired",
             )
             self.journal.log_event("position_action", action)
@@ -126,9 +134,14 @@ class AgentService:
             self.journal.log_event("position_action", action)
             return action
         snapshot = self.build_market_snapshot(market_id)
+        exit_price = self.portfolio.estimate_exit_price(
+            existing,
+            snapshot.orderbook,
+            self.settings.paper_exit_slippage_bps,
+        )
         action = self.portfolio.close_position(
             market_id,
-            exit_price=snapshot.orderbook.midpoint,
+            exit_price=exit_price,
             reason=reason,
         )
         self.journal.log_event("position_action", action)

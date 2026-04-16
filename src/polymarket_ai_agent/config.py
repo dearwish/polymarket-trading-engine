@@ -39,6 +39,8 @@ class Settings(BaseSettings):
     max_rejected_orders: int = 3
     paper_starting_balance_usd: float = 100.0
     paper_position_ttl_seconds: int = 60
+    paper_entry_slippage_bps: float = 10.0
+    paper_exit_slippage_bps: float = 10.0
 
     data_dir: Path = Field(default=Path("data"))
     log_dir: Path = Field(default=Path("logs"))

@@ -41,6 +41,7 @@ class PortfolioEngine:
     def record_execution(self, decision: TradeDecision, result: ExecutionResult) -> None:
         if not result.success or result.status != "FILLED_PAPER":
             return
+        entry_price = result.fill_price if result.fill_price > 0 else decision.limit_price
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
                 """
@@ -53,7 +54,7 @@ class PortfolioEngine:
                     decision.market_id,
                     decision.side.value,
                     decision.size_usd,
-                    decision.limit_price,
+                    entry_price,
                     result.order_id,
                     result.executed_at.isoformat(),
                     "OPEN",
@@ -143,6 +144,15 @@ class PortfolioEngine:
                 "select coalesce(sum(realized_pnl), 0.0) from positions where status = 'CLOSED'"
             ).fetchone()
         return float(row[0] or 0.0)
+
+    @staticmethod
+    def estimate_exit_price(position: PositionRecord, orderbook, exit_slippage_bps: float) -> float:
+        if position.side == SuggestedSide.YES:
+            reference = orderbook.bid
+        else:
+            reference = max(0.01, 1 - orderbook.ask)
+        slippage = reference * (exit_slippage_bps / 10_000)
+        return round(max(0.01, min(0.99, reference - slippage)), 6)
 
     @staticmethod
     def _compute_pnl(position: PositionRecord, exit_price: float) -> float:

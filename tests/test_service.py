@@ -6,6 +6,7 @@ from polymarket_ai_agent.types import (
     DecisionStatus,
     ExecutionMode,
     ExecutionResult,
+    SuggestedSide,
     TradeDecision,
 )
 
@@ -49,13 +50,14 @@ def test_agent_service_paper_trade(settings, market_snapshot, market_assessment)
         rationale=["approved"],
         rejected_by=[],
     )
-    service.execution.execute_trade = lambda decision: ExecutionResult(
+    service.execution.execute_trade = lambda decision, orderbook: ExecutionResult(
         market_id="123",
         success=True,
         mode=ExecutionMode.PAPER,
         order_id="paper-order-1",
         status="FILLED_PAPER",
         detail="ok",
+        fill_price=0.53,
     )
     service.portfolio.record_execution = lambda decision, result: recorded.__setitem__("called", True)
     _, _, decision, result = service.paper_trade("123")
@@ -76,6 +78,7 @@ def test_agent_service_manage_open_positions(settings, market_snapshot) -> None:
 
     class StubPosition:
         market_id = "123"
+        side = SuggestedSide.YES
 
     service.portfolio.positions_due_for_close = lambda ttl_seconds: [StubPosition()]
     service.build_market_snapshot = lambda market_id: market_snapshot
@@ -97,7 +100,7 @@ def test_agent_service_manage_open_positions(settings, market_snapshot) -> None:
 
 def test_agent_service_close_position(settings, market_snapshot) -> None:
     service = AgentService(settings)
-    service.portfolio.get_open_position = lambda market_id: object()
+    service.portfolio.get_open_position = lambda market_id: type("Position", (), {"side": SuggestedSide.YES})()
     service.build_market_snapshot = lambda market_id: market_snapshot
     seen = {}
 

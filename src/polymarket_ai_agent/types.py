@@ -124,6 +124,7 @@ class ExecutionResult:
     order_id: str
     status: str
     detail: str
+    fill_price: float = 0.0
     executed_at: datetime = field(default_factory=utc_now)
 
 
