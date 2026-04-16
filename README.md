@@ -97,9 +97,9 @@ The first version is intentionally narrow:
 
 ## Files
 
-- [`PLAN.md`](/Users/davidro/playground/polymarket-ai-agent/PLAN.md)
-- [`docs/DEPLOYMENT.md`](/Users/davidro/playground/polymarket-ai-agent/docs/DEPLOYMENT.md)
-- [`.gitignore`](/Users/davidro/playground/polymarket-ai-agent/.gitignore)
+- [`PLAN.md`](./PLAN.md)
+- [`docs/DEPLOYMENT.md`](./docs/DEPLOYMENT.md)
+- [`.gitignore`](./.gitignore)
 
 ## Deployment Recommendation
 
