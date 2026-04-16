@@ -26,17 +26,40 @@ class PortfolioEngine:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
-    def get_account_state(self, mode: ExecutionMode) -> AccountState:
+    def get_account_state(self, mode: ExecutionMode, now: datetime | None = None) -> AccountState:
         open_positions = self.list_open_positions()
-        realized_pnl = self._get_realized_pnl()
+        realized_pnl = self.get_total_realized_pnl()
+        daily_realized_pnl = self.get_daily_realized_pnl(now=now)
         reserved = sum(position.size_usd for position in open_positions)
         return AccountState(
             mode=mode,
             available_usd=self.starting_balance_usd + realized_pnl - reserved,
             open_positions=len(open_positions),
-            daily_realized_pnl=realized_pnl,
+            daily_realized_pnl=daily_realized_pnl,
             rejected_orders=0,
         )
+
+    def get_total_realized_pnl(self) -> float:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "select coalesce(sum(realized_pnl), 0.0) from positions where status = 'CLOSED'"
+            ).fetchone()
+        return float(row[0] or 0.0)
+
+    def get_daily_realized_pnl(self, now: datetime | None = None) -> float:
+        current = now or _utc_now()
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                """
+                select coalesce(sum(realized_pnl), 0.0)
+                from positions
+                where status = 'CLOSED'
+                  and closed_at is not null
+                  and substr(closed_at, 1, 10) = ?
+                """,
+                (current.date().isoformat(),),
+            ).fetchone()
+        return float(row[0] or 0.0)
 
     def record_execution(self, decision: TradeDecision, result: ExecutionResult) -> None:
         if not result.success or result.status != "FILLED_PAPER":
@@ -137,13 +160,6 @@ class PortfolioEngine:
                 (market_id,),
             ).fetchone()
         return self._row_to_position(row) if row else None
-
-    def _get_realized_pnl(self) -> float:
-        with sqlite3.connect(self.db_path) as conn:
-            row = conn.execute(
-                "select coalesce(sum(realized_pnl), 0.0) from positions where status = 'CLOSED'"
-            ).fetchone()
-        return float(row[0] or 0.0)
 
     @staticmethod
     def estimate_exit_price(position: PositionRecord, orderbook, exit_slippage_bps: float) -> float:

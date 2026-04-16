@@ -197,6 +197,7 @@ class AgentService:
 
     def status(self) -> dict:
         auth_status = self.polymarket.get_auth_status()
+        account_state = self.portfolio.get_account_state(ExecutionMode(self.settings.trading_mode))
         return {
             "trading_mode": self.settings.trading_mode,
             "market_family": self.settings.market_family,
@@ -204,7 +205,10 @@ class AgentService:
             "openrouter_configured": bool(self.settings.openrouter_api_key),
             "db_path": str(self.settings.db_path),
             "events_path": str(self.settings.events_path),
-            "open_positions": len(self.portfolio.list_open_positions()),
+            "open_positions": account_state.open_positions,
+            "available_usd": account_state.available_usd,
+            "daily_realized_pnl": account_state.daily_realized_pnl,
+            "daily_loss_limit_reached": account_state.daily_realized_pnl <= -self.settings.max_daily_loss_usd,
             "paper_position_ttl_seconds": self.settings.paper_position_ttl_seconds,
             "auth": {
                 "private_key_configured": auth_status.private_key_configured,

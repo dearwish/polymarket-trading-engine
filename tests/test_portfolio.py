@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from datetime import timedelta
 
 from polymarket_ai_agent.engine.portfolio import PortfolioEngine
@@ -106,3 +107,35 @@ def test_portfolio_estimates_exit_price_for_yes(settings) -> None:
     position = PositionRecord(market_id="123", side=SuggestedSide.YES, size_usd=10.0, entry_price=0.50)
     price = PortfolioEngine.estimate_exit_price(position, orderbook, exit_slippage_bps=10)
     assert price < 0.60
+
+
+def test_portfolio_daily_realized_pnl_ignores_previous_days(settings) -> None:
+    engine = PortfolioEngine(settings.db_path, settings.paper_starting_balance_usd)
+    opened_at = utc_now() - timedelta(days=1, minutes=5)
+    closed_at = utc_now() - timedelta(days=1)
+    with sqlite3.connect(settings.db_path) as conn:
+        conn.execute(
+            """
+            insert into positions(
+                market_id, side, size_usd, entry_price, order_id, opened_at, status,
+                close_reason, closed_at, exit_price, realized_pnl
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "old-1",
+                SuggestedSide.YES.value,
+                10.0,
+                0.50,
+                "paper-old",
+                opened_at.isoformat(),
+                "CLOSED",
+                "ttl_expired",
+                closed_at.isoformat(),
+                0.40,
+                -2.0,
+            ),
+        )
+        conn.commit()
+    account_state = engine.get_account_state(ExecutionMode.PAPER)
+    assert account_state.daily_realized_pnl == 0.0
+    assert engine.get_total_realized_pnl() == -2.0

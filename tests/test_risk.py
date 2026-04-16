@@ -80,3 +80,12 @@ def test_risk_rejects_low_confidence() -> None:
     risk = engine.evaluate(build_snapshot(), build_assessment(confidence=0.5), state)
     assert not risk.approved
     assert "confidence_limit" in risk.rejected_by
+
+
+def test_risk_rejects_daily_loss_limit() -> None:
+    settings = Settings(max_daily_loss_usd=5.0)
+    engine = RiskEngine(settings)
+    state = AccountState(mode=ExecutionMode.PAPER, available_usd=100.0, open_positions=0, daily_realized_pnl=-5.0)
+    risk = engine.evaluate(build_snapshot(), build_assessment(), state)
+    assert not risk.approved
+    assert "daily_loss_limit" in risk.rejected_by
