@@ -16,6 +16,33 @@ This repository currently contains:
 
 The actual trading engine implementation is intentionally not included yet. The next step is to review this repo structure and plan, then approve iteration on the codebase.
 
+## Implemented In This Iteration
+
+The repository now includes the first code implementation slice:
+
+- Python package scaffold under `src/polymarket_ai_agent`
+- operator CLI via `polymarket-ai-agent`
+- settings/config loading from `.env`
+- Polymarket market discovery and order book snapshot connector
+- external BTC price feed connector
+- research, scoring, risk, execution, and journaling engines
+- paper-first execution path
+- SQLite and JSONL logging
+- initial unit tests for risk gating
+
+This is still not a live trading bot. The live execution path remains intentionally disabled in the scaffold while the paper path and interfaces are hardened.
+
+## Quick Start
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+cp .env.example .env
+polymarket-ai-agent status
+polymarket-ai-agent scan --limit 5
+```
+
 ## Planned Architecture
 
 - `connectors/polymarket`
@@ -70,9 +97,9 @@ The first version is intentionally narrow:
 
 ## Files
 
-- [`PLAN.md`](/Users/davidro/Documents/New%20project/PLAN.md)
-- [`docs/DEPLOYMENT.md`](/Users/davidro/Documents/New%20project/docs/DEPLOYMENT.md)
-- [`.gitignore`](/Users/davidro/Documents/New%20project/.gitignore)
+- [`PLAN.md`](/Users/davidro/playground/polymarket-ai-agent/PLAN.md)
+- [`docs/DEPLOYMENT.md`](/Users/davidro/playground/polymarket-ai-agent/docs/DEPLOYMENT.md)
+- [`.gitignore`](/Users/davidro/playground/polymarket-ai-agent/.gitignore)
 
 ## Deployment Recommendation
 

@@ -1,0 +1,2 @@
+"""Polymarket AI agent package."""
+
