@@ -110,6 +110,7 @@ class AgentService:
         return report
 
     def status(self) -> dict:
+        auth_status = self.polymarket.get_auth_status()
         return {
             "trading_mode": self.settings.trading_mode,
             "market_family": self.settings.market_family,
@@ -119,4 +120,11 @@ class AgentService:
             "events_path": str(self.settings.events_path),
             "open_positions": len(self.portfolio.list_open_positions()),
             "paper_position_ttl_seconds": self.settings.paper_position_ttl_seconds,
+            "auth": {
+                "private_key_configured": auth_status.private_key_configured,
+                "funder_configured": auth_status.funder_configured,
+                "signature_type": auth_status.signature_type,
+                "live_client_constructible": auth_status.live_client_constructible,
+                "missing": auth_status.missing,
+            },
         }

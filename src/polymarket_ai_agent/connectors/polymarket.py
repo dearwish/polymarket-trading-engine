@@ -5,9 +5,10 @@ from datetime import datetime, timezone
 from typing import Any
 
 import httpx
+from py_clob_client.client import ClobClient
 
 from polymarket_ai_agent.config import Settings
-from polymarket_ai_agent.types import MarketCandidate, OrderBookSnapshot
+from polymarket_ai_agent.types import AuthStatus, MarketCandidate, OrderBookSnapshot
 
 
 class PolymarketConnector:
@@ -59,6 +60,35 @@ class PolymarketConnector:
             spread=spread,
             depth_usd=bid_depth + ask_depth,
             last_trade_price=midpoint,
+        )
+
+    def get_auth_status(self) -> AuthStatus:
+        private_key = self.settings.polymarket_private_key.strip()
+        funder = self.settings.polymarket_funder.strip()
+        missing: list[str] = []
+        if not private_key:
+            missing.append("polymarket_private_key")
+        if self.settings.polymarket_signature_type in {1, 2} and not funder:
+            missing.append("polymarket_funder")
+        return AuthStatus(
+            private_key_configured=bool(private_key),
+            funder_configured=bool(funder),
+            signature_type=self.settings.polymarket_signature_type,
+            live_client_constructible=not missing,
+            missing=missing,
+        )
+
+    def build_live_client(self) -> ClobClient:
+        status = self.get_auth_status()
+        if not status.live_client_constructible:
+            raise ValueError(f"Missing live auth settings: {', '.join(status.missing)}")
+        funder = self.settings.polymarket_funder.strip() or None
+        return ClobClient(
+            self.settings.polymarket_host,
+            key=self.settings.polymarket_private_key.strip(),
+            chain_id=self.settings.polymarket_chain_id,
+            signature_type=self.settings.polymarket_signature_type,
+            funder=funder,
         )
 
     def estimate_seconds_to_expiry(self, end_date_iso: str) -> int:

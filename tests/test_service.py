@@ -16,6 +16,7 @@ def test_agent_service_status(settings) -> None:
     assert status["trading_mode"] == settings.trading_mode
     assert status["market_family"] == settings.market_family
     assert "open_positions" in status
+    assert "auth" in status
 
 
 def test_agent_service_discover_markets_logs(settings, market_candidate) -> None:

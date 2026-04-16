@@ -120,3 +120,25 @@ def test_polymarket_connector_estimates_seconds_to_expiry(settings) -> None:
     end_date = (datetime.now(timezone.utc) + timedelta(seconds=90)).isoformat()
     seconds = connector.estimate_seconds_to_expiry(end_date)
     assert 0 < seconds <= 90
+
+
+def test_polymarket_connector_reports_missing_live_auth(settings) -> None:
+    connector = PolymarketConnector(settings, client=DummyClient([]))
+    auth = connector.get_auth_status()
+    assert not auth.live_client_constructible
+    assert "polymarket_private_key" in auth.missing
+
+
+def test_polymarket_connector_reports_constructible_live_auth(settings) -> None:
+    configured = settings.model_copy(
+        update={
+            "polymarket_private_key": "0x" + "1" * 64,
+            "polymarket_signature_type": 1,
+            "polymarket_funder": "0x" + "2" * 40,
+        }
+    )
+    connector = PolymarketConnector(configured, client=DummyClient([]))
+    auth = connector.get_auth_status()
+    assert auth.live_client_constructible
+    client = connector.build_live_client()
+    assert client is not None

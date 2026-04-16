@@ -157,6 +157,15 @@ class RiskState:
 
 
 @dataclass(slots=True)
+class AuthStatus:
+    private_key_configured: bool
+    funder_configured: bool
+    signature_type: int
+    live_client_constructible: bool
+    missing: list[str]
+
+
+@dataclass(slots=True)
 class Report:
     session_id: str
     generated_at: datetime
