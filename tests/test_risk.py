@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 from polymarket_ai_agent.config import Settings
 from polymarket_ai_agent.engine.risk import RiskEngine
 from polymarket_ai_agent.types import (
@@ -8,10 +10,17 @@ from polymarket_ai_agent.types import (
     MarketSnapshot,
     OrderBookSnapshot,
     SuggestedSide,
+    utc_now,
 )
 
 
-def build_snapshot(spread: float = 0.01, depth: float = 500.0, seconds_to_expiry: int = 120) -> MarketSnapshot:
+def build_snapshot(
+    spread: float = 0.01,
+    depth: float = 500.0,
+    seconds_to_expiry: int = 120,
+    observed_age_seconds: int = 0,
+    collected_age_seconds: int = 0,
+) -> MarketSnapshot:
     candidate = MarketCandidate(
         market_id="1",
         question="Will BTC be up in 5 minutes?",
@@ -33,11 +42,13 @@ def build_snapshot(spread: float = 0.01, depth: float = 500.0, seconds_to_expiry
             spread=spread,
             depth_usd=depth,
             last_trade_price=0.515,
+            observed_at=utc_now() - timedelta(seconds=observed_age_seconds),
         ),
         seconds_to_expiry=seconds_to_expiry,
         recent_price_change_bps=10.0,
         recent_trade_count=5,
         external_price=100000.0,
+        collected_at=utc_now() - timedelta(seconds=collected_age_seconds),
     )
 
 
@@ -89,3 +100,16 @@ def test_risk_rejects_daily_loss_limit() -> None:
     risk = engine.evaluate(build_snapshot(), build_assessment(), state)
     assert not risk.approved
     assert "daily_loss_limit" in risk.rejected_by
+
+
+def test_risk_rejects_stale_data() -> None:
+    settings = Settings(stale_data_seconds=30)
+    engine = RiskEngine(settings)
+    state = AccountState(mode=ExecutionMode.PAPER, available_usd=100.0, open_positions=0, daily_realized_pnl=0.0)
+    risk = engine.evaluate(
+        build_snapshot(observed_age_seconds=45, collected_age_seconds=45),
+        build_assessment(),
+        state,
+    )
+    assert not risk.approved
+    assert "stale_data" in risk.rejected_by

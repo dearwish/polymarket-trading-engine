@@ -9,6 +9,7 @@ from polymarket_ai_agent.types import (
     RiskState,
     SuggestedSide,
     TradeDecision,
+    utc_now,
 )
 
 
@@ -62,10 +63,17 @@ class RiskEngine:
         account_state: AccountState,
     ) -> RiskState:
         rejected_by: list[str] = []
+        now = utc_now()
         if account_state.daily_realized_pnl <= -self.settings.max_daily_loss_usd:
             rejected_by.append("daily_loss_limit")
         if account_state.rejected_orders >= self.settings.max_rejected_orders:
             rejected_by.append("rejected_order_limit")
+        snapshot_age = max(
+            (now - snapshot.collected_at).total_seconds(),
+            (now - snapshot.orderbook.observed_at).total_seconds(),
+        )
+        if snapshot_age > self.settings.stale_data_seconds:
+            rejected_by.append("stale_data")
         if snapshot.orderbook.spread > self.settings.max_spread:
             rejected_by.append("spread_limit")
         if snapshot.orderbook.depth_usd < self.settings.min_depth_usd:
