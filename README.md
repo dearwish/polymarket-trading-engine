@@ -43,6 +43,18 @@ polymarket-ai-agent status
 polymarket-ai-agent scan --limit 5
 ```
 
+## Makefile Shortcuts
+
+```bash
+make bootstrap
+make test
+make status
+make auth-check
+make simulate-active
+make simulate-market MARKET_ID=123
+make simulate-loop-active ITERATIONS=3 INTERVAL=0
+```
+
 ## Planned Architecture
 
 - `connectors/polymarket`
