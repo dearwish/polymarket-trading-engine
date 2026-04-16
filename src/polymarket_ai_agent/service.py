@@ -214,19 +214,12 @@ class AgentService:
             "safety_stop_reason": safety_stop_reason,
             "paper_position_ttl_seconds": self.settings.paper_position_ttl_seconds,
             "auth": {
-                "private_key_configured": auth_status.private_key_configured,
-                "funder_configured": auth_status.funder_configured,
-                "signature_type": auth_status.signature_type,
-                "live_client_constructible": auth_status.live_client_constructible,
-                "missing": auth_status.missing,
-                "wallet_address": auth_status.wallet_address,
-                "api_credentials_derived": auth_status.api_credentials_derived,
-                "server_ok": auth_status.server_ok,
-                "readonly_ready": auth_status.readonly_ready,
-                "probe_attempted": auth_status.probe_attempted,
-                "errors": auth_status.errors,
+                **self._auth_status_dict(auth_status),
             },
         }
+
+    def auth_status(self) -> dict:
+        return self._auth_status_dict(self.polymarket.probe_live_readiness())
 
     def safety_stop_reason(self, account_state: AccountState | None = None) -> str | None:
         state = account_state or self.portfolio.get_account_state(ExecutionMode(self.settings.trading_mode))
@@ -235,3 +228,19 @@ class AgentService:
         if state.rejected_orders >= self.settings.max_rejected_orders:
             return "rejected_order_limit"
         return None
+
+    @staticmethod
+    def _auth_status_dict(auth_status) -> dict:
+        return {
+            "private_key_configured": auth_status.private_key_configured,
+            "funder_configured": auth_status.funder_configured,
+            "signature_type": auth_status.signature_type,
+            "live_client_constructible": auth_status.live_client_constructible,
+            "missing": auth_status.missing,
+            "wallet_address": auth_status.wallet_address,
+            "api_credentials_derived": auth_status.api_credentials_derived,
+            "server_ok": auth_status.server_ok,
+            "readonly_ready": auth_status.readonly_ready,
+            "probe_attempted": auth_status.probe_attempted,
+            "errors": auth_status.errors,
+        }

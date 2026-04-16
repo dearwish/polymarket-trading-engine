@@ -69,6 +69,9 @@ class StubService:
     def status(self):
         return {"trading_mode": "paper", "open_positions": 0}
 
+    def auth_status(self):
+        return {"live_client_constructible": False, "readonly_ready": False}
+
     def safety_stop_reason(self):
         return None
 
@@ -119,6 +122,13 @@ def test_cli_status(monkeypatch) -> None:
     result = runner.invoke(app, ["status"])
     assert result.exit_code == 0
     assert "trading_mode" in result.stdout
+
+
+def test_cli_auth_check(monkeypatch) -> None:
+    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    result = runner.invoke(app, ["auth-check"])
+    assert result.exit_code == 0
+    assert "readonly_ready" in result.stdout
 
 
 def test_cli_scan(monkeypatch) -> None:

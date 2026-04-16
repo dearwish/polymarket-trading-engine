@@ -134,6 +134,15 @@ def status() -> None:
         _handle_operator_error(exc)
 
 
+@app.command("auth-check")
+def auth_check() -> None:
+    try:
+        service = _service()
+        console.print_json(json.dumps(service.auth_status()))
+    except Exception as exc:
+        _handle_operator_error(exc)
+
+
 @app.command()
 def manage() -> None:
     try:

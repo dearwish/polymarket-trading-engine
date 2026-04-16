@@ -210,3 +210,27 @@ def test_agent_service_status_reports_auth_probe(settings) -> None:
     status = service.status()
     assert status["auth"]["wallet_address"] == "0xabc"
     assert status["auth"]["readonly_ready"] is True
+
+
+def test_agent_service_auth_status(settings) -> None:
+    service = AgentService(settings)
+    service.polymarket.probe_live_readiness = lambda: type(
+        "Auth",
+        (),
+        {
+            "private_key_configured": True,
+            "funder_configured": True,
+            "signature_type": 1,
+            "live_client_constructible": True,
+            "missing": [],
+            "wallet_address": "0xdef",
+            "api_credentials_derived": True,
+            "server_ok": True,
+            "readonly_ready": True,
+            "probe_attempted": True,
+            "errors": [],
+        },
+    )()
+    auth = service.auth_status()
+    assert auth["wallet_address"] == "0xdef"
+    assert auth["readonly_ready"] is True
