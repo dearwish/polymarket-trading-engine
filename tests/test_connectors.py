@@ -37,7 +37,7 @@ def test_polymarket_connector_discovers_btc_market(settings) -> None:
     payload = [
         {
             "id": "123",
-            "question": "Will BTC be above 100,000 in 5 minutes?",
+            "question": "Will Bitcoin be up or down in 5 minutes?",
             "conditionId": "cond-123",
             "slug": "btc-5m",
             "endDate": "2099-01-01T00:00:00Z",
@@ -49,9 +49,9 @@ def test_polymarket_connector_discovers_btc_market(settings) -> None:
         },
         {
             "id": "999",
-            "question": "Will ETH be above 5,000?",
+            "question": "Will BTC be above 120,000 by the end of the month?",
             "conditionId": "cond-999",
-            "slug": "eth",
+            "slug": "btc-monthly",
             "endDate": "2099-01-01T00:00:00Z",
             "clobTokenIds": '["a","b"]',
             "outcomePrices": "[0.5,0.5]",
@@ -62,6 +62,39 @@ def test_polymarket_connector_discovers_btc_market(settings) -> None:
     assert len(markets) == 1
     assert markets[0].market_id == "123"
     assert markets[0].implied_probability == 0.55
+
+
+def test_polymarket_connector_prefers_nearest_active_btc_5m_market(settings) -> None:
+    payload = [
+        {
+            "id": "nearer",
+            "question": "Will Bitcoin be up or down in 5 minutes?",
+            "conditionId": "cond-nearer",
+            "slug": "btc-nearer",
+            "endDate": (datetime.now(timezone.utc) + timedelta(minutes=3)).isoformat(),
+            "clobTokenIds": '["yes-nearer","no-nearer"]',
+            "outcomePrices": "[0.51,0.49]",
+            "liquidityNum": 1000,
+            "volume24hr": 2000,
+            "description": "Resolution text",
+        },
+        {
+            "id": "later",
+            "question": "Will BTC be up or down in 5 minutes?",
+            "conditionId": "cond-later",
+            "slug": "btc-later",
+            "endDate": (datetime.now(timezone.utc) + timedelta(minutes=8)).isoformat(),
+            "clobTokenIds": '["yes-later","no-later"]',
+            "outcomePrices": "[0.52,0.48]",
+            "liquidityNum": 5000,
+            "volume24hr": 9000,
+            "description": "Resolution text",
+        },
+    ]
+    connector = PolymarketConnector(settings, client=DummyClient([payload]))
+    market = connector.discover_active_market()
+    assert market is not None
+    assert market.market_id == "nearer"
 
 
 def test_polymarket_connector_builds_orderbook_snapshot(settings) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -24,7 +25,12 @@ class PolymarketConnector:
         response = self.client.get(f"{self.settings.polymarket_gamma_url}/markets", params=params)
         response.raise_for_status()
         payload = response.json()
-        return [candidate for item in payload if (candidate := self._parse_market(item))]
+        markets = [candidate for item in payload if (candidate := self._parse_market(item))]
+        return self._sort_market_candidates(markets)
+
+    def discover_active_market(self, limit: int = 50) -> MarketCandidate | None:
+        markets = self.discover_markets(limit=limit)
+        return markets[0] if markets else None
 
     def get_market(self, market_id: str) -> MarketCandidate:
         response = self.client.get(f"{self.settings.polymarket_gamma_url}/markets/{market_id}")
@@ -67,7 +73,7 @@ class PolymarketConnector:
         if len(token_ids) < 2:
             return None
         question = item.get("question") or ""
-        if self.settings.market_family == "btc_5m" and "bitcoin" not in question.lower() and "btc" not in question.lower():
+        if self.settings.market_family == "btc_5m" and not self._matches_btc_5m_market(item):
             return None
         yes_price, no_price = self._parse_outcome_prices(item.get("outcomePrices"))
         implied = yes_price if yes_price else 0.5
@@ -84,6 +90,36 @@ class PolymarketConnector:
             volume_24h_usd=float(item.get("volume24hr") or item.get("volume24hrClob") or 0.0),
             resolution_source=item.get("description") or "",
         )
+
+    @staticmethod
+    def _sort_market_candidates(markets: list[MarketCandidate]) -> list[MarketCandidate]:
+        def sort_key(candidate: MarketCandidate) -> tuple[int, float, float]:
+            seconds_to_expiry = PolymarketConnector._seconds_to_expiry(candidate.end_date_iso)
+            effective_expiry = seconds_to_expiry if seconds_to_expiry >= 0 else 10**9
+            return (effective_expiry, -candidate.volume_24h_usd, -candidate.liquidity_usd)
+
+        return sorted(markets, key=sort_key)
+
+    @staticmethod
+    def _seconds_to_expiry(end_date_iso: str) -> int:
+        try:
+            expiry = datetime.fromisoformat(end_date_iso.replace("Z", "+00:00"))
+        except ValueError:
+            return -1
+        return int((expiry - datetime.now(timezone.utc)).total_seconds())
+
+    @staticmethod
+    def _matches_btc_5m_market(item: dict[str, Any]) -> bool:
+        haystacks = [
+            str(item.get("question") or ""),
+            str(item.get("description") or ""),
+            str(item.get("slug") or ""),
+        ]
+        joined = " ".join(haystacks).lower()
+        has_btc = "bitcoin" in joined or "btc" in joined
+        has_short_window = "5 minutes" in joined or "five minutes" in joined or re.search(r"\b5m\b", joined) is not None
+        has_direction = "up or down" in joined or "above or below" in joined or "higher or lower" in joined
+        return has_btc and has_short_window and has_direction
 
     @staticmethod
     def _parse_token_ids(raw_value: Any) -> list[str]:
