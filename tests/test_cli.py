@@ -95,6 +95,18 @@ class StubService:
             },
         )()
 
+    def run_cycle(self, market_id: str):
+        return {
+            "managed_actions": [],
+            "paper_trade": {
+                "market_id": market_id,
+                "decision_status": "APPROVED",
+                "decision_side": "YES",
+                "execution_status": "FILLED_PAPER",
+                "execution_success": True,
+            },
+        }
+
 
 def test_cli_status(monkeypatch) -> None:
     monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
@@ -144,3 +156,10 @@ def test_cli_analyze_handles_runtime_errors(monkeypatch) -> None:
     result = runner.invoke(app, ["analyze", "123"])
     assert result.exit_code == 1
     assert "Operation failed" in result.stdout
+
+
+def test_cli_run_loop(monkeypatch) -> None:
+    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    result = runner.invoke(app, ["run-loop", "123", "--iterations", "2", "--interval-seconds", "0"])
+    assert result.exit_code == 0
+    assert "\"iterations\": 2" in result.stdout

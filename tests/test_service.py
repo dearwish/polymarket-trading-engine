@@ -142,3 +142,17 @@ def test_agent_service_report_includes_portfolio_summaries(settings) -> None:
     assert "Open positions: 1" in report.summary
     assert any("OPEN | open-1" in item for item in report.items)
     assert any("CLOSED | closed-1" in item for item in report.items)
+
+
+def test_agent_service_run_cycle(settings, market_snapshot, market_assessment) -> None:
+    service = AgentService(settings)
+    service.manage_open_positions = lambda: []
+    service.paper_trade = lambda market_id: (
+        market_snapshot,
+        market_assessment,
+        type("Decision", (), {"status": type("Status", (), {"value": "APPROVED"})(), "side": type("Side", (), {"value": "YES"})()})(),
+        type("Result", (), {"status": "FILLED_PAPER", "success": True})(),
+    )
+    cycle = service.run_cycle("123")
+    assert cycle["paper_trade"]["decision_status"] == "APPROVED"
+    assert cycle["paper_trade"]["execution_status"] == "FILLED_PAPER"

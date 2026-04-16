@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 import httpx
 import typer
@@ -168,5 +169,31 @@ def report(session_id: str = "") -> None:
         for item in generated.items:
             table.add_row(item)
         console.print(table)
+    except Exception as exc:
+        _handle_operator_error(exc)
+
+
+@app.command("run-loop")
+def run_loop(
+    market_id: str,
+    iterations: int = typer.Option(1, min=1),
+    interval_seconds: int = typer.Option(0, min=0),
+) -> None:
+    try:
+        service = _service()
+        cycles = []
+        for idx in range(iterations):
+            cycles.append(service.run_cycle(market_id))
+            if idx < iterations - 1 and interval_seconds > 0:
+                time.sleep(interval_seconds)
+        console.print_json(
+            json.dumps(
+                {
+                    "market_id": market_id,
+                    "iterations": iterations,
+                    "cycles": cycles,
+                }
+            )
+        )
     except Exception as exc:
         _handle_operator_error(exc)

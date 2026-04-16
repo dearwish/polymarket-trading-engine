@@ -81,6 +81,23 @@ class AgentService:
         self.journal.log_event("execution_result", result)
         return snapshot, assessment, decision, result
 
+    def run_cycle(self, market_id: str) -> dict:
+        actions = self.manage_open_positions()
+        snapshot, assessment, decision, result = self.paper_trade(market_id)
+        return {
+            "managed_actions": [
+                {"market_id": action.market_id, "action": action.action, "reason": action.reason}
+                for action in actions
+            ],
+            "paper_trade": {
+                "market_id": snapshot.candidate.market_id,
+                "decision_status": decision.status.value,
+                "decision_side": decision.side.value,
+                "execution_status": result.status,
+                "execution_success": result.success,
+            },
+        }
+
     def manage_open_positions(self) -> list[PositionAction]:
         actions: list[PositionAction] = []
         due_positions = self.portfolio.positions_due_for_close(self.settings.paper_position_ttl_seconds)
