@@ -111,6 +111,27 @@ def create_app(service_factory: Callable[[], AgentService] = get_service) -> Fas
             "items": generated.items,
         }
 
+    @app.get("/api/decisions/recent")
+    def recent_decisions(limit: int = Query(25, ge=1, le=200), service: AgentService = Depends(service_factory)) -> dict:
+        allowed = {"simulation_cycle", "simulation_decision", "trade_decision", "market_assessment"}
+        events = [event for event in service.journal.read_recent_events(limit=limit * 4) if event["event_type"] in allowed]
+        return {
+            "count": len(events[:limit]),
+            "decisions": events[:limit],
+        }
+
+    @app.get("/api/live/orders")
+    def live_orders(service: AgentService = Depends(service_factory)) -> dict:
+        return service.live_orders()
+
+    @app.get("/api/live/trades")
+    def live_trades(
+        market_id: str | None = Query(default=None),
+        limit: int = Query(20, ge=1, le=200),
+        service: AgentService = Depends(service_factory),
+    ) -> dict:
+        return service.live_trades(market_id=market_id, limit=limit)
+
     @app.get("/api/events/recent")
     def recent_events(limit: int = Query(20, ge=1, le=200), service: AgentService = Depends(service_factory)) -> dict:
         events = service.journal.read_recent_events(limit=limit)

@@ -36,6 +36,30 @@ body {
   padding: 32px 0 48px;
 }
 
+.nav-strip {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 18px;
+}
+
+.nav-pill {
+  border: 1px solid var(--border);
+  background: rgba(8, 17, 31, 0.6);
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 10px 14px;
+  cursor: pointer;
+  transition: 160ms ease;
+}
+
+.nav-pill:hover,
+.nav-pill.active {
+  color: var(--text);
+  background: rgba(77, 212, 172, 0.14);
+  border-color: rgba(77, 212, 172, 0.3);
+}
+
 .hero {
   display: flex;
   justify-content: space-between;
@@ -165,6 +189,10 @@ dd {
   color: var(--muted);
 }
 
+.full-span {
+  grid-column: 1 / -1;
+}
+
 .chart {
   height: 240px;
   width: 100%;
@@ -233,6 +261,12 @@ th {
   background: var(--panel-strong);
   color: var(--muted);
   font-size: 14px;
+}
+
+.event-list li strong {
+  display: block;
+  color: var(--text);
+  margin-bottom: 6px;
 }
 
 .positive {

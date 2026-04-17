@@ -40,6 +40,20 @@ class StubService:
             "tracked_orders": {"summary": {"active": 0, "terminal": 0, "errors": 0}},
         }
 
+    def live_orders(self):
+        return {
+            "readonly": True,
+            "count": 1,
+            "orders": [{"order_id": "live-1", "status": "OPEN"}],
+        }
+
+    def live_trades(self, market_id=None, limit=20):
+        return {
+            "readonly": True,
+            "count": 1,
+            "trades": [{"trade_id": "trade-1", "order_id": "live-1"}],
+        }
+
     def generate_operator_report(self, session_id=None):
         return type(
             "Report",
@@ -51,6 +65,16 @@ class StubService:
                 "items": ["item-1"],
             },
         )()
+
+    class Journal:
+        @staticmethod
+        def read_recent_events(limit=20):
+            return [
+                {"event_type": "simulation_cycle", "logged_at": "2026-04-17T00:00:00+00:00", "payload": {"market_id": "123"}},
+                {"event_type": "market_assessment", "logged_at": "2026-04-17T00:01:00+00:00", "payload": {"market_id": "123"}},
+            ]
+
+    journal = Journal()
 
     class Portfolio:
         def list_open_positions(self):
@@ -175,6 +199,29 @@ def test_api_recent_events() -> None:
     payload = response.json()
     assert payload["count"] == 1
     assert payload["events"][0]["event_type"] == "simulation_cycle"
+
+
+def test_api_recent_decisions() -> None:
+    client = TestClient(create_app(lambda: StubService()))
+    response = client.get("/api/decisions/recent?limit=2")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["count"] == 2
+    assert payload["decisions"][0]["event_type"] == "simulation_cycle"
+
+
+def test_api_live_orders() -> None:
+    client = TestClient(create_app(lambda: StubService()))
+    response = client.get("/api/live/orders")
+    assert response.status_code == 200
+    assert response.json()["orders"][0]["order_id"] == "live-1"
+
+
+def test_api_live_trades() -> None:
+    client = TestClient(create_app(lambda: StubService()))
+    response = client.get("/api/live/trades")
+    assert response.status_code == 200
+    assert response.json()["trades"][0]["trade_id"] == "trade-1"
 
 
 def test_api_simulate_active() -> None:
