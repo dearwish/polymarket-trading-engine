@@ -226,3 +226,43 @@ def test_portfolio_updates_tracked_live_order(settings) -> None:
     tracked = engine.list_live_orders()
     assert tracked[0]["status"] == "MATCHED"
     assert tracked[0]["detail"] == "filled"
+
+
+def test_portfolio_splits_active_and_terminal_live_orders(settings) -> None:
+    engine = PortfolioEngine(settings.db_path, settings.paper_starting_balance_usd)
+    decision = TradeDecision(
+        market_id="123",
+        status=DecisionStatus.APPROVED,
+        side=SuggestedSide.YES,
+        size_usd=10.0,
+        limit_price=0.52,
+        rationale=["approved"],
+        rejected_by=[],
+        asset_id="token-yes",
+    )
+    engine.record_execution(
+        decision,
+        ExecutionResult(
+            market_id="123",
+            success=True,
+            mode=ExecutionMode.LIVE,
+            order_id="live-active",
+            status="LIVE_SUBMITTED",
+            detail="submitted",
+        ),
+    )
+    engine.record_execution(
+        decision,
+        ExecutionResult(
+            market_id="123",
+            success=True,
+            mode=ExecutionMode.LIVE,
+            order_id="live-terminal",
+            status="MATCHED",
+            detail="filled",
+        ),
+    )
+    assert len(engine.list_active_live_orders()) == 1
+    assert engine.list_active_live_orders()[0]["order_id"] == "live-active"
+    assert len(engine.list_terminal_live_orders()) == 1
+    assert engine.list_terminal_live_orders()[0]["order_id"] == "live-terminal"

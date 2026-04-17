@@ -192,19 +192,27 @@ class AgentService:
             raise RuntimeError("Authenticated live order refresh requires readonly_ready auth.")
         tracked = self.portfolio.list_live_orders(limit=limit)
         refreshed: list[dict] = []
+        summary = {"active": 0, "terminal": 0, "errors": 0}
         for item in tracked:
             try:
                 current = self.polymarket.get_live_order(item["order_id"])
                 status = current.get("status") or item["status"]
                 detail = json.dumps(current)
                 self.portfolio.update_live_order(item["order_id"], status=status, detail=detail)
-                refreshed.append(current)
+                normalized = {**current, "terminal": self.portfolio.is_terminal_live_order_status(str(status))}
+                if normalized["terminal"]:
+                    summary["terminal"] += 1
+                else:
+                    summary["active"] += 1
+                refreshed.append(normalized)
             except Exception as exc:
+                summary["errors"] += 1
                 refreshed.append({**item, "refresh_error": str(exc)})
         payload = {
             "readonly": True,
             "count": len(refreshed),
             "orders": refreshed,
+            "summary": summary,
         }
         self.journal.log_event("live_order_refresh", payload)
         return payload
@@ -514,6 +522,8 @@ class AgentService:
             },
             "tracked_orders": {
                 "count": len(tracked_orders),
+                "active_count": len(self.portfolio.list_active_live_orders(limit=50)),
+                "terminal_count": len(self.portfolio.list_terminal_live_orders(limit=50)),
                 "orders": tracked_orders,
             },
             "recent_trades": {

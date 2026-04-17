@@ -20,6 +20,8 @@ def _utc_now() -> datetime:
 
 
 class PortfolioEngine:
+    TERMINAL_LIVE_ORDER_STATUSES = {"CANCELED", "CANCELLED", "MATCHED", "FILLED", "EXECUTED", "REJECTED"}
+
     def __init__(self, db_path: Path, starting_balance_usd: float):
         self.db_path = db_path
         self.starting_balance_usd = starting_balance_usd
@@ -163,6 +165,12 @@ class PortfolioEngine:
             for row in rows
         ]
 
+    def list_active_live_orders(self, limit: int = 50) -> list[dict]:
+        return [order for order in self.list_live_orders(limit=limit) if not self.is_terminal_live_order_status(order["status"])]
+
+    def list_terminal_live_orders(self, limit: int = 50) -> list[dict]:
+        return [order for order in self.list_live_orders(limit=limit) if self.is_terminal_live_order_status(order["status"])]
+
     def update_live_order(self, order_id: str, status: str, detail: str = "", updated_at: datetime | None = None) -> None:
         current = updated_at or _utc_now()
         with sqlite3.connect(self.db_path) as conn:
@@ -175,6 +183,10 @@ class PortfolioEngine:
                 (status, detail, current.isoformat(), order_id),
             )
             conn.commit()
+
+    @classmethod
+    def is_terminal_live_order_status(cls, status: str) -> bool:
+        return status.strip().upper() in cls.TERMINAL_LIVE_ORDER_STATUSES
 
     def list_open_positions(self) -> list[PositionRecord]:
         with sqlite3.connect(self.db_path) as conn:

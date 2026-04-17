@@ -648,9 +648,13 @@ def test_agent_service_live_activity(settings) -> None:
     service.live_preflight = lambda market_id=None: {"market_id": market_id or "123", "ready": False, "blockers": ["edge_limit"]}
     service.polymarket.list_live_orders = lambda: [{"order_id": "live-1"}]
     service.polymarket.list_live_trades = lambda market_id=None, limit=20: [{"trade_id": "trade-1"}]
+    service.portfolio.list_active_live_orders = lambda limit=50: [{"order_id": "live-1"}]
+    service.portfolio.list_terminal_live_orders = lambda limit=50: [{"order_id": "live-2"}]
     payload = service.live_activity("123", trade_limit=5)
     assert payload["market_id"] == "123"
     assert payload["open_orders"]["count"] == 1
+    assert payload["tracked_orders"]["active_count"] == 1
+    assert payload["tracked_orders"]["terminal_count"] == 1
     assert payload["recent_trades"]["count"] == 1
     assert payload["preflight"]["blockers"] == ["edge_limit"]
 
@@ -692,6 +696,8 @@ def test_agent_service_refresh_live_order_tracking(settings) -> None:
     service.portfolio.list_live_orders = lambda limit=50: [{"order_id": "live-1", "status": "LIVE_SUBMITTED"}]
     service.polymarket.get_live_order = lambda order_id: {"order_id": order_id, "status": "MATCHED"}
     service.portfolio.update_live_order = lambda order_id, status, detail="": updates.append((order_id, status))
+    service.portfolio.is_terminal_live_order_status = lambda status: status == "MATCHED"
     payload = service.refresh_live_order_tracking(limit=5)
     assert payload["count"] == 1
     assert updates == [("live-1", "MATCHED")]
+    assert payload["summary"] == {"active": 0, "terminal": 1, "errors": 0}
