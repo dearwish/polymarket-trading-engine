@@ -275,6 +275,24 @@ def live_activity(
         _handle_operator_error(exc)
 
 
+@app.command("tracked-live-orders")
+def tracked_live_orders(limit: int = typer.Option(50, min=1, max=500)) -> None:
+    try:
+        service = _service()
+        console.print_json(json.dumps(service.tracked_live_orders(limit=limit)))
+    except Exception as exc:
+        _handle_operator_error(exc)
+
+
+@app.command("refresh-live-orders")
+def refresh_live_orders(limit: int = typer.Option(50, min=1, max=500)) -> None:
+    try:
+        service = _service()
+        console.print_json(json.dumps(service.refresh_live_order_tracking(limit=limit)))
+    except Exception as exc:
+        _handle_operator_error(exc)
+
+
 @app.command()
 def live(
     market_id: str = typer.Argument("", help="Explicit market id to trade live."),

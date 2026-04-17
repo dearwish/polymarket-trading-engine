@@ -653,3 +653,45 @@ def test_agent_service_live_activity(settings) -> None:
     assert payload["open_orders"]["count"] == 1
     assert payload["recent_trades"]["count"] == 1
     assert payload["preflight"]["blockers"] == ["edge_limit"]
+
+
+def test_agent_service_tracked_live_orders(settings) -> None:
+    service = AgentService(settings)
+    service.portfolio.list_live_orders = lambda limit=50: [{"order_id": "live-1", "status": "LIVE_SUBMITTED"}] if limit == 5 else [{"order_id": "live-1", "status": "LIVE_SUBMITTED"}]
+    payload = service.tracked_live_orders(limit=10)
+    assert payload["count"] == 1
+    assert payload["orders"][0]["order_id"] == "live-1"
+
+
+def test_agent_service_refresh_live_order_tracking(settings) -> None:
+    service = AgentService(settings)
+    service.polymarket.probe_live_readiness = lambda: type(
+        "Auth",
+        (),
+        {
+            "private_key_configured": True,
+            "funder_configured": True,
+            "signature_type": 2,
+            "live_client_constructible": True,
+            "missing": [],
+            "wallet_address": "0xdef",
+            "api_credentials_derived": True,
+            "server_ok": True,
+            "readonly_ready": True,
+            "probe_attempted": True,
+            "collateral_address": "0x2791",
+            "balance": 44.93,
+            "allowance": None,
+            "open_orders_count": 0,
+            "open_orders_markets": [],
+            "diagnostics_collected": True,
+            "errors": [],
+        },
+    )()
+    updates = []
+    service.portfolio.list_live_orders = lambda limit=50: [{"order_id": "live-1", "status": "LIVE_SUBMITTED"}]
+    service.polymarket.get_live_order = lambda order_id: {"order_id": order_id, "status": "MATCHED"}
+    service.portfolio.update_live_order = lambda order_id, status, detail="": updates.append((order_id, status))
+    payload = service.refresh_live_order_tracking(limit=5)
+    assert payload["count"] == 1
+    assert updates == [("live-1", "MATCHED")]

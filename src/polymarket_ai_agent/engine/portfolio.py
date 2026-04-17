@@ -80,6 +80,24 @@ class PortfolioEngine:
                     result.executed_at.isoformat(),
                 ),
             )
+            if result.mode == ExecutionMode.LIVE and result.order_id:
+                conn.execute(
+                    """
+                    insert into live_orders(
+                        order_id, market_id, asset_id, side, status, detail, created_at, updated_at
+                    ) values (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        result.order_id,
+                        decision.market_id,
+                        decision.asset_id,
+                        decision.side.value,
+                        result.status,
+                        result.detail,
+                        result.executed_at.isoformat(),
+                        result.executed_at.isoformat(),
+                    ),
+                )
             if not result.success or result.status != "FILLED_PAPER":
                 conn.commit()
                 return
@@ -119,6 +137,44 @@ class PortfolioEngine:
                 (current.date().isoformat(),),
             ).fetchone()
         return int(row[0] or 0)
+
+    def list_live_orders(self, limit: int = 50) -> list[dict]:
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                """
+                select order_id, market_id, asset_id, side, status, detail, created_at, updated_at
+                from live_orders
+                order by updated_at desc
+                limit ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            {
+                "order_id": str(row[0]),
+                "market_id": str(row[1]),
+                "asset_id": str(row[2]),
+                "side": str(row[3]),
+                "status": str(row[4]),
+                "detail": str(row[5]),
+                "created_at": str(row[6]),
+                "updated_at": str(row[7]),
+            }
+            for row in rows
+        ]
+
+    def update_live_order(self, order_id: str, status: str, detail: str = "", updated_at: datetime | None = None) -> None:
+        current = updated_at or _utc_now()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                update live_orders
+                set status = ?, detail = ?, updated_at = ?
+                where order_id = ?
+                """,
+                (status, detail, current.isoformat(), order_id),
+            )
+            conn.commit()
 
     def list_open_positions(self) -> list[PositionRecord]:
         with sqlite3.connect(self.db_path) as conn:
@@ -253,6 +309,20 @@ class PortfolioEngine:
                     status text not null,
                     detail text not null,
                     recorded_at text not null
+                )
+                """
+            )
+            conn.execute(
+                """
+                create table if not exists live_orders (
+                    order_id text primary key,
+                    market_id text not null,
+                    asset_id text not null,
+                    side text not null,
+                    status text not null,
+                    detail text not null,
+                    created_at text not null,
+                    updated_at text not null
                 )
                 """
             )

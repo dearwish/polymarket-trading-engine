@@ -151,6 +151,20 @@ class StubService:
             "preflight": {"ready": False, "blockers": ["edge_limit"]},
         }
 
+    def tracked_live_orders(self, limit=50):
+        return {
+            "readonly": True,
+            "count": 1,
+            "orders": [{"order_id": "live-1", "status": "LIVE_SUBMITTED"}],
+        }
+
+    def refresh_live_order_tracking(self, limit=50):
+        return {
+            "readonly": True,
+            "count": 1,
+            "orders": [{"order_id": "live-1", "status": "MATCHED"}],
+        }
+
     def safety_stop_reason(self):
         return None
 
@@ -311,6 +325,20 @@ def test_cli_live_activity(monkeypatch) -> None:
     assert "\"market_id\": \"active-123\"" in result.stdout
     assert "\"open_orders\"" in result.stdout
     assert "\"recent_trades\"" in result.stdout
+
+
+def test_cli_tracked_live_orders(monkeypatch) -> None:
+    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    result = runner.invoke(app, ["tracked-live-orders"])
+    assert result.exit_code == 0
+    assert "\"order_id\": \"live-1\"" in result.stdout
+
+
+def test_cli_refresh_live_orders(monkeypatch) -> None:
+    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    result = runner.invoke(app, ["refresh-live-orders"])
+    assert result.exit_code == 0
+    assert "\"status\": \"MATCHED\"" in result.stdout
 
 
 def test_cli_live_requires_confirm(monkeypatch) -> None:

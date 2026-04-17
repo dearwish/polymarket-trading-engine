@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 
 from polymarket_ai_agent.config import Settings
@@ -177,6 +178,36 @@ class AgentService:
         self.portfolio.record_execution(decision, result)
         self.journal.log_event("execution_result", result)
         return snapshot, assessment, decision, result
+
+    def tracked_live_orders(self, limit: int = 50) -> dict:
+        return {
+            "readonly": True,
+            "count": len(self.portfolio.list_live_orders(limit=limit)),
+            "orders": self.portfolio.list_live_orders(limit=limit),
+        }
+
+    def refresh_live_order_tracking(self, limit: int = 50) -> dict:
+        auth = self._auth_status_dict(self.polymarket.probe_live_readiness())
+        if not auth["readonly_ready"]:
+            raise RuntimeError("Authenticated live order refresh requires readonly_ready auth.")
+        tracked = self.portfolio.list_live_orders(limit=limit)
+        refreshed: list[dict] = []
+        for item in tracked:
+            try:
+                current = self.polymarket.get_live_order(item["order_id"])
+                status = current.get("status") or item["status"]
+                detail = json.dumps(current)
+                self.portfolio.update_live_order(item["order_id"], status=status, detail=detail)
+                refreshed.append(current)
+            except Exception as exc:
+                refreshed.append({**item, "refresh_error": str(exc)})
+        payload = {
+            "readonly": True,
+            "count": len(refreshed),
+            "orders": refreshed,
+        }
+        self.journal.log_event("live_order_refresh", payload)
+        return payload
 
     def run_cycle(self, market_id: str) -> dict:
         actions = self.manage_open_positions()
@@ -471,6 +502,7 @@ class AgentService:
         preflight = self.live_preflight(market_id)
         orders = self.polymarket.list_live_orders()
         trades = self.polymarket.list_live_trades(market_id=preflight["market_id"], limit=trade_limit)
+        tracked_orders = self.portfolio.list_live_orders(limit=50)
         payload = {
             "readonly": True,
             "market_id": preflight["market_id"],
@@ -479,6 +511,10 @@ class AgentService:
             "open_orders": {
                 "count": len(orders),
                 "orders": orders,
+            },
+            "tracked_orders": {
+                "count": len(tracked_orders),
+                "orders": tracked_orders,
             },
             "recent_trades": {
                 "count": len(trades),

@@ -172,3 +172,57 @@ def test_portfolio_counts_rejected_orders_without_counting_skips(settings) -> No
     engine.record_execution(decision, skipped_result)
     account_state = engine.get_account_state(ExecutionMode.PAPER)
     assert account_state.rejected_orders == 1
+
+
+def test_portfolio_tracks_live_order_submission(settings) -> None:
+    engine = PortfolioEngine(settings.db_path, settings.paper_starting_balance_usd)
+    decision = TradeDecision(
+        market_id="123",
+        status=DecisionStatus.APPROVED,
+        side=SuggestedSide.YES,
+        size_usd=10.0,
+        limit_price=0.52,
+        rationale=["approved"],
+        rejected_by=[],
+        asset_id="token-yes",
+    )
+    result = ExecutionResult(
+        market_id="123",
+        success=True,
+        mode=ExecutionMode.LIVE,
+        order_id="live-1",
+        status="LIVE_SUBMITTED",
+        detail="submitted",
+    )
+    engine.record_execution(decision, result)
+    tracked = engine.list_live_orders()
+    assert len(tracked) == 1
+    assert tracked[0]["order_id"] == "live-1"
+    assert tracked[0]["status"] == "LIVE_SUBMITTED"
+
+
+def test_portfolio_updates_tracked_live_order(settings) -> None:
+    engine = PortfolioEngine(settings.db_path, settings.paper_starting_balance_usd)
+    decision = TradeDecision(
+        market_id="123",
+        status=DecisionStatus.APPROVED,
+        side=SuggestedSide.YES,
+        size_usd=10.0,
+        limit_price=0.52,
+        rationale=["approved"],
+        rejected_by=[],
+        asset_id="token-yes",
+    )
+    result = ExecutionResult(
+        market_id="123",
+        success=True,
+        mode=ExecutionMode.LIVE,
+        order_id="live-1",
+        status="LIVE_SUBMITTED",
+        detail="submitted",
+    )
+    engine.record_execution(decision, result)
+    engine.update_live_order("live-1", status="MATCHED", detail="filled")
+    tracked = engine.list_live_orders()
+    assert tracked[0]["status"] == "MATCHED"
+    assert tracked[0]["detail"] == "filled"

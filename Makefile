@@ -9,7 +9,7 @@ CLI := $(BIN)/polymarket-ai-agent
 ITERATIONS ?= 10
 INTERVAL ?= 15
 
-.PHONY: help venv install bootstrap reinstall bootstrap-force test status auth-check doctor live-preflight live-activity live-orders live-trades live-cancel check report \
+.PHONY: help venv install bootstrap reinstall bootstrap-force test status auth-check doctor live-preflight live-activity live-orders tracked-live-orders refresh-live-orders live-trades live-cancel check report \
 	simulate-active simulate-market simulate-loop-active simulate-loop-market \
 	guard-market-id
 
@@ -52,6 +52,12 @@ live-activity: install
 
 live-orders: install
 	$(CLI) live-orders
+
+tracked-live-orders: install
+	$(CLI) tracked-live-orders
+
+refresh-live-orders: install
+	$(CLI) refresh-live-orders
 
 live-trades: install
 	$(CLI) live-trades
@@ -103,6 +109,8 @@ help:
 		'  make live-preflight           Run the live-readiness preflight without posting orders' \
 		'  make live-activity            Run the top-level live activity snapshot (preflight, orders, trades)' \
 		'  make live-orders              Inspect authenticated open live orders without posting new ones' \
+		'  make tracked-live-orders      Inspect locally tracked submitted live orders' \
+		'  make refresh-live-orders      Refresh tracked live orders against Polymarket' \
 		'  make live-trades              Inspect recent authenticated trade history without posting orders' \
 		'  make live-cancel ORDER_ID=abc123' \
 		'                               Cancel a specific live order with explicit confirmation' \
