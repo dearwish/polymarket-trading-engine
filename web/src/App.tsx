@@ -247,6 +247,35 @@ function mapSnapshotToState(snapshot: DashboardSnapshotPayload): DashboardState 
   };
 }
 
+function applyDashboardDelta(current: DashboardState, eventName: string, payload: unknown): DashboardState {
+  switch (eventName) {
+    case "status":
+      return { ...current, status: payload as StatusPayload };
+    case "auth":
+      return { ...current, auth: payload as AuthPayload };
+    case "live_activity":
+      return { ...current, liveActivity: payload as LiveActivityPayload };
+    case "portfolio_summary":
+      return { ...current, portfolioSummary: payload as PortfolioSummaryPayload };
+    case "closed_positions":
+      return { ...current, closedPositions: payload as ClosedPositionsPayload };
+    case "equity_curve":
+      return { ...current, equityCurve: payload as EquityCurvePayload };
+    case "report":
+      return { ...current, report: payload as ReportPayload };
+    case "recent_events":
+      return { ...current, recentEvents: (payload as RecentEventsPayload).events };
+    case "recent_decisions":
+      return { ...current, recentDecisions: (payload as DecisionsPayload).decisions };
+    case "live_orders":
+      return { ...current, liveOrders: (payload as LiveOrdersPayload).orders };
+    case "live_trades":
+      return { ...current, liveTrades: (payload as LiveTradesPayload).trades };
+    default:
+      return current;
+  }
+}
+
 function PnlChart({ points }: { points: EquityPoint[] }) {
   const polylinePoints = useMemo(() => {
     if (!points.length) return "";
@@ -681,17 +710,35 @@ export default function App() {
 
   useEffect(() => {
     const source = new EventSource("/api/dashboard/stream?interval_seconds=5");
-    source.addEventListener("dashboard", (event) => {
-      const payload = JSON.parse((event as MessageEvent).data) as DashboardSnapshotPayload;
-      setState(mapSnapshotToState(payload));
-      setLoading(false);
-      setError("");
+    const eventNames = [
+      "status",
+      "auth",
+      "live_activity",
+      "portfolio_summary",
+      "closed_positions",
+      "equity_curve",
+      "report",
+      "recent_events",
+      "recent_decisions",
+      "live_orders",
+      "live_trades",
+    ];
+    const handlers = eventNames.map((eventName) => {
+      const handler = (event: Event) => {
+        const payload = JSON.parse((event as MessageEvent).data);
+        setState((current) => applyDashboardDelta(current, eventName, payload));
+        setLoading(false);
+        setError("");
+      };
+      source.addEventListener(eventName, handler);
+      return { eventName, handler };
     });
     source.onerror = () => {
       setError("Dashboard stream disconnected.");
       source.close();
     };
     return () => {
+      handlers.forEach(({ eventName, handler }) => source.removeEventListener(eventName, handler));
       source.close();
     };
   }, []);

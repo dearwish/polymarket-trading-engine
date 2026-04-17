@@ -53,6 +53,22 @@ def create_app(service_factory: Callable[[], AgentService] = get_service) -> Fas
             "live_trades": live_trades(limit=20, service=service),
         }
 
+    def streamable_dashboard_sections(service: AgentService) -> dict:
+        snapshot = build_dashboard_snapshot(service)
+        return {
+            "status": snapshot["status"],
+            "auth": snapshot["auth"],
+            "live_activity": snapshot["live_activity"],
+            "portfolio_summary": snapshot["portfolio_summary"],
+            "closed_positions": snapshot["closed_positions"],
+            "equity_curve": snapshot["equity_curve"],
+            "report": snapshot["report"],
+            "recent_events": snapshot["recent_events"],
+            "recent_decisions": snapshot["recent_decisions"],
+            "live_orders": snapshot["live_orders"],
+            "live_trades": snapshot["live_trades"],
+        }
+
     @app.get("/api/status")
     def status(service: AgentService = Depends(service_factory)) -> dict:
         return service.status()
@@ -236,12 +252,13 @@ def create_app(service_factory: Callable[[], AgentService] = get_service) -> Fas
         service: AgentService = Depends(service_factory),
     ) -> StreamingResponse:
         async def event_generator():
-            previous_payload = ""
+            previous_sections: dict[str, str] = {}
             while True:
-                payload = json.dumps(build_dashboard_snapshot(service))
-                if payload != previous_payload:
-                    previous_payload = payload
-                    yield f"event: dashboard\ndata: {payload}\n\n"
+                for event_name, payload_obj in streamable_dashboard_sections(service).items():
+                    payload = json.dumps(payload_obj)
+                    if previous_sections.get(event_name) != payload:
+                        previous_sections[event_name] = payload
+                        yield f"event: {event_name}\ndata: {payload}\n\n"
                 await asyncio.sleep(interval_seconds)
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
