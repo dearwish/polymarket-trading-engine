@@ -1,6 +1,6 @@
 # Polymarket AI Agent
 
-Python project scaffold for a Polymarket trading agent with three clearly separated layers:
+Python project for a Polymarket trading agent with three clearly separated layers:
 
 - Deterministic execution built around official Polymarket APIs and `py-clob-client`
 - Research and model-scoring layer using OpenRouter by default
@@ -8,29 +8,27 @@ Python project scaffold for a Polymarket trading agent with three clearly separa
 
 ## Current Status
 
-This repository currently contains:
+The repository now includes a working paper and read-only live-readiness stack:
 
-- the approved implementation plan
-- deployment guidance
-- repository hygiene files
-
-The actual trading engine implementation is intentionally not included yet. The next step is to review this repo structure and plan, then approve iteration on the codebase.
-
-## Implemented In This Iteration
-
-The repository now includes the first code implementation slice:
-
-- Python package scaffold under `src/polymarket_ai_agent`
+- Python package under `src/polymarket_ai_agent`
 - operator CLI via `polymarket-ai-agent`
 - settings/config loading from `.env`
 - Polymarket market discovery and order book snapshot connector
+- authenticated read-only Polymarket account diagnostics
 - external BTC price feed connector
 - research, scoring, risk, execution, and journaling engines
-- paper-first execution path
+- paper trading and read-only simulation flows
+- hard-gated live execution path
+- live preflight and live order inspection commands
 - SQLite and JSONL logging
-- initial unit tests for risk gating
+- test suite covering connectors, scoring, risk, execution, service, and CLI
 
-This is still not a live trading bot. The live execution path remains intentionally disabled in the scaffold while the paper path and interfaces are hardened.
+Important:
+
+- this repo can authenticate against Polymarket and inspect account state
+- this repo can simulate and paper-trade decisions
+- this repo has a real live order-posting code path
+- live posting is still disabled by default and requires explicit config and CLI confirmation
 
 ## Quick Start
 
@@ -50,9 +48,54 @@ make bootstrap
 make test
 make status
 make auth-check
+make doctor
+make live-preflight
+make live-orders
 make simulate-active
 make simulate-market MARKET_ID=123
 make simulate-loop-active ITERATIONS=3 INTERVAL=0
+```
+
+## Operator Workflow
+
+Recommended sequence:
+
+1. `make status`
+2. `make auth-check`
+3. `make doctor`
+4. `make live-preflight`
+5. `make live-orders`
+
+What these do:
+
+- `status`
+  - shows runtime mode, safety state, and authenticated account summary
+- `auth-check`
+  - verifies wallet/private-key/funder auth and reads collateral balance
+- `doctor`
+  - combines auth, active market, order book, and current simulated decision
+- `live-preflight`
+  - evaluates whether a live trade would currently be allowed and lists blockers
+- `live-orders`
+  - inspects current authenticated open orders without posting anything
+
+## Live Trading Safety Model
+
+Live trading is intentionally hard-gated.
+
+Real order posting requires all of:
+
+- `TRADING_MODE=live`
+- `LIVE_TRADING_ENABLED=true`
+- valid Polymarket auth
+- a preflight that passes risk checks
+- explicit CLI confirmation via `--confirm-live`
+
+Default safe state:
+
+```env
+TRADING_MODE=paper
+LIVE_TRADING_ENABLED=false
 ```
 
 ## Planned Architecture
@@ -62,6 +105,7 @@ make simulate-loop-active ITERATIONS=3 INTERVAL=0
   - token resolution
   - order book snapshots
   - account state
+  - authenticated order inspection
 - `connectors/external_feeds`
   - external BTC price feed snapshots
   - source adapters for market-family-specific evidence
@@ -92,7 +136,12 @@ make simulate-loop-active ITERATIONS=3 INTERVAL=0
   - `scan`
   - `analyze`
   - `paper`
+  - `simulate`
+  - `doctor`
+  - `live-preflight`
   - `live`
+  - `live-orders`
+  - `live-order`
   - `close`
   - `status`
   - `report`
@@ -102,7 +151,7 @@ make simulate-loop-active ITERATIONS=3 INTERVAL=0
 The first version is intentionally narrow:
 
 - target one repetitive market family only
-- preferred first target: BTC 5-minute Up/Down
+- current implemented focus: BTC daily threshold markets
 - use OpenRouter as the default model gateway
 - keep execution deterministic and mostly non-agentic
 - require structured LLM output and local risk approval before any order can be placed
