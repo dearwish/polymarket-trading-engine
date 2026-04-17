@@ -79,6 +79,17 @@ class EvidencePacket:
     recent_trade_count: int
     reasons_context: list[str]
     citations: list[str]
+    bid_yes: float = 0.0
+    ask_yes: float = 0.0
+    bid_no: float = 0.0
+    ask_no: float = 0.0
+    microprice_yes: float = 0.0
+    imbalance_top5_yes: float = 0.0
+    signed_flow_5s: float = 0.0
+    btc_log_return_5m: float = 0.0
+    btc_log_return_15m: float = 0.0
+    realized_vol_30m: float = 0.0
+    time_elapsed_in_candle_s: int = 0
     generated_at: datetime = field(default_factory=utc_now)
 
 
@@ -93,6 +104,10 @@ class MarketAssessment:
     reasons_to_abstain: list[str]
     edge: float
     raw_model_output: str
+    edge_yes: float = 0.0
+    edge_no: float = 0.0
+    fair_probability_no: float = 0.0
+    slippage_bps: float = 0.0
     assessed_at: datetime = field(default_factory=utc_now)
 
 

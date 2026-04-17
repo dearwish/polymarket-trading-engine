@@ -57,6 +57,18 @@ class Settings(BaseSettings):
     paper_entry_slippage_bps: float = 10.0
     paper_exit_slippage_bps: float = 10.0
 
+    fee_bps: float = 0.0
+    quant_drift_damping: float = 0.5
+    quant_imbalance_tilt: float = 0.03
+    quant_slippage_baseline_bps: float = 15.0
+    quant_slippage_spread_coef: float = 0.25
+    quant_default_vol_per_second: float = 0.00015
+    quant_drift_horizon_seconds: float = 900.0
+    quant_tte_floor_seconds: float = 5.0
+    quant_confidence_per_edge: float = 10.0
+    quant_high_expiry_risk_seconds: int = 15
+    quant_medium_expiry_risk_seconds: int = 60
+
     data_dir: Path = Field(default=Path("data"))
     log_dir: Path = Field(default=Path("logs"))
     db_path: Path = Field(default=Path("data/agent.db"))
