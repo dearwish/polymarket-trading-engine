@@ -388,6 +388,58 @@ def test_polymarket_connector_blocks_live_trade_when_flag_disabled(settings) -> 
     assert result.status == "LIVE_DISABLED"
 
 
+def test_polymarket_connector_lists_live_orders(settings) -> None:
+    configured = settings.model_copy(
+        update={
+            "polymarket_private_key": "0x" + "1" * 64,
+        }
+    )
+    connector = PolymarketConnector(configured, client=DummyClient([]))
+
+    class StubLiveClient:
+        def create_or_derive_api_creds(self):
+            return {"key": "derived"}
+
+        def set_api_creds(self, creds):
+            self.creds = creds
+
+        def get_orders(self, params):
+            return [
+                {"id": "live-1", "market": "m1", "asset_id": "a1", "status": "OPEN", "side": "BUY", "price": "0.5"},
+            ]
+
+    connector.build_live_client = lambda: StubLiveClient()
+    orders = connector.list_live_orders()
+    assert orders[0]["order_id"] == "live-1"
+    assert orders[0]["market_id"] == "m1"
+    assert orders[0]["price"] == 0.5
+
+
+def test_polymarket_connector_gets_single_live_order(settings) -> None:
+    configured = settings.model_copy(
+        update={
+            "polymarket_private_key": "0x" + "1" * 64,
+        }
+    )
+    connector = PolymarketConnector(configured, client=DummyClient([]))
+
+    class StubLiveClient:
+        def create_or_derive_api_creds(self):
+            return {"key": "derived"}
+
+        def set_api_creds(self, creds):
+            self.creds = creds
+
+        def get_order(self, order_id):
+            return {"orderID": order_id, "market_id": "m1", "status": "MATCHED", "size": "20"}
+
+    connector.build_live_client = lambda: StubLiveClient()
+    order = connector.get_live_order("live-1")
+    assert order["order_id"] == "live-1"
+    assert order["status"] == "MATCHED"
+    assert order["size"] == 20.0
+
+
 def test_polymarket_connector_discovers_btc_daily_threshold_markets(settings) -> None:
     configured = settings.model_copy(update={"market_family": "btc_daily_threshold"})
     payload = [

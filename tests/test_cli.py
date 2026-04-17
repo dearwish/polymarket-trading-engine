@@ -109,6 +109,19 @@ class StubService:
             "decision": {"status": "APPROVED", "asset_id": "token-yes"},
         }
 
+    def live_orders(self):
+        return {
+            "readonly": True,
+            "count": 1,
+            "orders": [{"order_id": "live-1", "status": "OPEN"}],
+        }
+
+    def live_order_status(self, order_id):
+        return {
+            "readonly": True,
+            "order": {"order_id": order_id, "status": "OPEN"},
+        }
+
     def safety_stop_reason(self):
         return None
 
@@ -217,6 +230,21 @@ def test_cli_live_preflight(monkeypatch) -> None:
     assert result.exit_code == 0
     assert "\"ready\": true" in result.stdout
     assert "\"asset_id\": \"token-yes\"" in result.stdout
+
+
+def test_cli_live_orders(monkeypatch) -> None:
+    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    result = runner.invoke(app, ["live-orders"])
+    assert result.exit_code == 0
+    assert "\"count\": 1" in result.stdout
+    assert "\"order_id\": \"live-1\"" in result.stdout
+
+
+def test_cli_live_order(monkeypatch) -> None:
+    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    result = runner.invoke(app, ["live-order", "live-1"])
+    assert result.exit_code == 0
+    assert "\"order_id\": \"live-1\"" in result.stdout
 
 
 def test_cli_live_requires_confirm(monkeypatch) -> None:

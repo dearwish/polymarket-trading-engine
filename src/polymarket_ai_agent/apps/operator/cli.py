@@ -204,6 +204,24 @@ def live_preflight(
         _handle_operator_error(exc)
 
 
+@app.command("live-orders")
+def live_orders() -> None:
+    try:
+        service = _service()
+        console.print_json(json.dumps(service.live_orders()))
+    except Exception as exc:
+        _handle_operator_error(exc)
+
+
+@app.command("live-order")
+def live_order(order_id: str) -> None:
+    try:
+        service = _service()
+        console.print_json(json.dumps(service.live_order_status(order_id)))
+    except Exception as exc:
+        _handle_operator_error(exc)
+
+
 @app.command()
 def live(
     market_id: str = typer.Argument("", help="Explicit market id to trade live."),

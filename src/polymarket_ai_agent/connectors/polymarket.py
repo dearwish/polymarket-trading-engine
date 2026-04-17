@@ -147,9 +147,7 @@ class PolymarketConnector:
                 detail="Live trade decision is missing the Polymarket asset_id/token_id.",
                 fill_price=0.0,
             )
-        client = self.build_live_client()
-        creds = client.create_or_derive_api_creds()
-        client.set_api_creds(creds)
+        client = self._build_authed_live_client()
         share_size = round(decision.size_usd / decision.limit_price, 6)
         order = client.create_order(
             OrderArgs(
@@ -180,6 +178,21 @@ class PolymarketConnector:
             detail=f"Live order submitted for {share_size:.6f} shares at {decision.limit_price:.4f}",
             fill_price=0.0,
         )
+
+    def list_live_orders(self) -> list[dict[str, Any]]:
+        client = self._build_authed_live_client()
+        orders = client.get_orders(OpenOrderParams())
+        return [self._normalize_live_order(order) for order in orders]
+
+    def get_live_order(self, order_id: str) -> dict[str, Any]:
+        client = self._build_authed_live_client()
+        return self._normalize_live_order(client.get_order(order_id))
+
+    def _build_authed_live_client(self) -> ClobClient:
+        client = self.build_live_client()
+        creds = client.create_or_derive_api_creds()
+        client.set_api_creds(creds)
+        return client
 
     def _collect_account_diagnostics(self, client: ClobClient, status: AuthStatus) -> None:
         try:
@@ -297,6 +310,44 @@ class PolymarketConnector:
             return getattr(OrderType, value)
         except AttributeError as exc:
             raise ValueError(f"Unsupported live_order_type: {self.settings.live_order_type}") from exc
+
+    @staticmethod
+    def _normalize_live_order(order: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(order, dict):
+            return {"raw": order}
+        price = PolymarketConnector._coerce_float(
+            order.get("price") or order.get("limit_price") or order.get("avgPrice")
+        )
+        size = PolymarketConnector._coerce_float(
+            order.get("size") or order.get("original_size") or order.get("quantity")
+        )
+        remaining = PolymarketConnector._coerce_float(
+            order.get("size_matched")
+            or order.get("matched_size")
+            or order.get("remaining")
+            or order.get("remaining_size")
+        )
+        return {
+            "order_id": str(order.get("id") or order.get("orderID") or order.get("orderId") or ""),
+            "market_id": str(order.get("market") or order.get("market_id") or order.get("condition_id") or ""),
+            "asset_id": str(order.get("asset_id") or order.get("token_id") or ""),
+            "status": str(order.get("status") or order.get("state") or ""),
+            "side": str(order.get("side") or ""),
+            "price": price,
+            "size": size,
+            "size_matched": remaining,
+            "created_at": str(order.get("created_at") or order.get("createdAt") or ""),
+            "raw": order,
+        }
+
+    @staticmethod
+    def _coerce_float(value: Any) -> float | None:
+        try:
+            if value in ("", None):
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _extract_balance_allowance(payload: Any) -> tuple[float | None, float | None]:

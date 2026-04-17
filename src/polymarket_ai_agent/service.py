@@ -408,6 +408,27 @@ class AgentService:
             },
         }
 
+    def live_orders(self) -> dict:
+        auth = self._auth_status_dict(self.polymarket.probe_live_readiness())
+        if not auth["readonly_ready"]:
+            raise RuntimeError("Authenticated live order inspection requires readonly_ready auth.")
+        orders = self.polymarket.list_live_orders()
+        return {
+            "readonly": True,
+            "count": len(orders),
+            "orders": orders,
+        }
+
+    def live_order_status(self, order_id: str) -> dict:
+        auth = self._auth_status_dict(self.polymarket.probe_live_readiness())
+        if not auth["readonly_ready"]:
+            raise RuntimeError("Authenticated live order inspection requires readonly_ready auth.")
+        order = self.polymarket.get_live_order(order_id)
+        return {
+            "readonly": True,
+            "order": order,
+        }
+
     def safety_stop_reason(self, account_state: AccountState | None = None) -> str | None:
         state = account_state or self.portfolio.get_account_state(ExecutionMode(self.settings.trading_mode))
         if state.daily_realized_pnl <= -self.settings.max_daily_loss_usd:
