@@ -171,6 +171,7 @@ class StubService:
             "market_id": market_id or "active-123",
             "tracked_orders": {"summary": {"active": 0, "terminal": 1, "errors": 0}},
             "recent_trades": {"count": 1, "trades": [{"trade_id": "trade-1"}]},
+            "preflight": {"blockers": ["edge_limit"]},
         }
 
     def safety_stop_reason(self):
@@ -356,6 +357,15 @@ def test_cli_live_reconcile(monkeypatch) -> None:
     assert "\"market_id\": \"active-123\"" in result.stdout
     assert "\"tracked_orders\"" in result.stdout
     assert "\"recent_trades\"" in result.stdout
+
+
+def test_cli_live_watch(monkeypatch) -> None:
+    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    result = runner.invoke(app, ["live-watch", "--active", "--iterations", "2", "--interval-seconds", "0"])
+    assert result.exit_code == 0
+    assert "\"readonly\": true" in result.stdout
+    assert "\"iterations_completed\": 2" in result.stdout
+    assert "\"changed\": true" in result.stdout
 
 
 def test_cli_live_requires_confirm(monkeypatch) -> None:

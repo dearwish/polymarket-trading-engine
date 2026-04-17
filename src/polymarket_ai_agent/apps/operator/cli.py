@@ -316,6 +316,51 @@ def live_reconcile(
         _handle_operator_error(exc)
 
 
+@app.command("live-watch")
+def live_watch(
+    market_id: str = typer.Argument("", help="Explicit market id to monitor."),
+    active: bool = typer.Option(False, "--active"),
+    iterations: int = typer.Option(1, min=1),
+    interval_seconds: int = typer.Option(0, min=0),
+    trade_limit: int = typer.Option(20, "--trade-limit", min=1, max=200),
+    order_limit: int = typer.Option(50, "--order-limit", min=1, max=500),
+) -> None:
+    try:
+        service = _service()
+        resolved_market_id = _resolve_market_id(service, market_id, active)
+        cycles = []
+        previous = None
+        for idx in range(iterations):
+            cycle = service.live_reconcile(
+                resolved_market_id,
+                trade_limit=trade_limit,
+                order_limit=order_limit,
+            )
+            fingerprint = {
+                "blockers": cycle["preflight"].get("blockers", []),
+                "tracked_summary": cycle["tracked_orders"].get("summary", {}),
+                "recent_trade_count": cycle["recent_trades"].get("count", 0),
+            }
+            cycle["changed"] = fingerprint != previous
+            previous = fingerprint
+            cycles.append(cycle)
+            if idx < iterations - 1 and interval_seconds > 0:
+                time.sleep(interval_seconds)
+        console.print_json(
+            json.dumps(
+                {
+                    "readonly": True,
+                    "market_id": resolved_market_id,
+                    "iterations_requested": iterations,
+                    "iterations_completed": len(cycles),
+                    "cycles": cycles,
+                }
+            )
+        )
+    except Exception as exc:
+        _handle_operator_error(exc)
+
+
 @app.command()
 def live(
     market_id: str = typer.Argument("", help="Explicit market id to trade live."),

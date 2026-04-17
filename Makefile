@@ -9,7 +9,7 @@ CLI := $(BIN)/polymarket-ai-agent
 ITERATIONS ?= 10
 INTERVAL ?= 15
 
-.PHONY: help venv install bootstrap reinstall bootstrap-force test status auth-check doctor live-preflight live-activity live-orders tracked-live-orders refresh-live-orders live-reconcile live-trades live-cancel check report \
+.PHONY: help venv install bootstrap reinstall bootstrap-force test status auth-check doctor live-preflight live-activity live-orders tracked-live-orders refresh-live-orders live-reconcile live-watch live-trades live-cancel check report \
 	simulate-active simulate-market simulate-loop-active simulate-loop-market \
 	guard-market-id
 
@@ -61,6 +61,9 @@ refresh-live-orders: install
 
 live-reconcile: install
 	$(CLI) live-reconcile --active
+
+live-watch: install
+	$(CLI) live-watch --active --iterations $(ITERATIONS) --interval-seconds $(INTERVAL)
 
 live-trades: install
 	$(CLI) live-trades
@@ -115,6 +118,8 @@ help:
 		'  make tracked-live-orders      Inspect locally tracked submitted live orders' \
 		'  make refresh-live-orders      Refresh tracked live orders against Polymarket' \
 		'  make live-reconcile           Refresh tracked orders and recent trades in one runbook step' \
+		'  make live-watch [ITERATIONS=10] [INTERVAL=15]' \
+		'                               Repeatedly run live reconciliation in read-only mode' \
 		'  make live-trades              Inspect recent authenticated trade history without posting orders' \
 		'  make live-cancel ORDER_ID=abc123' \
 		'                               Cancel a specific live order with explicit confirmation' \
