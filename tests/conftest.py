@@ -19,6 +19,9 @@ def settings(tmp_path: Path) -> Settings:
     return Settings(
         openrouter_api_key="",
         market_family="btc_5m",
+        polymarket_private_key="",
+        polymarket_funder="",
+        polymarket_signature_type=0,
         data_dir=tmp_path / "data",
         log_dir=tmp_path / "logs",
         db_path=tmp_path / "data" / "agent.db",

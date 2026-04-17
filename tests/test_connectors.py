@@ -240,7 +240,9 @@ def test_polymarket_connector_probes_live_readiness(settings) -> None:
             return "0x2791"
 
         def get_balance_allowance(self, params):
-            return {"balance": "123.45", "allowance": "98.76"}
+            assert params.asset_type == "COLLATERAL"
+            assert params.signature_type == configured.polymarket_signature_type
+            return {"balance": "123450000", "allowance": "98.76"}
 
         def get_orders(self, params):
             return [
@@ -304,7 +306,7 @@ def test_polymarket_connector_collects_partial_diagnostics_with_errors(settings)
             raise RuntimeError("no collateral")
 
         def get_balance_allowance(self, params):
-            return {"balance": {"available": "50"}, "allowance": {"allowance": "40"}}
+            return {"balance": {"available": "50000000"}, "allowance": {"allowance": "40"}}
 
         def get_orders(self, params):
             raise RuntimeError("orders unavailable")

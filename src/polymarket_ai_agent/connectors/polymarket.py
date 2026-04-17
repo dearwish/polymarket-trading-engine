@@ -6,7 +6,7 @@ from typing import Any
 
 import httpx
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import BalanceAllowanceParams, OpenOrderParams
+from py_clob_client.clob_types import AssetType, BalanceAllowanceParams, OpenOrderParams
 
 from polymarket_ai_agent.config import Settings
 from polymarket_ai_agent.types import AuthStatus, MarketCandidate, OrderBookSnapshot
@@ -127,7 +127,12 @@ class PolymarketConnector:
         except Exception as exc:
             status.errors.append(f"collateral_address: {exc}")
         try:
-            balance_payload = client.get_balance_allowance(BalanceAllowanceParams())
+            balance_payload = client.get_balance_allowance(
+                BalanceAllowanceParams(
+                    asset_type=AssetType.COLLATERAL,
+                    signature_type=self.settings.polymarket_signature_type,
+                )
+            )
             balance, allowance = self._extract_balance_allowance(balance_payload)
             status.balance = balance
             status.allowance = allowance
@@ -239,6 +244,8 @@ class PolymarketConnector:
                 ("available",),
             ],
         )
+        if balance is not None:
+            balance = balance / 1_000_000
         allowance = PolymarketConnector._extract_first_float(
             payload,
             [
