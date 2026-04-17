@@ -90,6 +90,16 @@ class StubService:
             "open_orders_count": 0,
         }
 
+    def doctor(self, market_id=None):
+        return {
+            "readonly": True,
+            "market_id": market_id or "active-123",
+            "auth": {"readonly_ready": True, "balance": 44.93},
+            "market": {"question": "Will BTC be up?", "seconds_to_expiry": 100},
+            "orderbook": {"midpoint": 0.52, "spread": 0.02, "two_sided": True},
+            "simulation": {"decision_status": "APPROVED", "decision_side": "YES"},
+        }
+
     def safety_stop_reason(self):
         return None
 
@@ -159,6 +169,15 @@ def test_cli_auth_check(monkeypatch) -> None:
     assert result.exit_code == 0
     assert "readonly_ready" in result.stdout
     assert "open_orders_count" in result.stdout
+
+
+def test_cli_doctor(monkeypatch) -> None:
+    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    result = runner.invoke(app, ["doctor", "--active"])
+    assert result.exit_code == 0
+    assert "\"readonly\": true" in result.stdout
+    assert "\"market_id\": \"active-123\"" in result.stdout
+    assert "\"decision_status\": \"APPROVED\"" in result.stdout
 
 
 def test_cli_simulate(monkeypatch) -> None:

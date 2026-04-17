@@ -179,6 +179,19 @@ def auth_check() -> None:
 
 
 @app.command()
+def doctor(
+    market_id: str = typer.Argument("", help="Explicit market id to inspect."),
+    active: bool = typer.Option(False, "--active"),
+) -> None:
+    try:
+        service = _service()
+        resolved_market_id = _resolve_market_id(service, market_id, active) if (market_id or active) else ""
+        console.print_json(json.dumps(service.doctor(resolved_market_id or None)))
+    except Exception as exc:
+        _handle_operator_error(exc)
+
+
+@app.command()
 def manage() -> None:
     try:
         service = _service()

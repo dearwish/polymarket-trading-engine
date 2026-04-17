@@ -290,6 +290,44 @@ class AgentService:
     def auth_status(self) -> dict:
         return self._auth_status_dict(self.polymarket.probe_live_readiness())
 
+    def doctor(self, market_id: str | None = None) -> dict:
+        resolved_market_id = market_id or self.get_active_market_id()
+        auth = self._auth_status_dict(self.polymarket.probe_live_readiness())
+        snapshot, assessment, decision = self.simulate_market(resolved_market_id)
+        return {
+            "readonly": True,
+            "market_id": resolved_market_id,
+            "auth": auth,
+            "market": {
+                "question": snapshot.candidate.question,
+                "slug": snapshot.candidate.slug,
+                "implied_probability": snapshot.candidate.implied_probability,
+                "liquidity_usd": snapshot.candidate.liquidity_usd,
+                "volume_24h_usd": snapshot.candidate.volume_24h_usd,
+                "seconds_to_expiry": snapshot.seconds_to_expiry,
+            },
+            "orderbook": {
+                "bid": snapshot.orderbook.bid,
+                "ask": snapshot.orderbook.ask,
+                "midpoint": snapshot.orderbook.midpoint,
+                "spread": snapshot.orderbook.spread,
+                "depth_usd": snapshot.orderbook.depth_usd,
+                "last_trade_price": snapshot.orderbook.last_trade_price,
+                "two_sided": snapshot.orderbook.two_sided,
+            },
+            "simulation": {
+                "fair_probability": assessment.fair_probability,
+                "confidence": assessment.confidence,
+                "edge": assessment.edge,
+                "suggested_side": assessment.suggested_side.value,
+                "decision_status": decision.status.value,
+                "decision_side": decision.side.value,
+                "size_usd": decision.size_usd,
+                "limit_price": decision.limit_price,
+                "rejected_by": decision.rejected_by,
+            },
+        }
+
     def safety_stop_reason(self, account_state: AccountState | None = None) -> str | None:
         state = account_state or self.portfolio.get_account_state(ExecutionMode(self.settings.trading_mode))
         if state.daily_realized_pnl <= -self.settings.max_daily_loss_usd:

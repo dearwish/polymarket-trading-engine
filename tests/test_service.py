@@ -320,3 +320,52 @@ def test_agent_service_auth_status(settings) -> None:
     assert auth["readonly_ready"] is True
     assert auth["allowance"] == 9.0
     assert auth["open_orders_markets"] == ["m1"]
+
+
+def test_agent_service_doctor(settings, market_snapshot, market_assessment) -> None:
+    service = AgentService(settings)
+    service.get_active_market_id = lambda: "123"
+    service.polymarket.probe_live_readiness = lambda: type(
+        "Auth",
+        (),
+        {
+            "private_key_configured": True,
+            "funder_configured": True,
+            "signature_type": 2,
+            "live_client_constructible": True,
+            "missing": [],
+            "wallet_address": "0xdef",
+            "api_credentials_derived": True,
+            "server_ok": True,
+            "readonly_ready": True,
+            "probe_attempted": True,
+            "collateral_address": "0x2791",
+            "balance": 44.93,
+            "allowance": None,
+            "open_orders_count": 0,
+            "open_orders_markets": [],
+            "diagnostics_collected": True,
+            "errors": [],
+        },
+    )()
+    service.simulate_market = lambda market_id: (
+        market_snapshot,
+        market_assessment,
+        type(
+            "Decision",
+            (),
+            {
+                "status": type("Status", (), {"value": "APPROVED"})(),
+                "side": type("Side", (), {"value": "YES"})(),
+                "limit_price": 0.52,
+                "size_usd": 10.0,
+                "rejected_by": [],
+            },
+        )(),
+    )
+    report = service.doctor()
+    assert report["readonly"] is True
+    assert report["market_id"] == "123"
+    assert report["auth"]["balance"] == 44.93
+    assert report["market"]["question"] == market_snapshot.candidate.question
+    assert report["simulation"]["decision_status"] == "APPROVED"
