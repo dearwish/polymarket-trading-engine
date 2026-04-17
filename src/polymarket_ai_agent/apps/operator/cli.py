@@ -8,6 +8,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from polymarket_ai_agent.apps.daemon.run import run_daemon
 from polymarket_ai_agent.config import get_settings
 from polymarket_ai_agent.service import AgentService
 
@@ -487,6 +488,24 @@ def run_loop(
                 }
             )
         )
+    except Exception as exc:
+        _handle_operator_error(exc)
+
+
+@app.command("daemon")
+def daemon(
+    duration_seconds: float = typer.Option(
+        0.0,
+        "--duration-seconds",
+        min=0.0,
+        help="If > 0, stop the daemon after this many seconds (useful for smoke tests).",
+    ),
+) -> None:
+    """Run the event-driven market-data daemon (Phase 1: read-only feeds)."""
+    try:
+        settings = get_settings()
+        service = AgentService(settings)
+        run_daemon(settings, service, duration_seconds=duration_seconds or None)
     except Exception as exc:
         _handle_operator_error(exc)
 

@@ -11,6 +11,7 @@ INTERVAL ?= 15
 
 .PHONY: help venv install bootstrap reinstall bootstrap-force test status auth-check doctor api-dev web-install web-dev web-build live-preflight live-activity live-orders tracked-live-orders refresh-live-orders live-reconcile live-watch live-trades live-cancel check report \
 	simulate-active simulate-market simulate-loop-active simulate-loop-market \
+	daemon daemon-smoke \
 	guard-market-id
 
 $(BIN)/python:
@@ -112,6 +113,12 @@ simulate-loop-active: install
 simulate-loop-market: install guard-market-id
 	$(CLI) simulate-loop $(MARKET_ID) --iterations $(ITERATIONS) --interval-seconds $(INTERVAL)
 
+daemon: install
+	$(CLI) daemon
+
+daemon-smoke: install
+	$(CLI) daemon --duration-seconds 15
+
 help:
 	@printf '%s\n' \
 		'Available targets:' \
@@ -148,6 +155,8 @@ help:
 		'                               Run repeated read-only simulation on the active market' \
 		'  make simulate-loop-market MARKET_ID=123 [ITERATIONS=10] [INTERVAL=15]' \
 		'                               Run repeated read-only simulation for a specific market' \
+		'  make daemon                   Run the event-driven market-data daemon (Phase 1)' \
+		'  make daemon-smoke             Run the daemon for 15s to smoke-test websocket plumbing' \
 		'' \
 		'Variables:' \
 		'  PYTHON      Python executable to use (default: python3)' \
