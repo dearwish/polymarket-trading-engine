@@ -129,6 +129,19 @@ class StubService:
             "cancellation": {"order_id": order_id, "success": True},
         }
 
+    def live_trades(self, market_id=None, limit=20):
+        return {
+            "readonly": True,
+            "count": 1,
+            "trades": [{"trade_id": "trade-1", "order_id": "live-1"}],
+        }
+
+    def live_trade_status(self, trade_id, market_id=None, limit=100):
+        return {
+            "readonly": True,
+            "trade": {"trade_id": trade_id, "order_id": "live-1"},
+        }
+
     def safety_stop_reason(self):
         return None
 
@@ -266,6 +279,20 @@ def test_cli_live_cancel(monkeypatch) -> None:
     result = runner.invoke(app, ["live-cancel", "live-1", "--confirm-cancel"])
     assert result.exit_code == 0
     assert "\"success\": true" in result.stdout
+
+
+def test_cli_live_trades(monkeypatch) -> None:
+    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    result = runner.invoke(app, ["live-trades", "--limit", "5"])
+    assert result.exit_code == 0
+    assert "\"trade_id\": \"trade-1\"" in result.stdout
+
+
+def test_cli_live_trade(monkeypatch) -> None:
+    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    result = runner.invoke(app, ["live-trade", "trade-1"])
+    assert result.exit_code == 0
+    assert "\"trade_id\": \"trade-1\"" in result.stdout
 
 
 def test_cli_live_requires_confirm(monkeypatch) -> None:

@@ -557,3 +557,64 @@ def test_agent_service_cancel_live_order(settings) -> None:
     payload = service.cancel_live_order("live-1")
     assert payload["order"]["order_id"] == "live-1"
     assert payload["cancellation"]["success"] is True
+
+
+def test_agent_service_live_trades(settings) -> None:
+    service = AgentService(settings)
+    service.polymarket.probe_live_readiness = lambda: type(
+        "Auth",
+        (),
+        {
+            "private_key_configured": True,
+            "funder_configured": True,
+            "signature_type": 2,
+            "live_client_constructible": True,
+            "missing": [],
+            "wallet_address": "0xdef",
+            "api_credentials_derived": True,
+            "server_ok": True,
+            "readonly_ready": True,
+            "probe_attempted": True,
+            "collateral_address": "0x2791",
+            "balance": 44.93,
+            "allowance": None,
+            "open_orders_count": 0,
+            "open_orders_markets": [],
+            "diagnostics_collected": True,
+            "errors": [],
+        },
+    )()
+    service.polymarket.list_live_trades = lambda market_id=None, limit=20: [{"trade_id": "trade-1"}]
+    payload = service.live_trades(limit=5)
+    assert payload["count"] == 1
+    assert payload["trades"][0]["trade_id"] == "trade-1"
+
+
+def test_agent_service_live_trade_status(settings) -> None:
+    service = AgentService(settings)
+    service.polymarket.probe_live_readiness = lambda: type(
+        "Auth",
+        (),
+        {
+            "private_key_configured": True,
+            "funder_configured": True,
+            "signature_type": 2,
+            "live_client_constructible": True,
+            "missing": [],
+            "wallet_address": "0xdef",
+            "api_credentials_derived": True,
+            "server_ok": True,
+            "readonly_ready": True,
+            "probe_attempted": True,
+            "collateral_address": "0x2791",
+            "balance": 44.93,
+            "allowance": None,
+            "open_orders_count": 0,
+            "open_orders_markets": [],
+            "diagnostics_collected": True,
+            "errors": [],
+        },
+    )()
+    service.polymarket.get_live_trade = lambda trade_id, market_id=None, limit=100: {"trade_id": trade_id}
+    payload = service.live_trade_status("trade-1")
+    assert payload["trade"]["trade_id"] == "trade-1"

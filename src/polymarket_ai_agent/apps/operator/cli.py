@@ -236,6 +236,31 @@ def live_cancel(
         _handle_operator_error(exc)
 
 
+@app.command("live-trades")
+def live_trades(
+    market_id: str = typer.Option("", "--market-id"),
+    limit: int = typer.Option(20, min=1, max=200),
+) -> None:
+    try:
+        service = _service()
+        console.print_json(json.dumps(service.live_trades(market_id or None, limit=limit)))
+    except Exception as exc:
+        _handle_operator_error(exc)
+
+
+@app.command("live-trade")
+def live_trade(
+    trade_id: str,
+    market_id: str = typer.Option("", "--market-id"),
+    limit: int = typer.Option(100, min=1, max=500),
+) -> None:
+    try:
+        service = _service()
+        console.print_json(json.dumps(service.live_trade_status(trade_id, market_id or None, limit=limit)))
+    except Exception as exc:
+        _handle_operator_error(exc)
+
+
 @app.command()
 def live(
     market_id: str = typer.Argument("", help="Explicit market id to trade live."),

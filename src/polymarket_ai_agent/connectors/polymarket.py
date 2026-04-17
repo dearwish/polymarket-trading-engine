@@ -6,7 +6,7 @@ from typing import Any
 
 import httpx
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import AssetType, BalanceAllowanceParams, OpenOrderParams, OrderArgs, OrderType
+from py_clob_client.clob_types import AssetType, BalanceAllowanceParams, OpenOrderParams, OrderArgs, OrderType, TradeParams
 from py_clob_client.order_builder.constants import BUY
 
 from polymarket_ai_agent.config import Settings
@@ -193,6 +193,19 @@ class PolymarketConnector:
         response = client.cancel_orders([order_id])
         return self._normalize_cancel_response(order_id, response)
 
+    def list_live_trades(self, market_id: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+        client = self._build_authed_live_client()
+        params = TradeParams(market=market_id) if market_id else TradeParams()
+        trades = client.get_trades(params)
+        return [self._normalize_live_trade(trade) for trade in trades[:limit]]
+
+    def get_live_trade(self, trade_id: str, market_id: str | None = None, limit: int = 100) -> dict[str, Any]:
+        trades = self.list_live_trades(market_id=market_id, limit=limit)
+        for trade in trades:
+            if trade["trade_id"] == trade_id:
+                return trade
+        raise ValueError(f"Unable to find trade {trade_id} in recent authenticated trade history.")
+
     def _build_authed_live_client(self) -> ClobClient:
         client = self.build_live_client()
         creds = client.create_or_derive_api_creds()
@@ -368,6 +381,24 @@ class PolymarketConnector:
             "order_id": order_id,
             "success": False,
             "response": response,
+        }
+
+    @staticmethod
+    def _normalize_live_trade(trade: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(trade, dict):
+            return {"raw": trade}
+        return {
+            "trade_id": str(trade.get("id") or trade.get("tradeID") or trade.get("tradeId") or ""),
+            "order_id": str(trade.get("order_id") or trade.get("orderID") or trade.get("orderId") or ""),
+            "market_id": str(trade.get("market") or trade.get("market_id") or trade.get("condition_id") or ""),
+            "asset_id": str(trade.get("asset_id") or trade.get("token_id") or ""),
+            "status": str(trade.get("status") or trade.get("state") or ""),
+            "side": str(trade.get("side") or ""),
+            "price": PolymarketConnector._coerce_float(trade.get("price") or trade.get("avgPrice")),
+            "size": PolymarketConnector._coerce_float(trade.get("size") or trade.get("quantity")),
+            "amount": PolymarketConnector._coerce_float(trade.get("amount") or trade.get("usdc_size")),
+            "created_at": str(trade.get("created_at") or trade.get("createdAt") or ""),
+            "raw": trade,
         }
 
     @staticmethod

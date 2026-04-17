@@ -465,6 +465,48 @@ def test_polymarket_connector_cancels_live_order(settings) -> None:
     assert result["success"] is True
 
 
+def test_polymarket_connector_lists_live_trades(settings) -> None:
+    configured = settings.model_copy(
+        update={
+            "polymarket_private_key": "0x" + "1" * 64,
+        }
+    )
+    connector = PolymarketConnector(configured, client=DummyClient([]))
+
+    class StubLiveClient:
+        def create_or_derive_api_creds(self):
+            return {"key": "derived"}
+
+        def set_api_creds(self, creds):
+            self.creds = creds
+
+        def get_trades(self, params):
+            return [
+                {"id": "trade-1", "order_id": "live-1", "market": "m1", "price": "0.51", "size": "20"},
+            ]
+
+    connector.build_live_client = lambda: StubLiveClient()
+    trades = connector.list_live_trades(limit=5)
+    assert trades[0]["trade_id"] == "trade-1"
+    assert trades[0]["price"] == 0.51
+    assert trades[0]["size"] == 20.0
+
+
+def test_polymarket_connector_gets_single_live_trade(settings) -> None:
+    configured = settings.model_copy(
+        update={
+            "polymarket_private_key": "0x" + "1" * 64,
+        }
+    )
+    connector = PolymarketConnector(configured, client=DummyClient([]))
+    connector.list_live_trades = lambda market_id=None, limit=100: [
+        {"trade_id": "trade-1", "order_id": "live-1"},
+        {"trade_id": "trade-2", "order_id": "live-2"},
+    ]
+    trade = connector.get_live_trade("trade-2")
+    assert trade["order_id"] == "live-2"
+
+
 def test_polymarket_connector_discovers_btc_daily_threshold_markets(settings) -> None:
     configured = settings.model_copy(update={"market_family": "btc_daily_threshold"})
     payload = [
