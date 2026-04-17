@@ -45,13 +45,15 @@ class DummyClient:
         return DummyResponse(payload)
 
 
-def test_scoring_engine_heuristic_fallback(settings, market_snapshot) -> None:
+def test_scoring_engine_quant_fallback(settings, market_snapshot) -> None:
     packet = ResearchEngine().build_evidence_packet(market_snapshot)
     engine = ScoringEngine(settings)
     assessment = engine.score_market(packet)
     assert assessment.market_id == packet.market_id
-    assert assessment.raw_model_output == "heuristic-fallback"
+    assert assessment.raw_model_output == "quant-scoring"
     assert assessment.suggested_side in {SuggestedSide.YES, SuggestedSide.NO, SuggestedSide.ABSTAIN}
+    # Per-side edges are always populated by the quant scorer.
+    assert abs(assessment.fair_probability + assessment.fair_probability_no - 1.0) < 1e-6
 
 
 def test_scoring_engine_openrouter_path(settings, market_snapshot) -> None:

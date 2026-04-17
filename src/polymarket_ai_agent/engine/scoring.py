@@ -9,6 +9,7 @@ import httpx
 from pydantic import BaseModel, Field, ValidationError
 
 from polymarket_ai_agent.config import Settings
+from polymarket_ai_agent.engine.quant_scoring import QuantScoringEngine
 from polymarket_ai_agent.types import EvidencePacket, MarketAssessment, SuggestedSide
 
 
@@ -25,11 +26,12 @@ class ScoringEngine:
     def __init__(self, settings: Settings, client: httpx.Client | None = None):
         self.settings = settings
         self.client = client or httpx.Client(timeout=30)
+        self.quant = QuantScoringEngine(settings)
 
     def score_market(self, packet: EvidencePacket) -> MarketAssessment:
         if self.settings.openrouter_api_key:
             return self._score_via_openrouter(packet)
-        return self._score_heuristically(packet)
+        return self.quant.score_market(packet)
 
     def _score_via_openrouter(self, packet: EvidencePacket) -> MarketAssessment:
         prompt = dedent(
@@ -66,6 +68,7 @@ class ScoringEngine:
         fair = float(parsed.fair_probability)
         edge = fair - packet.market_probability
         suggested_side = self._align_suggested_side(parsed.suggested_side, edge)
+        breakdown = self.quant._edge_breakdown(packet, fair)
         return MarketAssessment(
             market_id=packet.market_id,
             fair_probability=fair,
@@ -76,39 +79,10 @@ class ScoringEngine:
             reasons_to_abstain=list(parsed.reasons_to_abstain),
             edge=edge,
             raw_model_output=raw,
-        )
-
-    def _score_heuristically(self, packet: EvidencePacket) -> MarketAssessment:
-        directional_bump = 0.015 if packet.recent_price_change_bps > 0 else -0.015
-        external_bias = 0.01 if packet.external_price > 0 else 0.0
-        fair_probability = max(0.01, min(0.99, packet.market_probability + directional_bump + external_bias))
-        edge = fair_probability - packet.market_probability
-        if edge > 0.01:
-            side = SuggestedSide.YES
-        elif edge < -0.01:
-            side = SuggestedSide.NO
-        else:
-            side = SuggestedSide.ABSTAIN
-        reasons_for_trade = [
-            "Heuristic fallback scoring is active because no OpenRouter key is configured.",
-            f"Recent price change bps = {packet.recent_price_change_bps:.2f}",
-        ]
-        reasons_to_abstain = []
-        if packet.seconds_to_expiry <= 30:
-            reasons_to_abstain.append("Market is too close to expiry.")
-        if packet.spread > 0.03:
-            reasons_to_abstain.append("Spread is wide relative to short-horizon edge.")
-        confidence = 0.55 if side == SuggestedSide.ABSTAIN else 0.70
-        return MarketAssessment(
-            market_id=packet.market_id,
-            fair_probability=fair_probability,
-            confidence=confidence,
-            suggested_side=side,
-            expiry_risk="HIGH" if packet.seconds_to_expiry <= 30 else "MEDIUM",
-            reasons_for_trade=reasons_for_trade,
-            reasons_to_abstain=reasons_to_abstain,
-            edge=edge,
-            raw_model_output="heuristic-fallback",
+            edge_yes=round(breakdown.edge_yes, 6),
+            edge_no=round(breakdown.edge_no, 6),
+            fair_probability_no=round(1.0 - fair, 6),
+            slippage_bps=round(breakdown.slippage_bps, 4),
         )
 
     def _normalize_openrouter_payload(self, payload: dict, packet: EvidencePacket) -> dict:
@@ -217,4 +191,8 @@ class ScoringEngine:
             ],
             edge=0.0,
             raw_model_output=raw_model_output,
+            edge_yes=0.0,
+            edge_no=0.0,
+            fair_probability_no=round(1.0 - packet.market_probability, 6),
+            slippage_bps=0.0,
         )
