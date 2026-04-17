@@ -84,10 +84,14 @@ class AgentService:
         self.journal.log_event("market_assessment", assessment)
         return snapshot, assessment
 
-    def paper_trade(self, market_id: str):
+    def _prepare_trade(self, market_id: str, mode: ExecutionMode):
         snapshot, assessment = self.analyze_market(market_id)
-        account_state = self.portfolio.get_account_state(ExecutionMode.PAPER)
+        account_state = self.portfolio.get_account_state(mode)
         decision = self.risk.decide_trade(snapshot, assessment, account_state)
+        return snapshot, assessment, decision, account_state
+
+    def paper_trade(self, market_id: str):
+        snapshot, assessment, decision, _account_state = self._prepare_trade(market_id, ExecutionMode.PAPER)
         self.journal.log_event("trade_decision", decision)
         result = self.execution.execute_trade(decision, snapshot.orderbook)
         self.portfolio.record_execution(decision, result)
@@ -95,11 +99,84 @@ class AgentService:
         return snapshot, assessment, decision, result
 
     def simulate_market(self, market_id: str):
-        snapshot, assessment = self.analyze_market(market_id)
-        account_state = self.portfolio.get_account_state(ExecutionMode.PAPER)
-        decision = self.risk.decide_trade(snapshot, assessment, account_state)
+        snapshot, assessment, decision, _account_state = self._prepare_trade(market_id, ExecutionMode.PAPER)
         self.journal.log_event("simulation_decision", decision)
         return snapshot, assessment, decision
+
+    def live_preflight(self, market_id: str | None = None) -> dict:
+        resolved_market_id = market_id or self.get_active_market_id()
+        auth = self._auth_status_dict(self.polymarket.probe_live_readiness())
+        snapshot, assessment, decision, account_state = self._prepare_trade(resolved_market_id, ExecutionMode.LIVE)
+        blockers: list[str] = []
+        if self.settings.trading_mode != ExecutionMode.LIVE.value:
+            blockers.append("trading_mode_not_live")
+        if not self.settings.live_trading_enabled:
+            blockers.append("live_trading_disabled")
+        if not auth["readonly_ready"]:
+            blockers.append("auth_not_ready")
+        safety_stop = self.safety_stop_reason(account_state)
+        if safety_stop:
+            blockers.append(safety_stop)
+        if decision.status.value != "APPROVED":
+            blockers.extend(decision.rejected_by or ["decision_not_approved"])
+        ready = not blockers
+        preflight = {
+            "readonly": True,
+            "market_id": resolved_market_id,
+            "ready": ready,
+            "blockers": blockers,
+            "auth": auth,
+            "market": {
+                "question": snapshot.candidate.question,
+                "slug": snapshot.candidate.slug,
+                "implied_probability": snapshot.candidate.implied_probability,
+                "liquidity_usd": snapshot.candidate.liquidity_usd,
+                "volume_24h_usd": snapshot.candidate.volume_24h_usd,
+                "seconds_to_expiry": snapshot.seconds_to_expiry,
+            },
+            "orderbook": {
+                "bid": snapshot.orderbook.bid,
+                "ask": snapshot.orderbook.ask,
+                "midpoint": snapshot.orderbook.midpoint,
+                "spread": snapshot.orderbook.spread,
+                "depth_usd": snapshot.orderbook.depth_usd,
+                "last_trade_price": snapshot.orderbook.last_trade_price,
+                "two_sided": snapshot.orderbook.two_sided,
+            },
+            "decision": {
+                "status": decision.status.value,
+                "side": decision.side.value,
+                "size_usd": decision.size_usd,
+                "limit_price": decision.limit_price,
+                "asset_id": decision.asset_id,
+                "rejected_by": decision.rejected_by,
+            },
+            "assessment": {
+                "fair_probability": assessment.fair_probability,
+                "confidence": assessment.confidence,
+                "edge": assessment.edge,
+                "suggested_side": assessment.suggested_side.value,
+            },
+            "account_state": {
+                "available_usd": account_state.available_usd,
+                "open_positions": account_state.open_positions,
+                "daily_realized_pnl": account_state.daily_realized_pnl,
+                "rejected_orders": account_state.rejected_orders,
+            },
+        }
+        self.journal.log_event("live_preflight", preflight)
+        return preflight
+
+    def live_trade(self, market_id: str):
+        preflight = self.live_preflight(market_id)
+        if preflight["blockers"]:
+            raise RuntimeError(f"Live preflight failed: {', '.join(preflight['blockers'])}")
+        snapshot, assessment, decision, _account_state = self._prepare_trade(market_id, ExecutionMode.LIVE)
+        self.journal.log_event("trade_decision", decision)
+        result = self.execution.execute_trade(decision, snapshot.orderbook)
+        self.portfolio.record_execution(decision, result)
+        self.journal.log_event("execution_result", result)
+        return snapshot, assessment, decision, result
 
     def run_cycle(self, market_id: str) -> dict:
         actions = self.manage_open_positions()

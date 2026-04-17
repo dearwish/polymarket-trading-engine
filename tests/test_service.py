@@ -370,3 +370,97 @@ def test_agent_service_doctor(settings, market_snapshot, market_assessment) -> N
     assert report["auth"]["balance"] == 44.93
     assert report["market"]["question"] == market_snapshot.candidate.question
     assert report["simulation"]["decision_status"] == "APPROVED"
+
+
+def test_agent_service_live_preflight_blocked(settings, market_snapshot, market_assessment) -> None:
+    service = AgentService(settings)
+    service.get_active_market_id = lambda: "123"
+    service.polymarket.probe_live_readiness = lambda: type(
+        "Auth",
+        (),
+        {
+            "private_key_configured": True,
+            "funder_configured": True,
+            "signature_type": 2,
+            "live_client_constructible": True,
+            "missing": [],
+            "wallet_address": "0xdef",
+            "api_credentials_derived": True,
+            "server_ok": True,
+            "readonly_ready": True,
+            "probe_attempted": True,
+            "collateral_address": "0x2791",
+            "balance": 44.93,
+            "allowance": None,
+            "open_orders_count": 0,
+            "open_orders_markets": [],
+            "diagnostics_collected": True,
+            "errors": [],
+        },
+    )()
+    service._prepare_trade = lambda market_id, mode: (
+        market_snapshot,
+        market_assessment,
+        TradeDecision(
+            market_id="123",
+            status=DecisionStatus.REJECTED,
+            side=SuggestedSide.ABSTAIN,
+            size_usd=0.0,
+            limit_price=0.52,
+            rationale=[],
+            rejected_by=["edge_limit"],
+        ),
+        AccountState(
+            mode=ExecutionMode.LIVE,
+            available_usd=100.0,
+            open_positions=0,
+            daily_realized_pnl=0.0,
+            rejected_orders=0,
+        ),
+    )
+    preflight = service.live_preflight()
+    assert preflight["ready"] is False
+    assert "trading_mode_not_live" in preflight["blockers"]
+    assert "live_trading_disabled" in preflight["blockers"]
+    assert "edge_limit" in preflight["blockers"]
+
+
+def test_agent_service_live_trade_executes_when_preflight_ready(settings, market_snapshot, market_assessment) -> None:
+    configured = settings.model_copy(update={"trading_mode": "live", "live_trading_enabled": True})
+    service = AgentService(configured)
+    service.live_preflight = lambda market_id: {"blockers": []}
+    service._prepare_trade = lambda market_id, mode: (
+        market_snapshot,
+        market_assessment,
+        TradeDecision(
+            market_id="123",
+            status=DecisionStatus.APPROVED,
+            side=SuggestedSide.YES,
+            size_usd=10.0,
+            limit_price=0.52,
+            rationale=["approved"],
+            rejected_by=[],
+            asset_id="token-yes",
+        ),
+        AccountState(
+            mode=ExecutionMode.LIVE,
+            available_usd=100.0,
+            open_positions=0,
+            daily_realized_pnl=0.0,
+            rejected_orders=0,
+        ),
+    )
+    service.execution.execute_trade = lambda decision, orderbook: ExecutionResult(
+        market_id="123",
+        success=True,
+        mode=ExecutionMode.LIVE,
+        order_id="live-1",
+        status="LIVE_SUBMITTED",
+        detail="ok",
+    )
+    recorded = {"called": False}
+    service.portfolio.record_execution = lambda decision, result: recorded.__setitem__("called", True)
+    _, _, decision, result = service.live_trade("123")
+    assert decision.asset_id == "token-yes"
+    assert result.status == "LIVE_SUBMITTED"
+    assert recorded["called"] is True

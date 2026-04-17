@@ -191,6 +191,63 @@ def doctor(
         _handle_operator_error(exc)
 
 
+@app.command("live-preflight")
+def live_preflight(
+    market_id: str = typer.Argument("", help="Explicit market id to inspect for live readiness."),
+    active: bool = typer.Option(False, "--active"),
+) -> None:
+    try:
+        service = _service()
+        resolved_market_id = _resolve_market_id(service, market_id, active) if (market_id or active) else ""
+        console.print_json(json.dumps(service.live_preflight(resolved_market_id or None)))
+    except Exception as exc:
+        _handle_operator_error(exc)
+
+
+@app.command()
+def live(
+    market_id: str = typer.Argument("", help="Explicit market id to trade live."),
+    active: bool = typer.Option(False, "--active"),
+    confirm_live: bool = typer.Option(False, "--confirm-live"),
+) -> None:
+    try:
+        if not confirm_live:
+            raise ValueError("Refusing live execution without --confirm-live.")
+        service = _service()
+        resolved_market_id = _resolve_market_id(service, market_id, active)
+        snapshot, assessment, decision, result = service.live_trade(resolved_market_id)
+        console.print_json(
+            json.dumps(
+                {
+                    "market_id": resolved_market_id,
+                    "question": snapshot.candidate.question,
+                    "assessment": {
+                        "fair_probability": assessment.fair_probability,
+                        "confidence": assessment.confidence,
+                        "edge": assessment.edge,
+                        "suggested_side": assessment.suggested_side.value,
+                    },
+                    "decision": {
+                        "status": decision.status.value,
+                        "side": decision.side.value,
+                        "size_usd": decision.size_usd,
+                        "limit_price": decision.limit_price,
+                        "asset_id": decision.asset_id,
+                        "rejected_by": decision.rejected_by,
+                    },
+                    "execution": {
+                        "success": result.success,
+                        "status": result.status,
+                        "detail": result.detail,
+                        "order_id": result.order_id,
+                    },
+                }
+            )
+        )
+    except Exception as exc:
+        _handle_operator_error(exc)
+
+
 @app.command()
 def manage() -> None:
     try:

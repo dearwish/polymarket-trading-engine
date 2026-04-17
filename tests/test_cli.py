@@ -100,6 +100,15 @@ class StubService:
             "simulation": {"decision_status": "APPROVED", "decision_side": "YES"},
         }
 
+    def live_preflight(self, market_id=None):
+        return {
+            "readonly": True,
+            "market_id": market_id or "active-123",
+            "ready": True,
+            "blockers": [],
+            "decision": {"status": "APPROVED", "asset_id": "token-yes"},
+        }
+
     def safety_stop_reason(self):
         return None
 
@@ -155,6 +164,28 @@ class StubService:
     def get_active_market_id(self):
         return "active-123"
 
+    def live_trade(self, market_id):
+        snapshot, assessment = self.analyze_market(market_id)
+        decision = TradeDecision(
+            market_id=market_id,
+            status=DecisionStatus.APPROVED,
+            side=SuggestedSide.YES,
+            size_usd=10.0,
+            limit_price=0.52,
+            rationale=["approved"],
+            rejected_by=[],
+            asset_id="token-yes",
+        )
+        result = ExecutionResult(
+            market_id=market_id,
+            success=True,
+            mode=ExecutionMode.LIVE,
+            order_id="live-1",
+            status="LIVE_SUBMITTED",
+            detail="ok",
+        )
+        return snapshot, assessment, decision, result
+
 
 def test_cli_status(monkeypatch) -> None:
     monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
@@ -178,6 +209,29 @@ def test_cli_doctor(monkeypatch) -> None:
     assert "\"readonly\": true" in result.stdout
     assert "\"market_id\": \"active-123\"" in result.stdout
     assert "\"decision_status\": \"APPROVED\"" in result.stdout
+
+
+def test_cli_live_preflight(monkeypatch) -> None:
+    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    result = runner.invoke(app, ["live-preflight", "--active"])
+    assert result.exit_code == 0
+    assert "\"ready\": true" in result.stdout
+    assert "\"asset_id\": \"token-yes\"" in result.stdout
+
+
+def test_cli_live_requires_confirm(monkeypatch) -> None:
+    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    result = runner.invoke(app, ["live", "--active"])
+    assert result.exit_code == 1
+    assert "confirm-live" in result.stdout
+
+
+def test_cli_live_with_confirm(monkeypatch) -> None:
+    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    result = runner.invoke(app, ["live", "--active", "--confirm-live"])
+    assert result.exit_code == 0
+    assert "\"order_id\": \"live-1\"" in result.stdout
+    assert "\"asset_id\": \"token-yes\"" in result.stdout
 
 
 def test_cli_simulate(monkeypatch) -> None:
