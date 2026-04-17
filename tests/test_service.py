@@ -685,6 +685,7 @@ def test_agent_service_live_activity(settings) -> None:
         "ready": False,
         "blockers": ["edge_limit"],
         "market": {
+            "condition_id": "cond-123",
             "seconds_to_expiry": 1800,
             "yes_token_id": "yes-token",
             "no_token_id": "no-token",
@@ -692,9 +693,12 @@ def test_agent_service_live_activity(settings) -> None:
     }
     service.polymarket.list_live_orders = lambda: [{"order_id": "live-1"}]
     service.polymarket.list_live_trades = lambda market_id=None, limit=20: [
-        {"trade_id": "trade-1", "asset_id": "yes-token"},
-        {"trade_id": "trade-2", "asset_id": "no-token"},
-        {"trade_id": "trade-3", "side": "NO"},
+        {"trade_id": "user-trade-1", "asset_id": "yes-token"},
+    ]
+    service.polymarket.list_market_trades = lambda market_id, limit=20: [
+        {"trade_id": "trade-1", "asset_id": "yes-token", "outcome": "Yes"},
+        {"trade_id": "trade-2", "asset_id": "no-token", "outcome": "No"},
+        {"trade_id": "trade-3", "side": "NO", "outcome": "No"},
     ]
     service.portfolio.list_active_live_orders = lambda limit=50: [{"order_id": "live-1"}]
     service.portfolio.list_terminal_live_orders = lambda limit=50: [{"order_id": "live-2"}]
@@ -703,9 +707,10 @@ def test_agent_service_live_activity(settings) -> None:
     assert payload["open_orders"]["count"] == 1
     assert payload["tracked_orders"]["active_count"] == 1
     assert payload["tracked_orders"]["terminal_count"] == 1
-    assert payload["recent_trades"]["count"] == 3
+    assert payload["recent_trades"]["count"] == 1
     assert payload["preflight"]["blockers"] == ["edge_limit"]
     assert payload["last_poll"]["time_remaining_seconds"] == 1800
+    assert payload["last_poll"]["market_trade_count"] == 3
     assert payload["last_poll"]["trade_counts"] == {"yes": 1, "no": 2, "other": 0, "total": 3}
 
 

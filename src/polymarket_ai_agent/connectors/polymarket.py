@@ -199,6 +199,17 @@ class PolymarketConnector:
         trades = client.get_trades(params)
         return [self._normalize_live_trade(trade) for trade in trades[:limit]]
 
+    def list_market_trades(self, market_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        response = self.client.get(
+            f"{self.settings.polymarket_data_url}/trades",
+            params={"market": market_id, "limit": limit},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, list):
+            return []
+        return [self._normalize_market_trade(trade) for trade in payload[:limit]]
+
     def get_live_trade(self, trade_id: str, market_id: str | None = None, limit: int = 100) -> dict[str, Any]:
         trades = self.list_live_trades(market_id=market_id, limit=limit)
         for trade in trades:
@@ -236,6 +247,21 @@ class PolymarketConnector:
         except Exception as exc:
             status.errors.append(f"open_orders: {exc}")
         status.diagnostics_collected = True
+
+    @staticmethod
+    def _normalize_market_trade(trade: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "trade_id": str(trade.get("id") or trade.get("transactionHash") or ""),
+            "market_id": str(trade.get("conditionId") or trade.get("market") or ""),
+            "asset_id": str(trade.get("asset") or trade.get("asset_id") or ""),
+            "side": str(trade.get("side") or ""),
+            "outcome": str(trade.get("outcome") or ""),
+            "price": float(trade.get("price") or 0.0),
+            "size": float(trade.get("size") or 0.0),
+            "timestamp": int(trade.get("timestamp") or 0),
+            "title": str(trade.get("title") or ""),
+            "slug": str(trade.get("slug") or ""),
+        }
 
     def estimate_seconds_to_expiry(self, end_date_iso: str) -> int:
         try:

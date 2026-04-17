@@ -507,6 +507,29 @@ def test_polymarket_connector_gets_single_live_trade(settings) -> None:
     assert trade["order_id"] == "live-2"
 
 
+def test_polymarket_connector_lists_public_market_trades(settings) -> None:
+    payload = [
+        {
+            "id": "trade-public-1",
+            "conditionId": "cond-123",
+            "asset": "yes-token",
+            "side": "BUY",
+            "outcome": "Yes",
+            "price": 0.61,
+            "size": 42.5,
+            "timestamp": 1776452750,
+            "title": "Will BTC be above 82k?",
+            "slug": "btc-above-82k",
+        }
+    ]
+    connector = PolymarketConnector(settings, client=DummyClient([payload]))
+    trades = connector.list_market_trades("cond-123", limit=5)
+    assert trades[0]["trade_id"] == "trade-public-1"
+    assert trades[0]["market_id"] == "cond-123"
+    assert trades[0]["outcome"] == "Yes"
+    assert trades[0]["price"] == 0.61
+
+
 def test_polymarket_connector_discovers_btc_daily_threshold_markets(settings) -> None:
     configured = settings.model_copy(update={"market_family": "btc_daily_threshold"})
     payload = [

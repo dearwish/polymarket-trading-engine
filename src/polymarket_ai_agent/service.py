@@ -131,6 +131,7 @@ class AgentService:
             "market": {
                 "question": snapshot.candidate.question,
                 "slug": snapshot.candidate.slug,
+                "condition_id": snapshot.candidate.condition_id,
                 "implied_probability": snapshot.candidate.implied_probability,
                 "liquidity_usd": snapshot.candidate.liquidity_usd,
                 "volume_24h_usd": snapshot.candidate.volume_24h_usd,
@@ -518,9 +519,13 @@ class AgentService:
         preflight = self.live_preflight(market_id)
         orders = self.polymarket.list_live_orders()
         trades = self.polymarket.list_live_trades(market_id=preflight["market_id"], limit=trade_limit)
+        market_trades = self.polymarket.list_market_trades(
+            market_id=str(preflight["market"].get("condition_id") or ""),
+            limit=trade_limit,
+        )
         tracked_orders = self.portfolio.list_live_orders(limit=50)
         trade_counts = self._trade_side_counts(
-            trades,
+            market_trades,
             yes_token_id=str(preflight["market"].get("yes_token_id") or ""),
             no_token_id=str(preflight["market"].get("no_token_id") or ""),
         )
@@ -533,6 +538,7 @@ class AgentService:
                 "polled_at": utc_now().isoformat(),
                 "time_remaining_seconds": preflight["market"]["seconds_to_expiry"],
                 "time_remaining_minutes": round(preflight["market"]["seconds_to_expiry"] / 60, 1),
+                "market_trade_count": len(market_trades),
                 "trade_counts": trade_counts,
             },
             "open_orders": {
@@ -560,7 +566,12 @@ class AgentService:
             counts["total"] += 1
             asset_id = str(trade.get("asset_id") or "")
             side = str(trade.get("side") or "").strip().upper()
-            if yes_token_id and asset_id == yes_token_id:
+            outcome = str(trade.get("outcome") or "").strip().upper()
+            if outcome == "YES":
+                counts["yes"] += 1
+            elif outcome == "NO":
+                counts["no"] += 1
+            elif yes_token_id and asset_id == yes_token_id:
                 counts["yes"] += 1
             elif no_token_id and asset_id == no_token_id:
                 counts["no"] += 1

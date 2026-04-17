@@ -25,6 +25,7 @@ class Settings(BaseSettings):
 
     polymarket_host: str = "https://clob.polymarket.com"
     polymarket_gamma_url: str = "https://gamma-api.polymarket.com"
+    polymarket_data_url: str = "https://data-api.polymarket.com"
     polymarket_chain_id: int = 137
     polymarket_private_key: str = ""
     polymarket_funder: str = ""
