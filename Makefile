@@ -9,7 +9,7 @@ CLI := $(BIN)/polymarket-ai-agent
 ITERATIONS ?= 10
 INTERVAL ?= 15
 
-.PHONY: help venv install bootstrap reinstall bootstrap-force test status auth-check doctor live-preflight live-activity live-orders tracked-live-orders refresh-live-orders live-reconcile live-watch live-trades live-cancel check report \
+.PHONY: help venv install bootstrap reinstall bootstrap-force test status auth-check doctor api-dev live-preflight live-activity live-orders tracked-live-orders refresh-live-orders live-reconcile live-watch live-trades live-cancel check report \
 	simulate-active simulate-market simulate-loop-active simulate-loop-market \
 	guard-market-id
 
@@ -43,6 +43,9 @@ auth-check: install
 
 doctor: install
 	$(CLI) doctor --active
+
+api-dev: install
+	$(BIN)/uvicorn polymarket_ai_agent.apps.api.main:app --host 127.0.0.1 --port 8000 --reload
 
 live-preflight: install
 	$(CLI) live-preflight --active
@@ -112,6 +115,7 @@ help:
 		'  make status                   Run the CLI status command' \
 		'  make auth-check               Run the CLI auth-check command' \
 		'  make doctor                   Run the combined read-only account/market/simulation diagnostic' \
+		'  make api-dev                  Run the FastAPI operator backend on http://127.0.0.1:8000' \
 		'  make live-preflight           Run the live-readiness preflight without posting orders' \
 		'  make live-activity            Run the top-level live activity snapshot (preflight, orders, trades)' \
 		'  make live-orders              Inspect authenticated open live orders without posting new ones' \
