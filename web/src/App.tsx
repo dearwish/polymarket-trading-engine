@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
-type ViewKey = "overview" | "decisions" | "orders" | "portfolio" | "events";
+type ViewKey = "overview" | "decisions" | "orders" | "portfolio" | "events" | "settings";
 
 type StatusPayload = {
   trading_mode: string;
@@ -163,9 +163,26 @@ type LiveTradesPayload = {
   trades: LiveTrade[];
 };
 
+type SettingsFieldMeta = {
+  label: string;
+  type: "text" | "number" | "boolean" | "select";
+  group: "runtime" | "live" | "thresholds" | "paper";
+  min?: number;
+  max?: number;
+  step?: number;
+  options?: string[];
+};
+
+type SettingsPayload = {
+  values: Record<string, string | number | boolean>;
+  overrides: Record<string, string | number | boolean>;
+  fields: Record<string, SettingsFieldMeta>;
+};
+
 type DashboardState = {
   status: StatusPayload | null;
   auth: AuthPayload | null;
+  settings: SettingsPayload | null;
   liveActivity: LiveActivityPayload | null;
   portfolioSummary: PortfolioSummaryPayload | null;
   closedPositions: ClosedPositionsPayload | null;
@@ -180,6 +197,7 @@ type DashboardState = {
 type DashboardSnapshotPayload = {
   status: StatusPayload;
   auth: AuthPayload;
+  settings: SettingsPayload;
   live_activity: LiveActivityPayload;
   portfolio_summary: PortfolioSummaryPayload;
   closed_positions: ClosedPositionsPayload;
@@ -197,12 +215,32 @@ const VIEWS: Array<{ key: ViewKey; label: string }> = [
   { key: "orders", label: "Orders & Trades" },
   { key: "portfolio", label: "Portfolio" },
   { key: "events", label: "Event Log" },
+  { key: "settings", label: "Settings" },
 ];
 
 async function fetchJson<T>(path: string): Promise<T> {
   const response = await fetch(path);
   if (!response.ok) {
     throw new Error(`Request failed for ${path}: ${response.status}`);
+  }
+  return response.json() as Promise<T>;
+}
+
+async function sendJson<T>(path: string, method: "POST" | "PUT", body: unknown): Promise<T> {
+  const response = await fetch(path, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    let detail = `${response.status}`;
+    try {
+      const payload = await response.json();
+      detail = payload.detail || JSON.stringify(payload);
+    } catch {
+      detail = await response.text();
+    }
+    throw new Error(`Request failed for ${path}: ${detail}`);
   }
   return response.json() as Promise<T>;
 }
@@ -253,6 +291,7 @@ function mapSnapshotToState(snapshot: DashboardSnapshotPayload): DashboardState 
   return {
     status: snapshot.status,
     auth: snapshot.auth,
+    settings: snapshot.settings,
     liveActivity: snapshot.live_activity,
     portfolioSummary: snapshot.portfolio_summary,
     closedPositions: snapshot.closed_positions,
@@ -271,6 +310,8 @@ function applyDashboardDelta(current: DashboardState, eventName: string, payload
       return { ...current, status: payload as StatusPayload };
     case "auth":
       return { ...current, auth: payload as AuthPayload };
+    case "settings":
+      return { ...current, settings: payload as SettingsPayload };
     case "live_activity":
       return { ...current, liveActivity: payload as LiveActivityPayload };
     case "portfolio_summary":
@@ -686,12 +727,218 @@ function EventsPage({ events, report }: { events: RecentEvent[]; report: ReportP
   );
 }
 
+function SettingsPage({
+  settings,
+  onSettingsUpdated,
+  onRefresh,
+}: {
+  settings: SettingsPayload | null;
+  onSettingsUpdated: (settings: SettingsPayload) => void;
+  onRefresh: () => Promise<void>;
+}) {
+  const [values, setValues] = useState<Record<string, string | number | boolean>>({});
+  const [watchIterations, setWatchIterations] = useState(3);
+  const [watchInterval, setWatchInterval] = useState(2);
+  const [saveMessage, setSaveMessage] = useState("");
+  const [actionMessage, setActionMessage] = useState("");
+  const [actionError, setActionError] = useState("");
+  const [actionResult, setActionResult] = useState<string>("");
+  const [busyAction, setBusyAction] = useState("");
+
+  useEffect(() => {
+    setValues(settings?.values ?? {});
+  }, [settings]);
+
+  if (!settings) {
+    return <section className="panel"><div className="empty-state">Settings are loading.</div></section>;
+  }
+
+  const groupedKeys = Object.entries(settings.fields).reduce<Record<string, string[]>>((acc, [key, meta]) => {
+    acc[meta.group] = [...(acc[meta.group] ?? []), key];
+    return acc;
+  }, {});
+
+  const updateValue = (key: string, value: string | number | boolean) => {
+    setValues((current) => ({ ...current, [key]: value }));
+  };
+
+  const runAction = async (path: string, body: Record<string, unknown>, label: string) => {
+    setBusyAction(label);
+    setActionError("");
+    setActionMessage("");
+    try {
+      const result = await sendJson<Record<string, unknown>>(path, "POST", body);
+      setActionResult(JSON.stringify(result, null, 2));
+      setActionMessage(`${label} completed.`);
+      await onRefresh();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : `${label} failed.`);
+    } finally {
+      setBusyAction("");
+    }
+  };
+
+  const saveSettings = async () => {
+    setSaveMessage("");
+    try {
+      const updated = await sendJson<SettingsPayload>("/api/settings", "PUT", { values });
+      onSettingsUpdated(updated);
+      setSaveMessage("Runtime settings saved.");
+      await onRefresh();
+    } catch (error) {
+      setSaveMessage(error instanceof Error ? error.message : "Failed to save settings.");
+    }
+  };
+
+  const renderField = (key: string) => {
+    const meta = settings.fields[key];
+    const value = values[key];
+    const isOverridden = Object.prototype.hasOwnProperty.call(settings.overrides, key);
+    if (meta.type === "boolean") {
+      return (
+        <label key={key} className="settings-field checkbox-field">
+          <span>{meta.label}</span>
+          <input
+            type="checkbox"
+            checked={Boolean(value)}
+            onChange={(event) => updateValue(key, event.target.checked)}
+          />
+          <small>{isOverridden ? "runtime override" : "env/default"}</small>
+        </label>
+      );
+    }
+    if (meta.type === "select") {
+      return (
+        <label key={key} className="settings-field">
+          <span>{meta.label}</span>
+          <select value={String(value ?? "")} onChange={(event) => updateValue(key, event.target.value)}>
+            {(meta.options ?? []).map((option) => (
+              <option key={option} value={option}>
+                {option}
+              </option>
+            ))}
+          </select>
+          <small>{isOverridden ? "runtime override" : "env/default"}</small>
+        </label>
+      );
+    }
+    return (
+      <label key={key} className="settings-field">
+        <span>{meta.label}</span>
+        <input
+          type={meta.type === "number" ? "number" : "text"}
+          min={meta.min}
+          max={meta.max}
+          step={meta.step}
+          value={String(value ?? "")}
+          onChange={(event) =>
+            updateValue(key, meta.type === "number" ? Number(event.target.value) : event.target.value)
+          }
+        />
+        <small>{isOverridden ? "runtime override" : "env/default"}</small>
+      </label>
+    );
+  };
+
+  return (
+    <section className="grid detail-grid">
+      <article className="panel">
+        <div className="panel-header">
+          <h2>Runtime Settings</h2>
+          <span>{Object.keys(settings.fields).length} editable fields</span>
+        </div>
+        <div className="settings-groups">
+          {["runtime", "live", "thresholds", "paper"].map((group) => (
+            <section key={group} className="settings-group">
+              <h3>{group}</h3>
+              <div className="settings-grid">
+                {(groupedKeys[group] ?? []).map(renderField)}
+              </div>
+            </section>
+          ))}
+        </div>
+        <div className="settings-actions">
+          <button type="button" className="refresh-button" onClick={() => void saveSettings()}>
+            Save Settings
+          </button>
+          {saveMessage && <span className="inline-message">{saveMessage}</span>}
+        </div>
+      </article>
+
+      <article className="panel">
+        <div className="panel-header">
+          <h2>GUI Actions</h2>
+          <span>Operator-safe API controls</span>
+        </div>
+        <div className="action-grid">
+          <button
+            type="button"
+            className="refresh-button"
+            disabled={busyAction === "simulate-active"}
+            onClick={() => void runAction("/api/actions/simulate-active", { active: true }, "simulate-active")}
+          >
+            Simulate Active
+          </button>
+          <button
+            type="button"
+            className="refresh-button"
+            disabled={busyAction === "live-preflight"}
+            onClick={() => void runAction("/api/actions/live-preflight", { active: true }, "live-preflight")}
+          >
+            Live Preflight
+          </button>
+          <button
+            type="button"
+            className="refresh-button"
+            disabled={busyAction === "live-reconcile"}
+            onClick={() => void runAction("/api/actions/live-reconcile", { active: true }, "live-reconcile")}
+          >
+            Live Reconcile
+          </button>
+        </div>
+        <div className="watch-controls">
+          <label className="settings-field">
+            <span>Watch Iterations</span>
+            <input type="number" min={1} max={100} value={watchIterations} onChange={(event) => setWatchIterations(Number(event.target.value))} />
+          </label>
+          <label className="settings-field">
+            <span>Watch Interval Seconds</span>
+            <input type="number" min={0} max={60} value={watchInterval} onChange={(event) => setWatchInterval(Number(event.target.value))} />
+          </label>
+          <button
+            type="button"
+            className="refresh-button"
+            disabled={busyAction === "live-watch"}
+            onClick={() =>
+              void runAction(
+                "/api/actions/live-watch",
+                { active: true, iterations: watchIterations, interval_seconds: watchInterval },
+                "live-watch",
+              )
+            }
+          >
+            Live Watch
+          </button>
+        </div>
+        {actionMessage && <div className="banner">{actionMessage}</div>}
+        {actionError && <div className="banner error">{actionError}</div>}
+        <div className="panel-header">
+          <h2>Last Action Result</h2>
+          <span>{busyAction ? `Running ${busyAction}` : "idle"}</span>
+        </div>
+        <pre className="event-preview action-result">{actionResult || "Run an action to inspect the response."}</pre>
+      </article>
+    </section>
+  );
+}
+
 export default function App() {
   const [activeView, setActiveView] = useState<ViewKey>(getInitialView);
   const [streamStatus, setStreamStatus] = useState<"connecting" | "connected" | "reconnecting" | "disconnected">("connecting");
   const [state, setState] = useState<DashboardState>({
     status: null,
     auth: null,
+    settings: null,
     liveActivity: null,
     portfolioSummary: null,
     closedPositions: null,
@@ -735,6 +982,7 @@ export default function App() {
     const eventNames = [
       "status",
       "auth",
+      "settings",
       "live_activity",
       "portfolio_summary",
       "closed_positions",
@@ -800,6 +1048,14 @@ export default function App() {
         return <PortfolioPage summary={state.portfolioSummary} positions={state.closedPositions?.positions ?? []} equityCurve={state.equityCurve} />;
       case "events":
         return <EventsPage events={state.recentEvents} report={state.report} />;
+      case "settings":
+        return (
+          <SettingsPage
+            settings={state.settings}
+            onSettingsUpdated={(settings) => setState((current) => ({ ...current, settings }))}
+            onRefresh={refreshDashboard}
+          />
+        );
       case "overview":
       default:
         return <OverviewPage state={state} />;

@@ -3,21 +3,49 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable
+from typing import Any
 
 import uvicorn
+from pydantic import BaseModel, Field
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-from polymarket_ai_agent.config import get_settings
+from polymarket_ai_agent.config import (
+    Settings,
+    get_settings,
+    get_effective_settings,
+    runtime_settings_payload,
+    save_runtime_overrides,
+)
 from polymarket_ai_agent.service import AgentService
 
 
 def get_service() -> AgentService:
-    return AgentService(get_settings())
+    return AgentService(get_effective_settings())
 
 
-def create_app(service_factory: Callable[[], AgentService] = get_service) -> FastAPI:
+class SettingsUpdateRequest(BaseModel):
+    values: dict[str, Any] = Field(default_factory=dict)
+
+
+class MarketActionRequest(BaseModel):
+    market_id: str | None = None
+    active: bool = True
+
+
+class LiveWatchActionRequest(MarketActionRequest):
+    iterations: int = Field(default=3, ge=1, le=100)
+    interval_seconds: int = Field(default=2, ge=0, le=60)
+    trade_limit: int = Field(default=20, ge=1, le=200)
+    order_limit: int = Field(default=50, ge=1, le=500)
+
+
+def create_app(
+    service_factory: Callable[[], AgentService] = get_service,
+    settings_factory: Callable[[], Settings] = get_effective_settings,
+    base_settings_factory: Callable[[], Settings] = get_settings,
+) -> FastAPI:
     app = FastAPI(
         title="Polymarket AI Agent API",
         version="0.1.0",
@@ -42,6 +70,7 @@ def create_app(service_factory: Callable[[], AgentService] = get_service) -> Fas
         return {
             "status": service.status(),
             "auth": service.auth_status(),
+            "settings": runtime_settings_payload(service.settings),
             "live_activity": service.live_activity(),
             "portfolio_summary": portfolio_summary(service=service),
             "closed_positions": closed_positions(limit=100, service=service),
@@ -58,6 +87,7 @@ def create_app(service_factory: Callable[[], AgentService] = get_service) -> Fas
         return {
             "status": snapshot["status"],
             "auth": snapshot["auth"],
+            "settings": snapshot["settings"],
             "live_activity": snapshot["live_activity"],
             "portfolio_summary": snapshot["portfolio_summary"],
             "closed_positions": snapshot["closed_positions"],
@@ -76,6 +106,16 @@ def create_app(service_factory: Callable[[], AgentService] = get_service) -> Fas
     @app.get("/api/auth")
     def auth(service: AgentService = Depends(service_factory)) -> dict:
         return service.auth_status()
+
+    @app.get("/api/settings")
+    def settings_snapshot() -> dict:
+        return runtime_settings_payload(settings_factory())
+
+    @app.put("/api/settings")
+    def update_settings(body: SettingsUpdateRequest) -> dict:
+        base_settings = base_settings_factory()
+        save_runtime_overrides(base_settings, body.values)
+        return runtime_settings_payload(settings_factory())
 
     @app.get("/api/markets")
     def markets(limit: int = Query(10, ge=1, le=100), service: AgentService = Depends(service_factory)) -> dict:
@@ -249,11 +289,11 @@ def create_app(service_factory: Callable[[], AgentService] = get_service) -> Fas
     @app.get("/api/dashboard/stream")
     async def dashboard_stream(
         interval_seconds: int = Query(5, ge=1, le=60),
-        service: AgentService = Depends(service_factory),
     ) -> StreamingResponse:
         async def event_generator():
             previous_sections: dict[str, str] = {}
             while True:
+                service = service_factory()
                 for event_name, payload_obj in streamable_dashboard_sections(service).items():
                     payload = json.dumps(payload_obj)
                     if previous_sections.get(event_name) != payload:
@@ -292,6 +332,92 @@ def create_app(service_factory: Callable[[], AgentService] = get_service) -> Fas
                 "limit_price": decision.limit_price,
                 "rejected_by": decision.rejected_by,
             },
+        }
+
+    @app.post("/api/actions/simulate-active")
+    def simulate_active_action(
+        body: MarketActionRequest,
+        service: AgentService = Depends(service_factory),
+    ) -> dict:
+        resolved_market_id = body.market_id
+        if not resolved_market_id and body.active:
+            resolved_market_id = service.get_active_market_id()
+        if not resolved_market_id:
+            raise HTTPException(status_code=400, detail="Provide market_id or set active=true.")
+        snapshot, assessment, decision = service.simulate_market(resolved_market_id)
+        return {
+            "action": "simulate-active",
+            "market_id": resolved_market_id,
+            "readonly": True,
+            "question": snapshot.candidate.question,
+            "assessment": {
+                "fair_probability": assessment.fair_probability,
+                "confidence": assessment.confidence,
+                "edge": assessment.edge,
+                "suggested_side": assessment.suggested_side.value,
+            },
+            "decision": {
+                "status": decision.status.value,
+                "side": decision.side.value,
+                "size_usd": decision.size_usd,
+                "limit_price": decision.limit_price,
+                "rejected_by": decision.rejected_by,
+            },
+        }
+
+    @app.post("/api/actions/live-preflight")
+    def live_preflight_action(
+        body: MarketActionRequest,
+        service: AgentService = Depends(service_factory),
+    ) -> dict:
+        resolved_market_id = body.market_id
+        if not resolved_market_id and body.active:
+            resolved_market_id = service.get_active_market_id()
+        return service.live_preflight(resolved_market_id or None)
+
+    @app.post("/api/actions/live-reconcile")
+    def live_reconcile_action(
+        body: MarketActionRequest,
+        service: AgentService = Depends(service_factory),
+    ) -> dict:
+        resolved_market_id = body.market_id
+        if not resolved_market_id and body.active:
+            resolved_market_id = service.get_active_market_id()
+        return service.live_reconcile(resolved_market_id or None)
+
+    @app.post("/api/actions/live-watch")
+    async def live_watch_action(
+        body: LiveWatchActionRequest,
+        service: AgentService = Depends(service_factory),
+    ) -> dict:
+        resolved_market_id = body.market_id
+        if not resolved_market_id and body.active:
+            resolved_market_id = service.get_active_market_id()
+        cycles: list[dict] = []
+        previous = None
+        for idx in range(body.iterations):
+            cycle = service.live_reconcile(
+                resolved_market_id or None,
+                trade_limit=body.trade_limit,
+                order_limit=body.order_limit,
+            )
+            fingerprint = {
+                "blockers": cycle["preflight"].get("blockers", []),
+                "tracked_summary": cycle["tracked_orders"].get("summary", {}),
+                "recent_trade_count": cycle["recent_trades"].get("count", 0),
+            }
+            cycle["changed"] = fingerprint != previous
+            previous = fingerprint
+            cycles.append(cycle)
+            if idx < body.iterations - 1 and body.interval_seconds > 0:
+                await asyncio.sleep(body.interval_seconds)
+        return {
+            "action": "live-watch",
+            "readonly": True,
+            "market_id": resolved_market_id,
+            "iterations_requested": body.iterations,
+            "iterations_completed": len(cycles),
+            "cycles": cycles,
         }
 
     return app

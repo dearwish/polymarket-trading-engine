@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
 from polymarket_ai_agent.apps.api.main import create_app
+from polymarket_ai_agent.config import Settings
 
 
 class StubService:
@@ -11,6 +14,8 @@ class StubService:
 
     def auth_status(self):
         return {"readonly_ready": True, "balance": 44.93}
+
+    settings = Settings()
 
     def discover_markets(self):
         class Market:
@@ -64,7 +69,12 @@ class StubService:
             "readonly": True,
             "market_id": market_id or "active-123",
             "tracked_orders": {"summary": {"active": 0, "terminal": 0, "errors": 0}},
+            "preflight": {"blockers": []},
+            "recent_trades": {"count": 0},
         }
+
+    def live_preflight(self, market_id=None):
+        return {"readonly": True, "market_id": market_id or "active-123", "blockers": []}
 
     def live_orders(self):
         return {
@@ -294,5 +304,68 @@ def test_api_dashboard_snapshot() -> None:
     payload = response.json()
     assert payload["status"]["trading_mode"] == "paper"
     assert payload["auth"]["readonly_ready"] is True
+    assert "settings" in payload
     assert payload["live_activity"]["market_id"] == "active-123"
     assert payload["recent_events"]["count"] == 2
+
+
+def test_api_settings_round_trip(tmp_path: Path) -> None:
+    base_settings = Settings(
+        data_dir=tmp_path / "data",
+        log_dir=tmp_path / "logs",
+        db_path=tmp_path / "data" / "agent.db",
+        events_path=tmp_path / "logs" / "events.jsonl",
+        runtime_settings_path=tmp_path / "data" / "runtime_settings.json",
+    )
+    client = TestClient(
+        create_app(
+            lambda: StubService(),
+            settings_factory=lambda: Settings.model_validate(
+                {
+                    **base_settings.model_dump(),
+                    **(__import__("json").loads(base_settings.runtime_settings_path.read_text()) if base_settings.runtime_settings_path.exists() else {}),
+                }
+            ),
+            base_settings_factory=lambda: base_settings,
+        )
+    )
+    response = client.get("/api/settings")
+    assert response.status_code == 200
+    assert response.json()["values"]["market_family"] == base_settings.market_family
+
+    updated = client.put("/api/settings", json={"values": {"market_family": "btc_daily_threshold", "min_edge": 0.02}})
+    assert updated.status_code == 200
+    payload = updated.json()
+    assert payload["values"]["market_family"] == "btc_daily_threshold"
+    assert payload["overrides"]["min_edge"] == 0.02
+
+
+def test_api_action_simulate_active() -> None:
+    client = TestClient(create_app(lambda: StubService()))
+    response = client.post("/api/actions/simulate-active", json={"active": True})
+    assert response.status_code == 200
+    assert response.json()["action"] == "simulate-active"
+    assert response.json()["decision"]["status"] == "APPROVED"
+
+
+def test_api_action_live_preflight() -> None:
+    client = TestClient(create_app(lambda: StubService()))
+    response = client.post("/api/actions/live-preflight", json={"active": True})
+    assert response.status_code == 200
+    assert response.json()["market_id"] == "active-123"
+
+
+def test_api_action_live_reconcile() -> None:
+    client = TestClient(create_app(lambda: StubService()))
+    response = client.post("/api/actions/live-reconcile", json={"active": True})
+    assert response.status_code == 200
+    assert response.json()["tracked_orders"]["summary"]["terminal"] == 0
+
+
+def test_api_action_live_watch() -> None:
+    client = TestClient(create_app(lambda: StubService()))
+    response = client.post("/api/actions/live-watch", json={"active": True, "iterations": 2, "interval_seconds": 0})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["action"] == "live-watch"
+    assert payload["iterations_completed"] == 2
