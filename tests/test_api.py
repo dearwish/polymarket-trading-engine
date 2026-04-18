@@ -116,7 +116,22 @@ class StubService:
 
     class Portfolio:
         def list_open_positions(self):
-            return [type("Position", (), {"size_usd": 12.5})()]
+            from datetime import datetime, timezone
+            from polymarket_ai_agent.types import SuggestedSide
+            return [
+                type(
+                    "Position",
+                    (),
+                    {
+                        "market_id": "open-1",
+                        "side": SuggestedSide.YES,
+                        "size_usd": 12.5,
+                        "entry_price": 0.52,
+                        "opened_at": datetime(2026, 4, 18, 22, 0, 0, tzinfo=timezone.utc),
+                        "order_id": "paper-order-000001",
+                    },
+                )()
+            ]
 
         def list_closed_positions(self, limit=100):
             return [

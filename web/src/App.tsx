@@ -86,6 +86,20 @@ type ClosedPositionsPayload = {
   positions: ClosedPosition[];
 };
 
+type OpenPosition = {
+  market_id: string;
+  side: string;
+  size_usd: number;
+  entry_price: number;
+  opened_at: string;
+  order_id: string;
+};
+
+type OpenPositionsPayload = {
+  count: number;
+  positions: OpenPosition[];
+};
+
 type EquityPoint = {
   sequence: number;
   market_id: string;
@@ -248,6 +262,7 @@ type DashboardState = {
   liveActivity: LiveActivityPayload | null;
   portfolioSummary: PortfolioSummaryPayload | null;
   closedPositions: ClosedPositionsPayload | null;
+  openPositions: OpenPositionsPayload | null;
   equityCurve: EquityCurvePayload | null;
   report: ReportPayload | null;
   recentEvents: RecentEvent[];
@@ -266,6 +281,7 @@ type DashboardSnapshotPayload = {
   live_activity: LiveActivityPayload;
   portfolio_summary: PortfolioSummaryPayload;
   closed_positions: ClosedPositionsPayload;
+  open_positions: OpenPositionsPayload;
   equity_curve: EquityCurvePayload;
   report: ReportPayload;
   recent_events: RecentEventsPayload;
@@ -414,6 +430,7 @@ function mapSnapshotToState(snapshot: DashboardSnapshotPayload): DashboardState 
     liveActivity: snapshot.live_activity,
     portfolioSummary: snapshot.portfolio_summary,
     closedPositions: snapshot.closed_positions,
+    openPositions: snapshot.open_positions ?? null,
     equityCurve: snapshot.equity_curve,
     report: snapshot.report,
     recentEvents: snapshot.recent_events.events,
@@ -440,6 +457,8 @@ function applyDashboardDelta(current: DashboardState, eventName: string, payload
       return { ...current, portfolioSummary: payload as PortfolioSummaryPayload };
     case "closed_positions":
       return { ...current, closedPositions: payload as ClosedPositionsPayload };
+    case "open_positions":
+      return { ...current, openPositions: payload as OpenPositionsPayload };
     case "equity_curve":
       return { ...current, equityCurve: payload as EquityCurvePayload };
     case "report":
@@ -856,7 +875,7 @@ function OrdersPage({ liveOrders, liveTrades, liveActivity, paperActivity, tradi
   );
 }
 
-function PortfolioPage({ summary, positions, equityCurve }: { summary: PortfolioSummaryPayload | null; positions: ClosedPosition[]; equityCurve: EquityCurvePayload | null }) {
+function PortfolioPage({ summary, positions, openPositions, equityCurve }: { summary: PortfolioSummaryPayload | null; positions: ClosedPosition[]; openPositions: OpenPosition[]; equityCurve: EquityCurvePayload | null }) {
   return (
     <section className="grid detail-grid">
       <article className="panel">
@@ -882,6 +901,43 @@ function PortfolioPage({ summary, positions, equityCurve }: { summary: Portfolio
           <div><dt>Closed Positions</dt><dd>{summary?.closed_positions ?? 0}</dd></div>
           <div><dt>Exposure</dt><dd>{formatMoney(summary?.open_position_notional)}</dd></div>
         </dl>
+      </article>
+
+      <article className="panel full-span">
+        <div className="panel-header">
+          <h2>Open Positions</h2>
+          <span>{openPositions.length} currently held</span>
+        </div>
+        {openPositions.length === 0 ? (
+          <div className="empty-state">No open positions.</div>
+        ) : (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Market</th>
+                  <th>Side</th>
+                  <th>Size</th>
+                  <th>Entry Price</th>
+                  <th>Opened</th>
+                  <th>Order ID</th>
+                </tr>
+              </thead>
+              <tbody>
+                {openPositions.map((position) => (
+                  <tr key={position.order_id || `${position.market_id}-${position.opened_at}`}>
+                    <td>{position.market_id}</td>
+                    <td className={position.side === "YES" ? "positive" : position.side === "NO" ? "negative" : ""}>{position.side}</td>
+                    <td>{formatMoney(position.size_usd)}</td>
+                    <td>{position.entry_price.toFixed(4)}</td>
+                    <td style={{ whiteSpace: "nowrap", fontSize: "12px", color: "var(--muted)" }}>{position.opened_at.slice(11, 19)}</td>
+                    <td style={{ fontSize: "12px", color: "var(--muted)" }}>{position.order_id || "n/a"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </article>
 
       <article className="panel full-span">
@@ -1390,6 +1446,7 @@ export default function App() {
     liveActivity: null,
     portfolioSummary: null,
     closedPositions: null,
+    openPositions: null,
     equityCurve: null,
     report: null,
     recentEvents: [],
@@ -1437,6 +1494,7 @@ export default function App() {
       "live_activity",
       "portfolio_summary",
       "closed_positions",
+      "open_positions",
       "equity_curve",
       "report",
       "recent_events",
@@ -1543,7 +1601,7 @@ export default function App() {
       case "orders":
         return <OrdersPage liveOrders={state.liveOrders} liveTrades={state.liveTrades} liveActivity={state.liveActivity} paperActivity={state.paperActivity} tradingMode={state.status?.trading_mode ?? "paper"} />;
       case "portfolio":
-        return <PortfolioPage summary={state.portfolioSummary} positions={state.closedPositions?.positions ?? []} equityCurve={state.equityCurve} />;
+        return <PortfolioPage summary={state.portfolioSummary} positions={state.closedPositions?.positions ?? []} openPositions={state.openPositions?.positions ?? []} equityCurve={state.equityCurve} />;
       case "events":
         return <EventsPage events={state.recentEvents} report={state.report} />;
       case "settings":

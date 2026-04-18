@@ -278,6 +278,7 @@ def create_app(
             "settings": runtime_settings_payload(service.settings),
             "live_activity": _cached("live_activity", 30.0, lambda: safe_live_activity(service)),
             "portfolio_summary": portfolio_summary(service=service),
+            "open_positions": open_positions(service=service),
             "closed_positions": closed_positions(limit=100, service=service),
             "equity_curve": equity_curve(limit=200, service=service),
             "report": _cached("report", 60.0, lambda: report(session_id=None, service=service)),
@@ -298,6 +299,7 @@ def create_app(
             "settings": snapshot["settings"],
             "live_activity": snapshot["live_activity"],
             "portfolio_summary": snapshot["portfolio_summary"],
+            "open_positions": snapshot["open_positions"],
             "closed_positions": snapshot["closed_positions"],
             "equity_curve": snapshot["equity_curve"],
             "report": snapshot["report"],
@@ -461,6 +463,22 @@ def create_app(
             "daily_realized_pnl": service.portfolio.get_daily_realized_pnl(),
             "open_position_notional": round(sum(position.size_usd for position in open_positions), 4),
         }
+
+    @app.get("/api/portfolio/open-positions")
+    def open_positions(service: AgentService = Depends(service_factory)) -> dict:
+        positions = service.portfolio.list_open_positions()
+        items = [
+            {
+                "market_id": p.market_id,
+                "side": p.side.value,
+                "size_usd": p.size_usd,
+                "entry_price": p.entry_price,
+                "opened_at": p.opened_at.isoformat(),
+                "order_id": p.order_id,
+            }
+            for p in positions
+        ]
+        return {"count": len(items), "positions": items}
 
     @app.get("/api/portfolio/closed-positions")
     def closed_positions(limit: int = Query(100, ge=1, le=500), service: AgentService = Depends(service_factory)) -> dict:
