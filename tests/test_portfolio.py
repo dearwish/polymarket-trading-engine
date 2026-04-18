@@ -93,6 +93,41 @@ def test_portfolio_closes_position_and_realizes_pnl(settings) -> None:
     assert closed[0].close_reason == "ttl_expired"
 
 
+def test_portfolio_no_side_pnl_sign_is_correct(settings) -> None:
+    """Buying NO at 0.52 and closing at 0.80 should be a WIN (+), not a loss.
+
+    Regression test for the pre-fix bug where NO-side PnL used the YES formula
+    and flipped the sign.
+    """
+    engine = PortfolioEngine(settings.db_path, settings.paper_starting_balance_usd)
+    decision = TradeDecision(
+        market_id="no-mkt",
+        status=DecisionStatus.APPROVED,
+        side=SuggestedSide.NO,
+        size_usd=10.0,
+        limit_price=0.52,
+        rationale=["approved"],
+        rejected_by=[],
+    )
+    # fill_price is now in the NO-token frame (post-fix).
+    result = ExecutionResult(
+        market_id="no-mkt",
+        success=True,
+        mode=ExecutionMode.PAPER,
+        order_id="paper-no-1",
+        status="FILLED_PAPER",
+        detail="ok",
+        fill_price=0.52,
+    )
+    engine.record_execution(decision, result)
+    # Close at NO = 0.80 → NO went up, we win.
+    engine.close_position("no-mkt", exit_price=0.80, reason="ttl_expired")
+    closed = engine.list_closed_positions(limit=1)
+    assert closed[0].realized_pnl > 0
+    # Roughly (0.80 - 0.52) × (10/0.52) ≈ $5.38
+    assert abs(closed[0].realized_pnl - (0.28 * 10 / 0.52)) < 0.01
+
+
 def test_portfolio_estimates_exit_price_for_yes(settings) -> None:
     from polymarket_ai_agent.types import OrderBookSnapshot, PositionRecord
 

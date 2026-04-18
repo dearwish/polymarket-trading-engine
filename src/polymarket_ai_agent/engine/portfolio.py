@@ -477,10 +477,11 @@ class PortfolioEngine:
 
     @staticmethod
     def _compute_pnl(position: PositionRecord, exit_price: float) -> float:
+        # entry_price and exit_price are both stored in the token's own frame
+        # (YES token price for YES positions, NO token price for NO positions).
+        # So the PnL formula is uniform: (sell - buy) × shares.
         shares = position.size_usd / max(position.entry_price, 0.0001)
-        if position.side == SuggestedSide.YES:
-            return (exit_price - position.entry_price) * shares
-        return ((1 - exit_price) - position.entry_price) * shares
+        return (exit_price - position.entry_price) * shares
 
     @staticmethod
     def _row_to_position(row) -> PositionRecord:

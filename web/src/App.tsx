@@ -509,7 +509,7 @@ function OverviewPage({ state }: { state: DashboardState }) {
             <div><dt>Total PnL</dt><dd>{formatMoney(portfolioSummary?.total_realized_pnl)}</dd></div>
             <div><dt>Daily PnL</dt><dd>{formatMoney(portfolioSummary?.daily_realized_pnl)}</dd></div>
             <div><dt>Closed Trades</dt><dd>{portfolioSummary?.closed_positions ?? 0}</dd></div>
-            <div><dt>Open Notional</dt><dd>{formatMoney(portfolioSummary?.open_position_notional)}</dd></div>
+            <div><dt>Exposure</dt><dd>{formatMoney(portfolioSummary?.open_position_notional)}</dd></div>
           </dl>
         </article>
 
@@ -870,7 +870,7 @@ function PortfolioPage({ summary, positions, equityCurve }: { summary: Portfolio
           <div><dt>Total Realized PnL</dt><dd>{formatMoney(summary?.total_realized_pnl)}</dd></div>
           <div><dt>Daily Realized PnL</dt><dd>{formatMoney(summary?.daily_realized_pnl)}</dd></div>
           <div><dt>Closed Positions</dt><dd>{summary?.closed_positions ?? 0}</dd></div>
-          <div><dt>Open Position Notional</dt><dd>{formatMoney(summary?.open_position_notional)}</dd></div>
+          <div><dt>Exposure</dt><dd>{formatMoney(summary?.open_position_notional)}</dd></div>
         </dl>
       </article>
 

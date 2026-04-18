@@ -12,6 +12,7 @@ from polymarket_ai_agent.types import (
     ExecutionStyle,
     OrderBookSnapshot,
     OrderSide,
+    SuggestedSide,
     TradeDecision,
 )
 
@@ -166,11 +167,24 @@ class ExecutionEngine:
         For BUYs we consume asks from best to worst; for SELLs we consume bids
         in reverse. If the book has no levels we fall back to a constant-bps
         slippage on the reference price so the existing tests keep passing.
+
+        NO-side trades: the passed orderbook is the YES book, so we reflect it
+        to the NO side using the Polymarket invariant NO_price = 1 - YES_price.
+        Buying NO == consuming YES bids at (1 - bid) in ascending NO-price order.
+        Selling NO == consuming YES asks at (1 - ask) in descending NO-price order.
+        Without this the fill price is recorded in the wrong token frame and PnL
+        comes out inverted.
         """
         levels = self._levels_for_side(decision.order_side, orderbook)
+        if decision.side == SuggestedSide.NO:
+            # Flip YES levels into the NO frame and re-sort.
+            opposite = list(orderbook.bid_levels) if decision.order_side == OrderSide.BUY else list(orderbook.ask_levels)
+            flipped = [(max(0.01, min(0.99, 1.0 - price)), size) for price, size in opposite if size > 0]
+            flipped.sort(key=lambda lvl: lvl[0], reverse=(decision.order_side == OrderSide.SELL))
+            levels = flipped
         target_shares = decision.size_usd / max(decision.limit_price, 1e-6)
         if not levels:
-            fallback = self._constant_slippage_price(decision.limit_price, orderbook, decision.order_side)
+            fallback = self._constant_slippage_price(decision.limit_price, orderbook, decision.order_side, side=decision.side)
             return fallback, target_shares, 0.0
 
         slippage_multiplier = 1 + self.paper_entry_slippage_bps / 10_000.0
@@ -191,7 +205,7 @@ class ExecutionEngine:
             filled += take
             remaining -= take
         if filled <= 0.0:
-            fallback = self._constant_slippage_price(decision.limit_price, orderbook, decision.order_side)
+            fallback = self._constant_slippage_price(decision.limit_price, orderbook, decision.order_side, side=decision.side)
             return fallback, 0.0, target_shares
         vwap = round(notional / filled, 6)
         return vwap, round(filled, 6), round(max(remaining, 0.0), 6)
@@ -210,11 +224,22 @@ class ExecutionEngine:
         limit_price: float,
         orderbook: OrderBookSnapshot | None,
         order_side: OrderSide,
+        side: SuggestedSide = SuggestedSide.YES,
     ) -> float:
         if orderbook is not None:
-            reference = orderbook.ask if order_side == OrderSide.BUY else orderbook.bid
-            if reference <= 0.0:
-                reference = limit_price
+            yes_reference = orderbook.ask if order_side == OrderSide.BUY else orderbook.bid
+            if yes_reference <= 0.0:
+                yes_reference = limit_price
+            # For NO trades, flip into the NO frame: buying NO uses (1 - YES_bid);
+            # selling NO uses (1 - YES_ask). The yes_reference chosen above is the
+            # YES ask (for BUY) or YES bid (for SELL), so we flip the OPPOSITE field.
+            if side == SuggestedSide.NO:
+                opposite = orderbook.bid if order_side == OrderSide.BUY else orderbook.ask
+                if opposite <= 0.0:
+                    opposite = 1.0 - limit_price
+                reference = max(0.01, min(0.99, 1.0 - opposite))
+            else:
+                reference = yes_reference
         else:
             reference = limit_price
         delta = reference * (self.paper_entry_slippage_bps / 10_000.0)
