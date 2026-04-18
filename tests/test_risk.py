@@ -76,10 +76,12 @@ def test_risk_rejects_wide_spread() -> None:
 
 
 def test_risk_approves_clean_setup() -> None:
+    # Default market_family is btc_1h → exit buffer = 0.05 * 3600 = 180s.
+    # Keep TTE well above that so only the generic gates apply.
     settings = Settings()
     engine = RiskEngine(settings)
     state = AccountState(mode=ExecutionMode.PAPER, available_usd=100.0, open_positions=0, daily_realized_pnl=0.0)
-    decision = engine.decide_trade(build_snapshot(), build_assessment(), state)
+    decision = engine.decide_trade(build_snapshot(seconds_to_expiry=1200), build_assessment(), state)
     assert decision.status.value == "APPROVED"
     assert decision.side.value == "YES"
 
