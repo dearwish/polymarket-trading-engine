@@ -656,12 +656,22 @@ function EventEntry({
   );
 }
 
-function OrdersPage({ liveOrders, liveTrades, liveActivity, paperActivity }: { liveOrders: LiveOrder[]; liveTrades: LiveTrade[]; liveActivity: LiveActivityPayload | null; paperActivity: PaperActivityEvent[] }) {
+function OrdersPage({ liveOrders, liveTrades, liveActivity, paperActivity, tradingMode }: { liveOrders: LiveOrder[]; liveTrades: LiveTrade[]; liveActivity: LiveActivityPayload | null; paperActivity: PaperActivityEvent[]; tradingMode: string }) {
+  const isLive = tradingMode === "live";
   const [selectedOrderId, setSelectedOrderId] = useState<string>("");
   const [selectedTradeId, setSelectedTradeId] = useState<string>("");
+  const [liveOpen, setLiveOpen] = useState<boolean>(isLive);
+  const [paperOpen, setPaperOpen] = useState<boolean>(!isLive);
   const selectedOrder = liveOrders.find((order) => order.order_id === selectedOrderId) ?? liveOrders[0];
   const selectedTrade = liveTrades.find((trade) => trade.trade_id === selectedTradeId) ?? liveTrades[0];
   return (
+    <div className="accordion-stack">
+    <details className="mode-accordion" open={liveOpen} onToggle={(e) => setLiveOpen((e.target as HTMLDetailsElement).open)}>
+      <summary>
+        <span className="mode-chip">Live Trading</span>
+        {isLive ? <span className="mode-badge-active">ACTIVE</span> : <span className="mode-badge-idle">idle</span>}
+        <span className="mode-summary-meta">{liveOrders.length} orders · {liveTrades.length} trades</span>
+      </summary>
     <section className="grid detail-grid">
       <article className="panel">
         <div className="panel-header">
@@ -768,7 +778,16 @@ function OrdersPage({ liveOrders, liveTrades, liveActivity, paperActivity }: { l
           </div>
         </div>
       </article>
+    </section>
+    </details>
 
+    <details className="mode-accordion" open={paperOpen} onToggle={(e) => setPaperOpen((e.target as HTMLDetailsElement).open)}>
+      <summary>
+        <span className="mode-chip">Paper Trading</span>
+        {!isLive ? <span className="mode-badge-active">ACTIVE</span> : <span className="mode-badge-idle">idle</span>}
+        <span className="mode-summary-meta">{paperActivity.length} executions</span>
+      </summary>
+      <section className="grid">
       <article className="panel full-span">
         <div className="panel-header">
           <h2>Paper Activity</h2>
@@ -821,7 +840,9 @@ function OrdersPage({ liveOrders, liveTrades, liveActivity, paperActivity }: { l
           </div>
         )}
       </article>
-    </section>
+      </section>
+    </details>
+    </div>
   );
 }
 
@@ -1439,7 +1460,7 @@ export default function App() {
       case "decisions":
         return <DecisionsPage decisions={state.recentDecisions} />;
       case "orders":
-        return <OrdersPage liveOrders={state.liveOrders} liveTrades={state.liveTrades} liveActivity={state.liveActivity} paperActivity={state.paperActivity} />;
+        return <OrdersPage liveOrders={state.liveOrders} liveTrades={state.liveTrades} liveActivity={state.liveActivity} paperActivity={state.paperActivity} tradingMode={state.status?.trading_mode ?? "paper"} />;
       case "portfolio":
         return <PortfolioPage summary={state.portfolioSummary} positions={state.closedPositions?.positions ?? []} equityCurve={state.equityCurve} />;
       case "events":

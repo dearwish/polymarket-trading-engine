@@ -623,6 +623,92 @@ th {
   letter-spacing: 0.05em;
 }
 
+.accordion-stack {
+  display: grid;
+  gap: 14px;
+}
+
+.mode-accordion {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 4px 6px 6px;
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(12px);
+}
+
+.mode-accordion[open] {
+  padding-bottom: 18px;
+}
+
+.mode-accordion > summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 18px;
+  border-radius: 16px;
+  transition: background 160ms ease;
+}
+
+.mode-accordion > summary::-webkit-details-marker {
+  display: none;
+}
+
+.mode-accordion > summary::before {
+  content: "▸";
+  color: var(--muted);
+  transition: transform 160ms ease;
+  font-size: 12px;
+}
+
+.mode-accordion[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.mode-accordion > summary:hover {
+  background: rgba(77, 212, 172, 0.06);
+}
+
+.mode-chip {
+  font-weight: 600;
+  font-size: 15px;
+  color: var(--text);
+}
+
+.mode-badge-active {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: rgba(77, 212, 172, 0.18);
+  color: var(--accent);
+  border: 1px solid rgba(77, 212, 172, 0.35);
+}
+
+.mode-badge-idle {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  padding: 3px 8px;
+  border-radius: 999px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  text-transform: uppercase;
+}
+
+.mode-summary-meta {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.mode-accordion > section {
+  margin-top: 10px;
+  padding: 0 14px;
+}
+
 .market-card-meta {
   display: flex;
   gap: 8px;
