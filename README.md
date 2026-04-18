@@ -8,7 +8,7 @@ Python project for a Polymarket trading agent with three clearly separated layer
 
 ## Current Status
 
-The repository includes a working paper and read-only live-readiness stack, plus Phases 1–3 of the short-horizon BTC trading core (see [`docs/ROADMAP.md`](./docs/ROADMAP.md)).
+The repository includes a working paper and read-only live-readiness stack, plus Phases 1–4 of the short-horizon BTC trading core (see [`docs/ROADMAP.md`](./docs/ROADMAP.md)).
 
 - Python package under `src/polymarket_ai_agent`
 - operator CLI via `polymarket-ai-agent`
@@ -24,7 +24,9 @@ The repository includes a working paper and read-only live-readiness stack, plus
 - **event-driven asyncio daemon** with Polymarket CLOB + Binance BTC websocket subscriptions, rolling per-market and BTC state, and a pluggable decision callback (Phase 1)
 - **deterministic quant fair-value scorer** (closed-form GBM + momentum tilt + per-side edge after slippage and fees) running on every daemon tick (Phase 2)
 - **maker-first / taker-fallback execution router** with VWAP paper fills, SELL-side support, live-fill → PositionRecord bridge, and a `close_position` path that posts a SELL-side counter order on Polymarket (Phase 3)
-- test suite covering connectors, scoring, risk, execution, service, CLI, state/daemon/feed modules, the execution router and VWAP fills, live fill bridging, and the live close flow
+- **per-family risk profiles** (btc_1h / btc_15m / btc_5m) with tighter stale-data ceilings, a dynamic exit buffer scaled against the family's candle window, a correlation cap on net BTC directional exposure, and `max_concurrent_positions` replacing the single-position rule (Phase 4)
+- **SQLite hygiene** — WAL mode, `synchronous=NORMAL`, explicit indexes on every hot lookup column, bounded `events.jsonl` tail reads, and an auto-prune loop (Phase 4; see the SQLite & Log-Growth Risk section in `docs/ROADMAP.md`)
+- test suite covering connectors, scoring, risk, execution, service, CLI, state/daemon/feed modules, the execution router and VWAP fills, live fill bridging, the live close flow, per-family risk profiles, btc_15m discovery, and journal retention
 
 Important:
 
@@ -200,6 +202,31 @@ DAEMON_DECISION_MIN_INTERVAL_SECONDS=1.0
 - confidence scales with edge magnitude and degrades when slippage is high
 - expiry-risk tiers configurable via `QUANT_HIGH_EXPIRY_RISK_SECONDS` / `QUANT_MEDIUM_EXPIRY_RISK_SECONDS`
 - the `ScoringEngine.OpenRouter` path is preserved but now returns the same per-side edge fields
+
+## Per-Family Risk Profiles (Phase 4)
+
+Risk gates now resolve per family instead of operating off a single global scalar. The active profile is derived from `settings.market_family` at `RiskEngine` construction; explicit `Settings` overrides always win, so env-tuned deployments stay backward-compatible.
+
+| family   | stale data | exit buffer pct × window | max concurrent |
+|----------|------------|--------------------------|----------------|
+| btc_1h   | 5s         | 0.05 × 3600 = 180s       | 2              |
+| btc_15m  | 3s         | 0.07 × 900 = 63s         | 2              |
+| btc_5m   | 2s         | 0.10 × 300 = 30s         | 1              |
+
+- `max_concurrent_positions` replaces the old single-position rule.
+- `max_net_btc_exposure_usd` caps `|long_btc_usd − short_btc_usd|` across all open BTC positions — YES counts as long-BTC, NO as short-BTC.
+- `AccountState` now carries `long_btc_exposure_usd`, `short_btc_exposure_usd`, `net_btc_exposure_usd`, and `total_exposure_usd`, populated by `PortfolioEngine.get_account_state`.
+
+## SQLite & Event-Log Hygiene
+
+The daemon is an append-heavy writer; both `data/agent.db` and `logs/events.jsonl` will grow without bound on a busy deployment. Phase 4 adds the following defaults:
+
+- `PRAGMA journal_mode=WAL` + `synchronous=NORMAL` + `temp_store=MEMORY` on both database files
+- explicit indexes on every hot lookup column (positions.status, positions.market_id+status, positions.closed_at, order_attempts.recorded_at, order_attempts.market_id, live_orders.status, live_orders.updated_at, reports.created_at)
+- `Journal.read_recent_events` uses a 64KB backwards-chunk tail-read, so peeking at the last N lines of a multi-GB JSONL no longer OOMs
+- `Journal.prune_events_jsonl(max_bytes, keep_tail_bytes)` + `log_event` auto-prune every `prune_check_every` writes once the file exceeds `events_jsonl_max_bytes` (default 200 MB, keeping the last 50 MB)
+
+See **SQLite & Log-Growth Risk Analysis** in [`docs/ROADMAP.md`](./docs/ROADMAP.md) for the full audit of write amplification, locking, WAL checkpointing, and backup concerns — plus the remaining Phase 5 items (retention for `order_attempts`, periodic `VACUUM`, off-host backup, `/api/metrics` db-size gauge).
 
 ## Execution Router (Phase 3)
 

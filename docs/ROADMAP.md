@@ -130,7 +130,7 @@ Note on btc_15m: the existing code ships family scorers for `btc_1h`, `btc_5m`, 
 
 Each phase is independently shippable and leaves paper mode working.
 
-**Status:** Phases 1, 2, and 3 have landed on `main`. Phase 4 (per-family risk + correlation-aware portfolio) is next.
+**Status:** Phases 1, 2, 3, and 4 have landed on `main`. Phase 5 (operational readiness: daemon, metrics, reconciliation, chaos tests) is next.
 
 ### Phase 1 — Event-driven market plumbing (foundation) ✅
 Goal: replace REST polling on the hot path with websocket-driven state.
@@ -174,13 +174,16 @@ Verification:
 - Paper fills walk top-10 `bid_levels`/`ask_levels` VWAP-style; `ExecutionResult` reports filled/remaining shares.
 - Future Phase 3 extensions (force-close near exit, stream-driven user WS reconciliation loop) are tracked alongside Phase 5 operational work.
 
-### Phase 4 — Per-family risk + correlation-aware portfolio
-- `RiskProfile` per family: `btc_1h`, `btc_15m`, `btc_5m`.
-- Replace single-position rule with `max_concurrent_positions` + `max_total_exposure_usd`.
-- Correlation gate: cap net BTC directional exposure across families.
-- Dynamic `exit_buffer_seconds = max(base_s, pct * TTE)`.
-- Tighten `stale_data_seconds`: 2s for 5m, 3s for 15m, 5s for 1h.
-- Add `btc_15m` scorer to `PolymarketConnector`.
+### Phase 4 — Per-family risk + correlation-aware portfolio ✅
+- `RiskProfile` dataclass + `FAMILY_PROFILE_OVERRIDES` ship per-family defaults; `resolve_risk_profile` lets explicit operator globals win so env-tuned deployments are unchanged.
+- Single-position rule replaced with `max_concurrent_positions` plus a correlation cap on projected net BTC directional exposure (`max_net_btc_exposure_usd`).
+- Dynamic buffer: `max(exit_buffer_seconds, exit_buffer_pct_of_tte * family_window_seconds)` — scales with the family's nominal candle length rather than the shrinking TTE.
+- Tightened stale-data ceilings: 2s for btc_5m, 3s for btc_15m, 5s for btc_1h (operator-overridable).
+- `btc_15m` scorer + 30-minute active window + 200-item discovery limit; family now appears in the `market_family` select.
+- `AccountState` carries long/short/net/total BTC exposure; `PortfolioEngine.get_account_state` and `get_exposure_summary` feed the correlation gate.
+- SQLite hygiene: WAL + synchronous=NORMAL + temp_store=MEMORY + indexes on every hot lookup column. Events.jsonl auto-prunes via bounded tail-reads and `prune_events_jsonl`; see SQLite & Log-Growth Risk section below.
+
+**Tests landing with the phase:** `tests/test_risk_profiles.py`, `tests/test_btc_15m_family.py`, `tests/test_journal_retention.py` — full suite at 224 green.
 
 ### Phase 5 — Operational readiness (daemon, metrics, reconciliation)
 - `polymarket-ai-agent daemon` CLI runs forever, auto-reconnect WS.
@@ -193,6 +196,40 @@ Verification:
 - RiskProfile editor in settings.
 
 ---
+
+## SQLite & Log-Growth Risk Analysis
+
+The daemon is a long-running append-heavy writer; on a small VPS the two
+persistence layers can quietly become a bomb if left alone. This is the
+audit we did before Phase 5.
+
+### What the existing writers look like
+- [engine/portfolio.py](../src/polymarket_ai_agent/engine/portfolio.py) inserts into three tables every trade cycle: `positions` (on paper fill or live fill bridge), `order_attempts` (every execute call, success or failure), and `live_orders` (each submitted live order, plus status updates on reconciliation).
+- [engine/journal.py](../src/polymarket_ai_agent/engine/journal.py) persists `reports` rows via `save_report`, and appends every event to `events.jsonl` via `log_event`. The daemon fires a `daemon_tick` event on every quant decision — at `DAEMON_DECISION_MIN_INTERVAL_SECONDS=1.0` that's ~86k rows/day per active market before Phase 1 rate-limits.
+
+### Concrete blow-up risks (ranked)
+
+1. **events.jsonl grows without bound.** Biggest risk. ~200–400 bytes per daemon_tick × 4 active markets × 1 Hz ≈ 5–15 GB/week. With the old `read_text().splitlines()` tail reader, every `/api/events/stream` or CLI `report` call would OOM once the file crossed RAM. *Addressed in Phase 4*: bounded tail-reads via `Journal._tail_lines` (64KB chunks, backwards) and `prune_events_jsonl`; `log_event` auto-prunes every 200 writes when `events_jsonl_max_bytes` is set (default 200MB with a 50MB tail).
+2. **`order_attempts` rows are never pruned.** Every cycle writes one row; counted rejections feed `get_rejected_orders`, which filters by `substr(recorded_at, 1, 10) = today`. That substring predicate was a table scan until Phase 4 added `order_attempts_recorded_at_idx`. Still unbounded in row count — Phase 5 should add a retention helper that deletes attempts older than N days.
+3. **`positions` with no index on `status`.** `list_open_positions` and `positions_due_for_close` filter on status on every call, and the daemon calls them many times per minute. *Addressed in Phase 4*: `positions_status_idx` + `positions_market_status_idx` + `positions_closed_at_idx`.
+4. **`live_orders` row-churn via status updates.** Each reconciliation tick can rewrite every non-terminal row. *Addressed in Phase 4*: `live_orders_status_idx` + `live_orders_updated_at_idx`; Phase 5 can add terminal-row archival.
+5. **Default rollback-journal mode serializes reads and writes.** With a busy daemon writing and the operator API / CLI reading the same DB, locks can stall both. *Addressed in Phase 4*: `PRAGMA journal_mode = WAL` + `synchronous = NORMAL` in both `PortfolioEngine._init_db` and `Journal._init_db`. This also trades a small durability window for much better read concurrency.
+6. **Synchronous sqlite calls on an asyncio loop.** The daemon's decision callback ends with `await asyncio.to_thread(journal.log_event, ...)` which is fine today, but direct sync calls from `PortfolioEngine` run in the foreground. Fine for our write volume on a local disk; becomes a problem if the DB ever lives on a network volume. Phase 5 should move portfolio writes behind `asyncio.to_thread` for the same reason.
+7. **WAL file on crash.** WAL mode creates `<db>.wal` and `<db>-shm` sidecar files. Unclean shutdown can leave a large WAL; on next open SQLite checkpoints it. Add `PRAGMA wal_autocheckpoint` tuning and a periodic `PRAGMA wal_checkpoint(TRUNCATE)` in the Phase 5 daemon loop.
+8. **No backup/rotation.** A single disk failure kills all realised PnL, position, and journal history. Phase 5 should ship a systemd cron that copies `agent.db` + `events.jsonl` to an off-host location nightly. SQLite's `.backup` / `VACUUM INTO` are safe even with live writers once WAL is on.
+9. **JSONL payloads contain large nested dicts (auth dumps, book events).** A single pathological event can be tens of KB; truncate `Journal._normalize` to elide or cap very large lists. Lower priority but worth flagging.
+
+### What's now covered vs. still open
+
+Covered in Phase 4: WAL, indexes, bounded `events.jsonl` reads, auto-prune, indexes on reports(created_at).
+
+Still open (explicit Phase 5 work):
+- retention / archival job for `order_attempts` and terminal `live_orders` rows (`delete where recorded_at < :cutoff`).
+- periodic `VACUUM` or `VACUUM INTO` for long-lived deployments.
+- off-host backup (`VACUUM INTO` + rsync / S3 put nightly).
+- `asyncio.to_thread` around portfolio writes in the daemon hot path.
+- WAL checkpoint loop and size alerting.
+- structured metric for DB size and events.jsonl size exposed on `/api/metrics`.
 
 ## Out of Scope
 
