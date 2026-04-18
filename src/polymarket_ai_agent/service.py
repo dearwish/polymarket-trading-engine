@@ -665,12 +665,34 @@ class AgentService:
         self.journal.log_event("live_reconcile", payload)
         return payload
 
-    def safety_stop_reason(self, account_state: AccountState | None = None) -> str | None:
+    def safety_stop_reason(
+        self,
+        account_state: AccountState | None = None,
+        heartbeat_age_seconds: float | None = None,
+        auth_readonly_ready: bool | None = None,
+    ) -> str | None:
+        """Return a non-null reason if the daemon should halt trading.
+
+        The two base checks (daily loss / rejected orders) run unconditionally.
+        The optional keyword args let callers layer in operational signals
+        they already have — e.g. the daemon passes its heartbeat age so the
+        API / CLI can share the same determination.
+        """
         state = account_state or self.portfolio.get_account_state(ExecutionMode(self.settings.trading_mode))
         if state.daily_realized_pnl <= -self.settings.max_daily_loss_usd:
             return "daily_loss_limit"
         if state.rejected_orders >= self.settings.max_rejected_orders:
             return "rejected_order_limit"
+        if (
+            auth_readonly_ready is False
+            and ExecutionMode(self.settings.trading_mode) == ExecutionMode.LIVE
+        ):
+            return "auth_not_ready"
+        if (
+            heartbeat_age_seconds is not None
+            and heartbeat_age_seconds > float(self.settings.daemon_heartbeat_stale_seconds)
+        ):
+            return "daemon_heartbeat_stale"
         return None
 
     @staticmethod

@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Protocol
 
+from polymarket_ai_agent.apps.daemon.heartbeat import HeartbeatWriter
 from polymarket_ai_agent.config import Settings
 from polymarket_ai_agent.connectors.binance_ws import BinanceBtcFeed, BtcTick
 from polymarket_ai_agent.connectors.polymarket_ws import MarketStreamEvent, PolymarketMarketStream
@@ -39,10 +40,22 @@ class DaemonMetrics:
     last_btc_tick_at: datetime | None = None
     last_decision_at: datetime | None = None
     last_decision_latency_ms: float = 0.0
+    maintenance_runs: int = 0
+    last_maintenance_at: datetime | None = None
+    last_maintenance_summary: dict[str, Any] | None = None
+    safety_stop_reason: str | None = None
+    safety_stop_at: datetime | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
-        for key in ("started_at", "last_polymarket_event_at", "last_btc_tick_at", "last_decision_at"):
+        for key in (
+            "started_at",
+            "last_polymarket_event_at",
+            "last_btc_tick_at",
+            "last_decision_at",
+            "last_maintenance_at",
+            "safety_stop_at",
+        ):
             value = payload.get(key)
             if isinstance(value, datetime):
                 payload[key] = value.isoformat()
@@ -55,6 +68,9 @@ class DaemonConfig:
     discovery_interval_seconds: float = 60.0
     decision_min_interval_seconds: float = 1.0
     max_active_markets: int = 4
+    heartbeat_interval_seconds: float = 5.0
+    maintenance_interval_seconds: float = 3600.0
+    prune_history_days: int = 14
 
 
 class MarketStreamFactory(Protocol):
@@ -103,6 +119,9 @@ class DaemonRunner:
             market_family=settings.market_family,
             discovery_interval_seconds=float(settings.daemon_discovery_interval_seconds),
             decision_min_interval_seconds=float(settings.daemon_decision_min_interval_seconds),
+            heartbeat_interval_seconds=float(settings.daemon_heartbeat_interval_seconds),
+            maintenance_interval_seconds=float(settings.daemon_maintenance_interval_seconds),
+            prune_history_days=int(settings.daemon_prune_history_days),
         )
         self._market_stream_factory = market_stream_factory or (
             lambda url: PolymarketMarketStream(
@@ -125,6 +144,7 @@ class DaemonRunner:
         self.btc_state = BtcState()
         self.research = ResearchEngine()
         self.quant = QuantScoringEngine(settings)
+        self.heartbeat = HeartbeatWriter(settings.heartbeat_path)
         self._market_states: dict[str, MarketState] = {}
         self._candidates: dict[str, MarketCandidate] = {}
         self._asset_to_market: dict[str, str] = {}
@@ -148,10 +168,20 @@ class DaemonRunner:
         self._stop_event = stop_event or asyncio.Event()
         discovery_task = asyncio.create_task(self._discovery_loop(self._stop_event))
         btc_task = asyncio.create_task(self._btc_loop(self._stop_event))
+        heartbeat_task = asyncio.create_task(self._heartbeat_loop(self._stop_event))
+        maintenance_task = asyncio.create_task(self._maintenance_loop(self._stop_event))
         try:
             await self._stop_event.wait()
         finally:
-            await self._shutdown_tasks([discovery_task, btc_task, self._market_subscriber_task])
+            await self._shutdown_tasks(
+                [
+                    discovery_task,
+                    btc_task,
+                    heartbeat_task,
+                    maintenance_task,
+                    self._market_subscriber_task,
+                ]
+            )
 
     async def run_for(self, duration_seconds: float) -> None:
         stop_event = asyncio.Event()
@@ -289,6 +319,12 @@ class DaemonRunner:
             elapsed = (now - self._last_decision_at).total_seconds()
             if elapsed < self.config.decision_min_interval_seconds:
                 return
+        if self.metrics.safety_stop_reason is not None:
+            # Kill-switch is active — skip the callback so no new trade
+            # decisions are published. We still update the timer so we only
+            # log once per interval when the switch is hot.
+            self._last_decision_at = now
+            return
         candidate = self._candidates.get(state.market_id)
         if candidate is None:
             return
@@ -365,6 +401,112 @@ class DaemonRunner:
             "expiry_risk": assessment.expiry_risk,
         }
         await asyncio.to_thread(self.service.journal.log_event, "daemon_tick", payload)
+
+    # --- Heartbeat + maintenance --------------------------------------
+
+    async def _heartbeat_loop(self, stop_event: asyncio.Event) -> None:
+        """Persist the daemon's metrics at a steady cadence.
+
+        The API process has no in-memory view of the daemon so it reads this
+        file to compute heartbeat-age, kill-switch state, and the per-daemon
+        metrics exposed on ``/api/metrics``.
+        """
+        interval = max(0.1, float(self.config.heartbeat_interval_seconds))
+        while not stop_event.is_set():
+            try:
+                auth = self._auth_readonly_ready()
+                self._apply_safety_stop(auth_readonly_ready=auth)
+                extra = {
+                    "active_market_ids": self.active_market_ids,
+                    "active_asset_ids": self.active_asset_ids,
+                    "btc_last_price": self.btc_state.last_price,
+                    "btc_seconds_since_last_update": self.btc_state.seconds_since_last_update(),
+                    "auth_readonly_ready": auth,
+                    "safety_stop_reason": self.metrics.safety_stop_reason,
+                    "market_family": self.settings.market_family,
+                }
+                await asyncio.to_thread(self.heartbeat.write, self.metrics, extra)
+            except Exception as exc:
+                logger.warning("daemon heartbeat write failed: %s", exc)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                continue
+
+    async def _maintenance_loop(self, stop_event: asyncio.Event) -> None:
+        """Periodic retention + WAL checkpoint + VACUUM-lite upkeep.
+
+        Runs separately from the decision loop so SQLite's exclusive lock for
+        VACUUM never blocks a tick. First iteration waits the full interval so
+        a freshly started daemon doesn't immediately churn the DB.
+        """
+        interval = max(60.0, float(self.config.maintenance_interval_seconds))
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
+        while not stop_event.is_set():
+            try:
+                summary = await asyncio.to_thread(self._run_maintenance)
+                self.metrics.maintenance_runs += 1
+                self.metrics.last_maintenance_at = _utc_now()
+                self.metrics.last_maintenance_summary = summary
+            except Exception as exc:
+                logger.warning("daemon maintenance run failed: %s", exc)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                continue
+
+    def _run_maintenance(self) -> dict[str, Any]:
+        summary: dict[str, Any] = {}
+        days = int(self.config.prune_history_days)
+        if days > 0:
+            summary["history_pruned"] = self.service.portfolio.prune_history(days)
+        events_pruned = self.service.journal.prune_events_jsonl(
+            self.settings.events_jsonl_max_bytes,
+            keep_tail_bytes=self.settings.events_jsonl_keep_tail_bytes,
+        )
+        summary["events_jsonl_pruned"] = bool(events_pruned)
+        try:
+            wal = self.service.portfolio.wal_checkpoint()
+            summary["wal_checkpoint"] = {
+                "busy": wal[0],
+                "log_pages": wal[1],
+                "checkpointed_pages": wal[2],
+            }
+        except Exception as exc:
+            summary["wal_checkpoint_error"] = str(exc)
+        summary["db_size_bytes"] = self.service.journal.db_size_bytes()
+        summary["events_jsonl_size_bytes"] = self.service.journal.events_jsonl_size_bytes()
+        return summary
+
+    def _auth_readonly_ready(self) -> bool:
+        try:
+            status = self.service.polymarket.get_auth_status()
+        except Exception:
+            return False
+        return bool(status.live_client_constructible)
+
+    def _apply_safety_stop(self, auth_readonly_ready: bool | None) -> None:
+        reason = self.service.safety_stop_reason(
+            auth_readonly_ready=auth_readonly_ready,
+        )
+        if reason is None:
+            if self.metrics.safety_stop_reason is not None:
+                logger.info("daemon kill-switch cleared (was %s)", self.metrics.safety_stop_reason)
+            self.metrics.safety_stop_reason = None
+            self.metrics.safety_stop_at = None
+            return
+        if self.metrics.safety_stop_reason == reason:
+            return
+        self.metrics.safety_stop_reason = reason
+        self.metrics.safety_stop_at = _utc_now()
+        logger.warning("daemon kill-switch fired: %s", reason)
+        try:
+            self.service.journal.log_event("safety_stop", {"reason": reason})
+        except Exception as exc:
+            logger.warning("failed to journal safety_stop: %s", exc)
 
     # --- Shutdown ------------------------------------------------------
 

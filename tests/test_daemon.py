@@ -203,6 +203,88 @@ def test_daemon_skips_polymarket_when_no_markets(tmp_path: Path) -> None:
     assert market_stream.run_calls == []
 
 
+def test_daemon_heartbeat_loop_writes_file(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    journal = FakeJournal()
+    service = FakeService([], journal)
+    # Stub the polymarket probe so _auth_readonly_ready works on FakeService.
+    service.polymarket = type("P", (), {"get_auth_status": lambda self: type("A", (), {"live_client_constructible": True})()})()  # type: ignore
+    service.safety_stop_reason = lambda **_: None  # type: ignore
+    market_stream = FakeMarketStream([])
+    btc_feed = FakeBtcFeed([])
+    runner = DaemonRunner(
+        settings=settings,
+        service=service,  # type: ignore[arg-type]
+        config=DaemonConfig(
+            market_family="btc_1h",
+            discovery_interval_seconds=3600.0,
+            decision_min_interval_seconds=0.0,
+            heartbeat_interval_seconds=0.05,
+            maintenance_interval_seconds=3600.0,
+        ),
+        market_stream_factory=lambda url: market_stream,  # type: ignore[arg-type]
+        btc_feed_factory=lambda: btc_feed,  # type: ignore[arg-type]
+    )
+    asyncio.run(runner.run_for(0.3))
+    assert settings.heartbeat_path.exists()
+    import json as _json
+
+    payload = _json.loads(settings.heartbeat_path.read_text())
+    assert "metrics" in payload
+    assert payload["market_family"] == "btc_1h"
+
+
+def test_daemon_kill_switch_gates_decision_callback(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    candidates = [_candidate("m1", "yes-1", "no-1")]
+    journal = FakeJournal()
+    service = FakeService(candidates, journal)
+    # The heartbeat loop re-evaluates safety_stop_reason via the service;
+    # force it to always return a stop so the kill switch stays hot.
+    service.polymarket = type("P", (), {"get_auth_status": lambda self: type("A", (), {"live_client_constructible": True})()})()  # type: ignore
+    service.safety_stop_reason = lambda **_: "daily_loss_limit"  # type: ignore
+
+    events = [
+        MarketStreamEvent(
+            event_type="book",
+            payload={
+                "asset_id": "yes-1",
+                "bids": [{"price": "0.48", "size": "100"}],
+                "asks": [{"price": "0.52", "size": "100"}],
+            },
+        ),
+    ]
+    market_stream = FakeMarketStream(events)
+    btc_feed = FakeBtcFeed([])
+
+    callback_hits: list[str] = []
+
+    async def callback(context):  # type: ignore[no-untyped-def]
+        callback_hits.append(context.market_id)
+
+    runner = DaemonRunner(
+        settings=settings,
+        service=service,  # type: ignore[arg-type]
+        config=DaemonConfig(
+            market_family="btc_1h",
+            discovery_interval_seconds=3600.0,
+            decision_min_interval_seconds=0.0,
+            heartbeat_interval_seconds=0.02,
+            maintenance_interval_seconds=3600.0,
+        ),
+        market_stream_factory=lambda url: market_stream,  # type: ignore[arg-type]
+        btc_feed_factory=lambda: btc_feed,  # type: ignore[arg-type]
+        decision_callback=callback,
+    )
+    asyncio.run(runner.run_for(0.3))
+    # The heartbeat loop armed the kill switch before/while the event arrived;
+    # the decision callback must have been skipped.
+    assert callback_hits == []
+    assert runner.metrics.safety_stop_reason == "daily_loss_limit"
+    stop_events = [payload for etype, payload in journal.events if etype == "safety_stop"]
+    assert stop_events, "safety_stop event should be journalled"
+
+
 def test_agent_service_attributes_available() -> None:
     # Sanity: the real AgentService exposes `journal` + `discover_markets`, so the
     # daemon's expectations on the service API stay coupled to the production type.
