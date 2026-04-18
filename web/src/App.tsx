@@ -447,12 +447,12 @@ function OverviewPage({ state }: { state: DashboardState }) {
 
         <article className="card">
           <h2>Last Poll</h2>
-          <p>{liveActivity?.preflight.market.question || "n/a"}</p>
+          <p>{liveActivity?.preflight?.market?.question || "n/a"}</p>
           <dl>
-            <div><dt>Time Remaining</dt><dd>{formatDuration(liveActivity?.last_poll.time_remaining_seconds)}</dd></div>
-            <div><dt>Yes Trades</dt><dd>{liveActivity?.last_poll.trade_counts.yes ?? 0}</dd></div>
-            <div><dt>No Trades</dt><dd>{liveActivity?.last_poll.trade_counts.no ?? 0}</dd></div>
-            <div><dt>Total Trades</dt><dd>{liveActivity?.last_poll.trade_counts.total ?? 0}</dd></div>
+            <div><dt>Time Remaining</dt><dd>{formatDuration(liveActivity?.last_poll?.time_remaining_seconds)}</dd></div>
+            <div><dt>Yes Trades</dt><dd>{liveActivity?.last_poll?.trade_counts?.yes ?? 0}</dd></div>
+            <div><dt>No Trades</dt><dd>{liveActivity?.last_poll?.trade_counts?.no ?? 0}</dd></div>
+            <div><dt>Total Trades</dt><dd>{liveActivity?.last_poll?.trade_counts?.total ?? 0}</dd></div>
           </dl>
         </article>
       </section>
@@ -474,23 +474,23 @@ function OverviewPage({ state }: { state: DashboardState }) {
           <div className="decision-grid">
             <div>
               <label>Suggested Side</label>
-              <strong>{liveActivity?.preflight.assessment.suggested_side || "n/a"}</strong>
+              <strong>{liveActivity?.preflight?.assessment?.suggested_side || "n/a"}</strong>
             </div>
             <div>
               <label>Edge</label>
-              <strong>{formatPct(liveActivity?.preflight.assessment.edge)}</strong>
+              <strong>{formatPct(liveActivity?.preflight?.assessment?.edge)}</strong>
             </div>
             <div>
               <label>Time Remaining</label>
-              <strong>{formatDuration(liveActivity?.last_poll.time_remaining_seconds)}</strong>
+              <strong>{formatDuration(liveActivity?.last_poll?.time_remaining_seconds)}</strong>
             </div>
             <div>
               <label>Tracked Orders</label>
-              <strong>{liveActivity?.tracked_orders.count ?? 0}</strong>
+              <strong>{liveActivity?.tracked_orders?.count ?? 0}</strong>
             </div>
             <div>
               <label>Recent Trades</label>
-              <strong>{liveActivity?.recent_trades.count ?? 0}</strong>
+              <strong>{liveActivity?.recent_trades?.count ?? 0}</strong>
             </div>
           </div>
         </article>
@@ -656,13 +656,13 @@ function OrdersPage({ liveOrders, liveTrades, liveActivity }: { liveOrders: Live
           </div>
           <div>
             <label>Live Preflight</label>
-            <strong>{liveActivity?.preflight.market.question || "n/a"}</strong>
-            <p className="detail-copy">blockers={liveActivity?.preflight.blockers.join(", ") || "none"}</p>
+            <strong>{liveActivity?.preflight?.market?.question || "n/a"}</strong>
+            <p className="detail-copy">blockers={liveActivity?.preflight?.blockers?.join(", ") || "none"}</p>
             <p className="detail-copy">
-              implied={formatPct(liveActivity?.preflight.market.implied_probability)} | fair={formatPct(liveActivity?.preflight.assessment.fair_probability)}
+              implied={formatPct(liveActivity?.preflight?.market?.implied_probability)} | fair={formatPct(liveActivity?.preflight?.assessment?.fair_probability)}
             </p>
             <p className="detail-copy">
-              confidence={formatPct(liveActivity?.preflight.assessment.confidence)} | liquidity={formatMoney(liveActivity?.preflight.market.liquidity_usd)}
+              confidence={formatPct(liveActivity?.preflight?.assessment?.confidence)} | liquidity={formatMoney(liveActivity?.preflight?.market?.liquidity_usd)}
             </p>
           </div>
         </div>
@@ -898,7 +898,7 @@ function SettingsPage({
           <span>{Object.keys(settings.fields).length} editable fields</span>
         </div>
         <div className="settings-groups">
-          {["runtime", "live", "thresholds", "paper"].map((group) => (
+          {Object.keys(groupedKeys).map((group) => (
             <section key={group} className="settings-group">
               <h3>{group}</h3>
               <div className="settings-grid">
@@ -925,23 +925,23 @@ function SettingsPage({
                 <tr>
                   <th>Family</th>
                   <th>Stale Data (s)</th>
-                  <th>Exit Buffer %</th>
+                  <th>Exit Buffer % × Window</th>
                   <th>Max Concurrent</th>
-                  <th>Max Net BTC Exp (USD)</th>
+                  <th>Exit Buffer Floor</th>
                 </tr>
               </thead>
               <tbody>
                 {[
-                  { family: "btc_1h", stale_data_seconds: 5, exit_buffer_pct_of_tte: 0.05, max_concurrent_positions: 2 },
-                  { family: "btc_15m", stale_data_seconds: 3, exit_buffer_pct_of_tte: 0.07, max_concurrent_positions: 2 },
-                  { family: "btc_5m", stale_data_seconds: 2, exit_buffer_pct_of_tte: 0.10, max_concurrent_positions: 1 },
+                  { family: "btc_1h",  stale_data_seconds: 5, exit_buffer_pct_of_tte: 0.05, max_concurrent_positions: 2, floor_seconds: 30, window: "3600s" },
+                  { family: "btc_15m", stale_data_seconds: 3, exit_buffer_pct_of_tte: 0.07, max_concurrent_positions: 2, floor_seconds: 15, window: "900s" },
+                  { family: "btc_5m",  stale_data_seconds: 2, exit_buffer_pct_of_tte: 0.10, max_concurrent_positions: 1, floor_seconds: 10, window: "300s" },
                 ].map((row) => (
                   <tr key={row.family}>
-                    <td>{row.family}</td>
+                    <td><code>{row.family}</code></td>
                     <td>{row.stale_data_seconds}</td>
-                    <td>{(row.exit_buffer_pct_of_tte * 100).toFixed(0)}%</td>
+                    <td>{(row.exit_buffer_pct_of_tte * 100).toFixed(0)}% × {row.window} = {(row.exit_buffer_pct_of_tte * parseInt(row.window)).toFixed(0)}s</td>
                     <td>{row.max_concurrent_positions}</td>
-                    <td>{formatMoney(settings.values["max_net_btc_exposure_usd"] as number | null)}</td>
+                    <td>{row.floor_seconds}s</td>
                   </tr>
                 ))}
               </tbody>
@@ -1038,7 +1038,7 @@ function DaemonView({ heartbeat, ticks }: { heartbeat: DaemonHeartbeatPayload | 
 
       <div className="daemon-header">
         <span className="pill">
-          BTC: {hb?.btc_last_price != null ? `$${hb.btc_last_price.toLocaleString()}` : "n/a"}
+          BTC: {formatMoney(hb?.btc_last_price)}
         </span>
         <span className={heartbeatAgeClass(age)}>
           Heartbeat: {age !== null ? `${age.toFixed(1)}s ago` : "absent"}
@@ -1057,19 +1057,19 @@ function DaemonView({ heartbeat, ticks }: { heartbeat: DaemonHeartbeatPayload | 
       <div className="daemon-stat-grid">
         <article className="card">
           <h2>Polymarket Events</h2>
-          <strong style={{ fontSize: "28px" }}>{metrics?.polymarket_events?.toLocaleString() ?? "0"}</strong>
+          <strong className="card-stat">{metrics?.polymarket_events?.toLocaleString() ?? "0"}</strong>
         </article>
         <article className="card">
           <h2>BTC Ticks</h2>
-          <strong style={{ fontSize: "28px" }}>{metrics?.btc_ticks?.toLocaleString() ?? "0"}</strong>
+          <strong className="card-stat">{metrics?.btc_ticks?.toLocaleString() ?? "0"}</strong>
         </article>
         <article className="card">
           <h2>Decision Ticks</h2>
-          <strong style={{ fontSize: "28px" }}>{metrics?.decision_ticks?.toLocaleString() ?? "0"}</strong>
+          <strong className="card-stat">{metrics?.decision_ticks?.toLocaleString() ?? "0"}</strong>
         </article>
         <article className="card">
           <h2>Last Latency</h2>
-          <strong style={{ fontSize: "28px" }}>
+          <strong className={`card-stat${metrics?.last_decision_latency_ms != null && metrics.last_decision_latency_ms > 100 ? " danger" : ""}`}>
             {metrics?.last_decision_latency_ms != null ? `${metrics.last_decision_latency_ms.toFixed(2)} ms` : "n/a"}
           </strong>
         </article>
@@ -1082,23 +1082,25 @@ function DaemonView({ heartbeat, ticks }: { heartbeat: DaemonHeartbeatPayload | 
           {ticks.map((tick) => {
             const fairYes = tick.fair_probability ?? 0;
             const fairNo = tick.fair_probability_no ?? (1 - fairYes);
-            const tte = tick.seconds_to_expiry != null ? Math.round(tick.seconds_to_expiry / 60) : null;
             const sideClass =
               tick.suggested_side === "YES" ? "side-yes" :
               tick.suggested_side === "NO" ? "side-no" : "side-abstain";
+            const expiryClass =
+              tick.expiry_risk === "HIGH" ? "side-no" :
+              tick.expiry_risk === "MEDIUM" ? "side-abstain" : "side-yes";
             return (
               <div key={tick.market_id} className="daemon-market-card">
-                <div style={{ marginBottom: "10px", fontWeight: 600, fontSize: "14px" }}>
+                <div className="market-card-title">
                   {tick.question ? (tick.question.length > 55 ? `${tick.question.slice(0, 55)}...` : tick.question) : tick.market_id}
                 </div>
-                <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: "10px", fontSize: "12px", color: "var(--muted)" }}>
-                  <span>TTE: {tte !== null ? `${tte}m` : "n/a"}</span>
+                <div className="market-card-meta">
+                  <span>TTE: {formatDuration(tick.seconds_to_expiry)}</span>
                   <span>Bid: {tick.bid_yes?.toFixed(3) ?? "n/a"}</span>
                   <span>Ask: {tick.ask_yes?.toFixed(3) ?? "n/a"}</span>
                 </div>
 
-                <div style={{ marginBottom: "8px" }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: "12px", color: "var(--muted)", marginBottom: "4px" }}>
+                <div className="market-card-prob">
+                  <div className="market-card-prob-labels">
                     <span>YES {(fairYes * 100).toFixed(1)}%</span>
                     <span>NO {(fairNo * 100).toFixed(1)}%</span>
                   </div>
@@ -1107,7 +1109,7 @@ function DaemonView({ heartbeat, ticks }: { heartbeat: DaemonHeartbeatPayload | 
                   </div>
                 </div>
 
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px", fontSize: "13px", marginBottom: "10px" }}>
+                <div className="market-card-edges">
                   <div>
                     Edge YES: <span className={tick.edge_yes > 0 ? "edge-positive" : "edge-negative"}>
                       {tick.edge_yes != null ? (tick.edge_yes * 100).toFixed(2) : "n/a"}%
@@ -1120,13 +1122,13 @@ function DaemonView({ heartbeat, ticks }: { heartbeat: DaemonHeartbeatPayload | 
                   </div>
                 </div>
 
-                <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" }}>
+                <div className="market-card-footer">
                   <span className={sideClass}>{tick.suggested_side}</span>
-                  <span style={{ fontSize: "12px", color: "var(--muted)" }}>
+                  <span className="market-card-confidence">
                     Confidence: {tick.confidence != null ? `${(tick.confidence * 100).toFixed(0)}%` : "n/a"}
                   </span>
                   {tick.expiry_risk && (
-                    <span className={`side-${tick.expiry_risk === "high" ? "no" : tick.expiry_risk === "medium" ? "abstain" : "yes"}`}>
+                    <span className={expiryClass}>
                       {tick.expiry_risk} expiry risk
                     </span>
                   )}
