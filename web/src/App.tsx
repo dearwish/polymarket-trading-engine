@@ -1177,7 +1177,7 @@ function DaemonView({ heartbeat, ticks }: { heartbeat: DaemonHeartbeatPayload | 
         <div className="empty-state">No daemon tick data — daemon may not be running or no markets are active.</div>
       ) : (
         <div className="daemon-market-grid">
-          {ticks.map((tick) => {
+          {[...ticks].sort((a, b) => (a.seconds_to_expiry ?? Infinity) - (b.seconds_to_expiry ?? Infinity)).map((tick) => {
             const fairYes = tick.fair_probability ?? 0;
             const fairNo = tick.fair_probability_no ?? (1 - fairYes);
             const sideClass =
