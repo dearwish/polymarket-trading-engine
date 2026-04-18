@@ -80,11 +80,18 @@ class Settings(BaseSettings):
 
     events_jsonl_max_bytes: int = 200_000_000
     events_jsonl_keep_tail_bytes: int = 50_000_000
+    daemon_maintenance_interval_seconds: int = 3600
+    daemon_heartbeat_interval_seconds: float = 5.0
+    daemon_prune_history_days: int = 14
+    daemon_heartbeat_stale_seconds: float = 30.0
+    daemon_ws_stale_seconds: float = 60.0
 
     data_dir: Path = Field(default=Path("data"))
     log_dir: Path = Field(default=Path("logs"))
     db_path: Path = Field(default=Path("data/agent.db"))
     events_path: Path = Field(default=Path("logs/events.jsonl"))
+    heartbeat_path: Path = Field(default=Path("data/daemon_heartbeat.json"))
+    backups_dir: Path = Field(default=Path("data/backups"))
     runtime_settings_path: Path = Field(default=Path("data/runtime_settings.json"))
 
 

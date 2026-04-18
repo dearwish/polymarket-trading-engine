@@ -49,6 +49,30 @@ class Journal:
             keep_tail_bytes=self.events_jsonl_keep_tail_bytes or None,
         )
 
+    def events_jsonl_size_bytes(self) -> int:
+        if not self.events_path.exists():
+            return 0
+        return self.events_path.stat().st_size
+
+    def db_size_bytes(self) -> int:
+        if not self.db_path.exists():
+            return 0
+        total = self.db_path.stat().st_size
+        for suffix in ("-wal", "-shm"):
+            sidecar = self.db_path.with_suffix(self.db_path.suffix + suffix)
+            if sidecar.exists():
+                total += sidecar.stat().st_size
+        return total
+
+    def vacuum(self) -> None:
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.isolation_level = None
+            conn.execute("vacuum")
+            conn.execute("pragma wal_checkpoint(TRUNCATE)")
+        finally:
+            conn.close()
+
     def save_report(self, session_id: str, summary: str) -> None:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(

@@ -28,6 +28,98 @@ class PortfolioEngine:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
+    # --- maintenance --------------------------------------------------
+
+    def prune_history(self, max_age_days: int, now: datetime | None = None) -> dict[str, int]:
+        """Delete append-only history rows older than ``max_age_days``.
+
+        Closed positions, rejected order attempts, and terminal live-order
+        rows all accrue without bound on a long-running daemon. This helper
+        is safe to run from a periodic maintenance task: open positions and
+        active live orders are never touched.
+        """
+        if max_age_days <= 0:
+            return {"order_attempts": 0, "positions": 0, "live_orders": 0}
+        current = now or _utc_now()
+        cutoff = (current - timedelta(days=max_age_days)).isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            order_attempts = conn.execute(
+                "delete from order_attempts where recorded_at < ?",
+                (cutoff,),
+            ).rowcount or 0
+            positions = conn.execute(
+                "delete from positions where status = 'CLOSED' and closed_at is not null and closed_at < ?",
+                (cutoff,),
+            ).rowcount or 0
+            terminal = ",".join("?" for _ in self.TERMINAL_LIVE_ORDER_STATUSES)
+            live_orders = conn.execute(
+                f"delete from live_orders where status in ({terminal}) and updated_at < ?",
+                (*self.TERMINAL_LIVE_ORDER_STATUSES, cutoff),
+            ).rowcount or 0
+            conn.commit()
+        return {
+            "order_attempts": int(order_attempts),
+            "positions": int(positions),
+            "live_orders": int(live_orders),
+        }
+
+    def vacuum(self) -> None:
+        """Run a blocking VACUUM + WAL truncate.
+
+        SQLite does not permit VACUUM inside a transaction and it takes an
+        exclusive lock, so callers should schedule this from a maintenance
+        task rather than the hot path. After the vacuum we truncate the WAL
+        file so disk usage stays bounded.
+        """
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.isolation_level = None  # autocommit — VACUUM can't run inside a txn
+            conn.execute("vacuum")
+            conn.execute("pragma wal_checkpoint(TRUNCATE)")
+        finally:
+            conn.close()
+
+    def wal_checkpoint(self) -> tuple[int, int, int]:
+        """Force a WAL checkpoint so the -wal sidecar cannot grow forever.
+
+        Returns the raw (busy, log_pages, checkpointed_pages) tuple SQLite
+        reports from ``pragma wal_checkpoint(TRUNCATE)`` so metrics can
+        surface it.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute("pragma wal_checkpoint(TRUNCATE)").fetchone()
+        if not row:
+            return (0, 0, 0)
+        return (int(row[0] or 0), int(row[1] or 0), int(row[2] or 0))
+
+    def backup(self, destination: Path) -> Path:
+        """Write a consistent backup to ``destination`` using SQLite VACUUM INTO.
+
+        VACUUM INTO is safe to call while the daemon is writing (with WAL
+        enabled) and produces a standalone, compacted database file that can
+        be rsync'd / uploaded off-host.
+        """
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            destination.unlink()
+        with sqlite3.connect(self.db_path) as conn:
+            # sqlite3 in Python 3.11+ does not allow parameterised VACUUM INTO,
+            # so escape the path quote-quote style and keep the operator-supplied
+            # destination separate from user-controlled strings.
+            escaped = str(destination).replace("'", "''")
+            conn.execute(f"vacuum into '{escaped}'")
+        return destination
+
+    def row_counts(self) -> dict[str, int]:
+        """Cheap row counts for the `/api/metrics` gauges."""
+        counts = {}
+        with sqlite3.connect(self.db_path) as conn:
+            for table in ("positions", "order_attempts", "live_orders"):
+                row = conn.execute(f"select count(*) from {table}").fetchone()
+                counts[table] = int(row[0] or 0)
+        return counts
+
     def get_account_state(self, mode: ExecutionMode, now: datetime | None = None) -> AccountState:
         open_positions = self.list_open_positions()
         realized_pnl = self.get_total_realized_pnl()
