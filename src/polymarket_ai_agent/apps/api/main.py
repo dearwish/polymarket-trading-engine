@@ -269,7 +269,7 @@ def create_app(
             "equity_curve": equity_curve(limit=200, service=service),
             "report": report(session_id=None, service=service),
             "recent_events": recent_events(limit=12, service=service),
-            "recent_decisions": recent_decisions(limit=20, service=service),
+            "recent_decisions": recent_decisions(limit=50, service=service),
             "live_orders": live_orders(service=service),
             "live_trades": live_trades(limit=20, service=service),
             "daemon_heartbeat": _daemon_heartbeat_payload(service.settings),
@@ -373,9 +373,8 @@ def create_app(
         }
 
     @app.get("/api/decisions/recent")
-    def recent_decisions(limit: int = Query(25, ge=1, le=200), service: AgentService = Depends(service_factory)) -> dict:
-        allowed = {"simulation_cycle", "simulation_decision", "trade_decision", "market_assessment"}
-        events = [event for event in service.journal.read_recent_events(limit=limit * 4) if event["event_type"] in allowed]
+    def recent_decisions(limit: int = Query(50, ge=1, le=200), service: AgentService = Depends(service_factory)) -> dict:
+        events = [e for e in service.journal.read_recent_events(limit=limit * 6) if e["event_type"] == "daemon_tick"]
         return {
             "count": len(events[:limit]),
             "decisions": events[:limit],

@@ -254,7 +254,7 @@ type DashboardSnapshotPayload = {
 
 const VIEWS: Array<{ key: ViewKey; label: string }> = [
   { key: "overview", label: "Overview" },
-  { key: "decisions", label: "Decisions" },
+  { key: "decisions", label: "Signal History" },
   { key: "orders", label: "Orders & Trades" },
   { key: "portfolio", label: "Portfolio" },
   { key: "events", label: "Event Log" },
@@ -314,17 +314,6 @@ function formatDuration(totalSeconds: number | null | undefined): string {
   return parts.join(" ");
 }
 
-function shortText(value: string | undefined, limit = 88): string {
-  if (!value) return "n/a";
-  return value.length > limit ? `${value.slice(0, limit)}...` : value;
-}
-
-function eventPayloadSummary(payload: Record<string, unknown>): string {
-  if (typeof payload.question === "string") return payload.question;
-  if (typeof payload.market_id === "string") return `market ${payload.market_id}`;
-  if (typeof payload.status === "string") return `status ${payload.status}`;
-  return JSON.stringify(payload).slice(0, 96);
-}
 
 function getInitialView(): ViewKey {
   const hash = window.location.hash.replace("#", "") as ViewKey;
@@ -503,29 +492,58 @@ function DecisionsPage({ decisions }: { decisions: DecisionItem[] }) {
   return (
     <section className="panel">
       <div className="panel-header">
-        <h2>Recent Decisions</h2>
-        <span>{decisions.length} items</span>
+        <h2>Signal History</h2>
+        <span>{decisions.length} daemon ticks</span>
       </div>
-      <div className="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Time</th>
-              <th>Type</th>
-              <th>Summary</th>
-            </tr>
-          </thead>
-          <tbody>
-            {decisions.map((item, index) => (
-              <tr key={`${item.logged_at}-${index}`}>
-                <td>{item.logged_at}</td>
-                <td>{item.event_type}</td>
-                <td>{shortText(eventPayloadSummary(item.payload), 120)}</td>
+      {decisions.length === 0 ? (
+        <div className="empty-state">No signal history yet — start the daemon to populate this view.</div>
+      ) : (
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Market</th>
+                <th>Side</th>
+                <th>Fair</th>
+                <th>Edge YES</th>
+                <th>Edge NO</th>
+                <th>Confidence</th>
+                <th>TTE</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+            </thead>
+            <tbody>
+              {decisions.map((item, index) => {
+                const p = item.payload;
+                const side = String(p.suggested_side ?? "");
+                const sideClass = side === "YES" ? "side-yes" : side === "NO" ? "side-no" : "side-abstain";
+                const edgeYes = typeof p.edge_yes === "number" ? p.edge_yes : null;
+                const edgeNo = typeof p.edge_no === "number" ? p.edge_no : null;
+                const fair = typeof p.fair_probability === "number" ? p.fair_probability : null;
+                const conf = typeof p.confidence === "number" ? p.confidence : null;
+                const tte = typeof p.seconds_to_expiry === "number" ? p.seconds_to_expiry : null;
+                const question = typeof p.question === "string" ? p.question : String(p.market_id ?? "");
+                return (
+                  <tr key={`${item.logged_at}-${index}`}>
+                    <td style={{ whiteSpace: "nowrap", color: "var(--muted)", fontSize: "12px" }}>{item.logged_at.slice(11, 19)}</td>
+                    <td title={question}>{question.length > 42 ? `${question.slice(0, 42)}…` : question}</td>
+                    <td><span className={sideClass}>{side || "n/a"}</span></td>
+                    <td>{fair !== null ? `${(fair * 100).toFixed(1)}%` : "n/a"}</td>
+                    <td className={edgeYes !== null && edgeYes > 0 ? "positive" : edgeYes !== null ? "negative" : ""}>
+                      {edgeYes !== null ? `${edgeYes >= 0 ? "+" : ""}${(edgeYes * 100).toFixed(2)}%` : "n/a"}
+                    </td>
+                    <td className={edgeNo !== null && edgeNo > 0 ? "positive" : edgeNo !== null ? "negative" : ""}>
+                      {edgeNo !== null ? `${edgeNo >= 0 ? "+" : ""}${(edgeNo * 100).toFixed(2)}%` : "n/a"}
+                    </td>
+                    <td>{conf !== null ? `${(conf * 100).toFixed(0)}%` : "n/a"}</td>
+                    <td style={{ whiteSpace: "nowrap" }}>{formatDuration(tte)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
     </section>
   );
 }
