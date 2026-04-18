@@ -989,7 +989,7 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
               </tr>
             </thead>
             <tbody>
-              {positions.map((position) => (
+              {[...positions].reverse().map((position) => (
                 <tr key={`${position.market_id}-${position.closed_at}`}>
                   <td><MarketCell marketId={position.market_id} lookup={marketLookup} timezone={timezone} timeFormat={timeFormat} /></td>
                   <td>{position.side}</td>
