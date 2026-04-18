@@ -606,6 +606,95 @@ def test_paper_tp_ladder_closes_position_in_tranches(tmp_path) -> None:
     assert any(p.close_reason == "paper_tp_ladder_2" for p in closed_after_second)
 
 
+def test_paper_trail_arm_threshold_blocks_premature_trail_exit(tmp_path) -> None:
+    """Without the arm threshold, a small +2% peak + 5% trail would exit
+    the position at a loss. With paper_trail_arm_pct=0.05 the trail stays
+    disarmed below +5% peak.
+    """
+    from polymarket_ai_agent.apps.daemon.run import DecisionContext
+    from polymarket_ai_agent.engine.market_state import MarketState
+
+    runner, service, candidate, approved, btc = _setup_runner_with_open_yes_position(
+        tmp_path, entry_price=0.50, settings_overrides={
+            "paper_trailing_stop_pct": 0.05,
+            "paper_trail_arm_pct": 0.05,
+        },
+    )
+    # Peak goes to only ~+2.8% above entry (mid 0.525 vs entry ~0.51051),
+    # so the trail must NOT arm at the 5% threshold.
+    state_small = MarketState(market_id=candidate.market_id, yes_token_id="yes-tok", no_token_id="no-tok")
+    state_small.apply_book_snapshot({
+        "asset_id": "yes-tok",
+        "bids": [{"price": "0.515", "size": "500"}],
+        "asks": [{"price": "0.535", "size": "500"}],
+    })
+    runner._market_states[candidate.market_id] = state_small
+    ctx_peak = DecisionContext(
+        market_id=candidate.market_id, candidate=candidate,
+        features=state_small.features(), btc_snapshot=btc, assessment=approved, metrics=runner.metrics,
+    )
+    asyncio.run(runner._paper_execute_decision_callback(ctx_peak))
+    # Now drop the mid hard (enough to have crossed a naive trail) but trail is still disarmed.
+    state_drop = MarketState(market_id=candidate.market_id, yes_token_id="yes-tok", no_token_id="no-tok")
+    state_drop.apply_book_snapshot({
+        "asset_id": "yes-tok",
+        "bids": [{"price": "0.48", "size": "500"}],
+        "asks": [{"price": "0.50", "size": "500"}],
+    })
+    runner._market_states[candidate.market_id] = state_drop
+    ctx_drop = DecisionContext(
+        market_id=candidate.market_id, candidate=candidate,
+        features=state_drop.features(), btc_snapshot=btc, assessment=approved, metrics=runner.metrics,
+    )
+    asyncio.run(runner._paper_execute_decision_callback(ctx_drop))
+    # Position should STILL be open — trail never armed.
+    assert len(service.portfolio.list_open_positions()) == 1
+
+
+def test_paper_entry_cooldown_blocks_immediate_reentry(tmp_path) -> None:
+    from polymarket_ai_agent.apps.daemon.run import DecisionContext
+    from polymarket_ai_agent.engine.market_state import MarketState
+
+    runner, service, candidate, approved, btc = _setup_runner_with_open_yes_position(
+        tmp_path, entry_price=0.50, settings_overrides={
+            "paper_stop_loss_pct": 0.15,
+            "paper_entry_cooldown_seconds": 120,
+        },
+    )
+    # Force a stop-loss close: mid drops 20%.
+    state_down = MarketState(market_id=candidate.market_id, yes_token_id="yes-tok", no_token_id="no-tok")
+    state_down.apply_book_snapshot({
+        "asset_id": "yes-tok",
+        "bids": [{"price": "0.39", "size": "500"}],
+        "asks": [{"price": "0.41", "size": "500"}],
+    })
+    runner._market_states[candidate.market_id] = state_down
+    ctx_close = DecisionContext(
+        market_id=candidate.market_id, candidate=candidate,
+        features=state_down.features(), btc_snapshot=btc, assessment=approved, metrics=runner.metrics,
+    )
+    asyncio.run(runner._paper_execute_decision_callback(ctx_close))
+    assert service.portfolio.list_open_positions() == []
+    assert candidate.market_id in runner._last_close_at
+
+    # Now price pops back up and the scorer wants to re-enter on the same
+    # market — but we're still within the 120s cooldown window.
+    state_up = MarketState(market_id=candidate.market_id, yes_token_id="yes-tok", no_token_id="no-tok")
+    state_up.apply_book_snapshot({
+        "asset_id": "yes-tok",
+        "bids": [{"price": "0.55", "size": "500"}],
+        "asks": [{"price": "0.57", "size": "500"}],
+    })
+    runner._market_states[candidate.market_id] = state_up
+    ctx_reentry = DecisionContext(
+        market_id=candidate.market_id, candidate=candidate,
+        features=state_up.features(), btc_snapshot=btc, assessment=approved, metrics=runner.metrics,
+    )
+    asyncio.run(runner._paper_execute_decision_callback(ctx_reentry))
+    # Cooldown blocks the new entry.
+    assert service.portfolio.list_open_positions() == []
+
+
 def test_tp_ladder_parser_ignores_malformed_pairs() -> None:
     from polymarket_ai_agent.apps.daemon.run import DaemonRunner
     assert DaemonRunner._parse_tp_ladder("") == []

@@ -52,6 +52,15 @@ class Settings(BaseSettings):
     # Trailing stop: track peak token price since entry; close when current
     # drops by `paper_trailing_stop_pct` of the peak. 0.0 disables.
     paper_trailing_stop_pct: float = 0.0
+    # Trail-arm threshold: the trailing stop only becomes active once the
+    # peak clears entry_price × (1 + paper_trail_arm_pct). Prevents the
+    # trail from firing at a small loss when the peak barely moved above
+    # entry. 0.0 arms immediately (previous behaviour).
+    paper_trail_arm_pct: float = 0.0
+    # Entry cooldown: after any close on a market, block new entries on the
+    # same market for this many seconds. Prevents immediate re-entry whipsaw
+    # where the scorer flips sides and each flip gets stopped out. 0 disables.
+    paper_entry_cooldown_seconds: int = 0
     # Scale-out / tiered take-profit ladder. Comma-separated list of
     #   "<pnl_pct>:<fraction_to_close>" pairs, e.g. "0.15:0.5,0.30:0.25"
     # meaning: at +15% PnL close 50% of the position, at +30% close another
@@ -201,6 +210,22 @@ EDITABLE_SETTINGS_METADATA: dict[str, dict[str, Any]] = {
     "paper_tp_ladder": {
         "label": "Paper TP Ladder (pct:fraction,...)",
         "type": "text",
+        "group": "paper",
+    },
+    "paper_trail_arm_pct": {
+        "label": "Paper Trail Arm %",
+        "type": "number",
+        "min": 0,
+        "max": 1,
+        "step": 0.01,
+        "group": "paper",
+    },
+    "paper_entry_cooldown_seconds": {
+        "label": "Paper Entry Cooldown Seconds",
+        "type": "number",
+        "min": 0,
+        "max": 3600,
+        "step": 1,
         "group": "paper",
     },
 }

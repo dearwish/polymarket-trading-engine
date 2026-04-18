@@ -171,6 +171,9 @@ class DaemonRunner:
         # Paper-mode only: lives in memory, reset if the daemon restarts.
         self._position_extras: dict[str, dict[str, float]] = {}
         self._tp_ladder: list[tuple[float, float]] = self._parse_tp_ladder(settings.paper_tp_ladder)
+        # Last close timestamp per market, used to enforce an entry cooldown
+        # that blocks whipsaw re-entries on the same market. In-memory only.
+        self._last_close_at: dict[str, datetime] = {}
 
     @property
     def active_asset_ids(self) -> list[str]:
@@ -497,11 +500,20 @@ class DaemonRunner:
                             f"paper_tp_ladder_{tranches_closed + 1}",
                         )
                         extras["tranches_closed"] = tranches_closed + 1
+                        # Partial closes don't start a cooldown — position is
+                        # still live for the remainder; cooldown only applies
+                        # after a FULL close.
                         return
                 # --- 2. Trailing stop (full close) ------------------------
+                # Arms only once peak clears entry × (1 + arm_pct); prevents
+                # the trail from locking in a small loss when the peak barely
+                # moved above entry.
                 trail_pct = float(self.settings.paper_trailing_stop_pct)
+                arm_pct = float(self.settings.paper_trail_arm_pct)
                 peak = extras["peak_price"]
-                if trail_pct > 0.0 and peak > entry_price and current_price <= peak * (1.0 - trail_pct):
+                arm_threshold = entry_price * (1.0 + arm_pct)
+                trail_armed = peak >= arm_threshold
+                if trail_pct > 0.0 and trail_armed and current_price <= peak * (1.0 - trail_pct):
                     await asyncio.to_thread(
                         self.service.portfolio.close_position,
                         market_id,
@@ -509,6 +521,7 @@ class DaemonRunner:
                         "paper_trailing_stop",
                     )
                     self._position_extras.pop(market_id, None)
+                    self._last_close_at[market_id] = _utc_now()
                     return
                 # --- 3 + 4. Fixed TP / SL ---------------------------------
                 tp_pct = float(self.settings.paper_take_profit_pct)
@@ -526,6 +539,7 @@ class DaemonRunner:
                         close_reason,
                     )
                     self._position_extras.pop(market_id, None)
+                    self._last_close_at[market_id] = _utc_now()
                     return
             # --- 5. TTE exit buffer ---------------------------------------
             exit_buffer = self.service.risk.exit_buffer_seconds_for_tte(tte_seconds)
@@ -537,9 +551,19 @@ class DaemonRunner:
                     "paper_tte_exit",
                 )
                 self._position_extras.pop(market_id, None)
+                self._last_close_at[market_id] = _utc_now()
             return  # Do not open a duplicate while a position is live.
         # Clean up extras if no open position exists (e.g., previous TTE close).
         self._position_extras.pop(market_id, None)
+
+        # Enforce entry cooldown after a recent close on this market.
+        cooldown_seconds = int(self.settings.paper_entry_cooldown_seconds)
+        if cooldown_seconds > 0:
+            last_close = self._last_close_at.get(market_id)
+            if last_close is not None:
+                elapsed = (_utc_now() - last_close).total_seconds()
+                if elapsed < cooldown_seconds:
+                    return
 
         snapshot = MarketSnapshot(
             candidate=candidate,
