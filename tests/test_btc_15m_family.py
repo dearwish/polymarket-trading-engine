@@ -24,9 +24,9 @@ def _settings(tmp_path: Path, family: str) -> Settings:
 def test_btc_15m_scorer_matches_15_minute_phrase(tmp_path: Path) -> None:
     connector = PolymarketConnector(_settings(tmp_path, "btc_15m"))
     score = connector._btc_15m_match_score(
-        "Will Bitcoin be up or down in the next 15 minutes?",
+        "Bitcoin Up or Down - 10:30AM-10:45AM ET",
         "Resolves YES if BTC price is higher 15 minutes from market open.",
-        "bitcoin-up-or-down-15m",
+        "btc-updown-15m-1776522600",
     )
     assert score >= 3
 
@@ -41,18 +41,23 @@ def test_btc_15m_scorer_ignores_non_btc(tmp_path: Path) -> None:
     assert score == 0
 
 
-def test_btc_15m_scorer_handles_general_minute_markets(tmp_path: Path) -> None:
+def test_btc_15m_scorer_rejects_non_15m_slug_decoys(tmp_path: Path) -> None:
     connector = PolymarketConnector(_settings(tmp_path, "btc_15m"))
+    # Generic BTC "up or down" market without the canonical btc-updown-15m slug.
+    # After Phase 7 we require the slug prefix — decoys must score 0.
     score = connector._btc_15m_match_score(
         "Bitcoin up or down in the next 10 minutes?",
         "",
         "btc-10m",
     )
-    # Not a 15m market, but mentions minutes + direction + BTC → still scores above zero.
-    assert score >= 1
-    # Still less than an explicit 15m match.
-    explicit = connector._btc_15m_match_score("Bitcoin 15m up or down", "", "btc-15m")
-    assert explicit > score
+    assert score == 0
+    # A market with the right slug scores > 0.
+    explicit = connector._btc_15m_match_score(
+        "Bitcoin Up or Down - 11:00AM-11:15AM ET",
+        "",
+        "btc-updown-15m-1776524400",
+    )
+    assert explicit >= 3
 
 
 def test_btc_15m_active_expiry_window(tmp_path: Path) -> None:

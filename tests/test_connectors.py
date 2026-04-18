@@ -8,8 +8,9 @@ from polymarket_ai_agent.types import DecisionStatus, SuggestedSide, TradeDecisi
 
 
 class DummyResponse:
-    def __init__(self, payload):
+    def __init__(self, payload, status_code: int = 200):
         self._payload = payload
+        self.status_code = status_code
 
     def raise_for_status(self) -> None:
         return None
@@ -20,12 +21,22 @@ class DummyResponse:
 
 class DummyClient:
     def __init__(self, payloads):
-        self.payloads = payloads
+        self.payloads = list(payloads)
         self.calls = []
 
-    def get(self, url, params=None):
+    def get(self, url, params=None, **kwargs):
         self.calls.append((url, params))
-        return DummyResponse(self.payloads.pop(0))
+        if not self.payloads:
+            return DummyResponse(None, status_code=404)
+        payload = self.payloads.pop(0)
+        if isinstance(payload, DummyResponse):
+            return payload
+        return DummyResponse(payload)
+
+
+def _event_response(market_dict: dict) -> dict:
+    """Wrap a market dict as an /events/slug/<slug> response."""
+    return {"markets": [market_dict]}
 
 
 def test_external_feed_connector_returns_btc_price() -> None:
@@ -34,228 +45,117 @@ def test_external_feed_connector_returns_btc_price() -> None:
     assert connector.get_btc_price() == 123456.78
 
 
-def test_polymarket_connector_discovers_btc_market(settings) -> None:
-    payload = [
-        {
-            "id": "123",
-            "question": "Will Bitcoin be up or down in 5 minutes?",
-            "conditionId": "cond-123",
-            "slug": "btc-5m",
-            "endDate": "2099-01-01T00:00:00Z",
-            "clobTokenIds": '["yes-token","no-token"]',
-            "outcomePrices": "[0.55,0.45]",
-            "liquidityNum": 1000,
-            "volume24hr": 5000,
-            "description": "Resolution text",
-        },
-        {
-            "id": "999",
-            "question": "Will BTC be above 120,000 by the end of the month?",
-            "conditionId": "cond-999",
-            "slug": "btc-monthly",
-            "endDate": "2099-01-01T00:00:00Z",
-            "clobTokenIds": '["a","b"]',
-            "outcomePrices": "[0.5,0.5]",
-        },
+def _make_market_dict(market_id: str, question: str, slug: str, end_minutes_from_now: int = 5,
+                      yes_price: float = 0.55) -> dict:
+    return {
+        "id": market_id,
+        "question": question,
+        "conditionId": f"cond-{market_id}",
+        "slug": slug,
+        "endDate": (datetime.now(timezone.utc) + timedelta(minutes=end_minutes_from_now)).isoformat(),
+        "clobTokenIds": f'["yes-{market_id}","no-{market_id}"]',
+        "outcomePrices": f"[{yes_price},{1.0 - yes_price}]",
+        "liquidityNum": 1000,
+        "volume24hr": 5000,
+        "description": "Resolution text",
+    }
+
+
+def test_predicted_slug_btc_5m_format() -> None:
+    # 5m slug is btc-updown-5m-<unix_ts> where ts is current 5-min window start
+    slug = PolymarketConnector._predicted_slug("btc_5m", 0)
+    assert slug is not None and slug.startswith("btc-updown-5m-")
+    ts = int(slug.rsplit("-", 1)[1])
+    assert ts % 300 == 0  # aligned to 5-min boundary
+
+
+def test_predicted_slug_btc_15m_format() -> None:
+    slug = PolymarketConnector._predicted_slug("btc_15m", 0)
+    assert slug is not None and slug.startswith("btc-updown-15m-")
+    ts = int(slug.rsplit("-", 1)[1])
+    assert ts % 900 == 0  # aligned to 15-min boundary
+
+
+def test_predicted_slug_btc_1h_et_format() -> None:
+    # Format: bitcoin-up-or-down-{month}-{day}-{year}-{hr}{am/pm}-et
+    slug = PolymarketConnector._predicted_slug("btc_1h", 0)
+    assert slug is not None
+    assert slug.startswith("bitcoin-up-or-down-")
+    assert slug.endswith("-et")
+    # one of am/pm must appear exactly before -et
+    assert ("am-et" in slug) or ("pm-et" in slug)
+
+
+def test_predicted_slug_unknown_family_returns_none() -> None:
+    assert PolymarketConnector._predicted_slug("not-a-family", 0) is None
+
+
+def test_slug_prediction_discovers_btc_5m_markets(settings) -> None:
+    # 3 lookahead slugs → 3 event responses, each wrapping one market
+    payloads = [
+        _event_response(_make_market_dict("m1", "Bitcoin Up or Down - 10:25AM-10:30AM ET", "btc-updown-5m-aaa", yes_price=0.50)),
+        _event_response(_make_market_dict("m2", "Bitcoin Up or Down - 10:30AM-10:35AM ET", "btc-updown-5m-bbb", yes_price=0.55)),
+        _event_response(_make_market_dict("m3", "Bitcoin Up or Down - 10:35AM-10:40AM ET", "btc-updown-5m-ccc", yes_price=0.60)),
     ]
-    connector = PolymarketConnector(settings, client=DummyClient([payload]))
+    connector = PolymarketConnector(settings, client=DummyClient(payloads))
     markets = connector.discover_markets()
-    assert len(markets) == 1
-    assert markets[0].market_id == "123"
-    assert markets[0].implied_probability == 0.55
+    assert [m.market_id for m in markets] == ["m1", "m2", "m3"]
 
 
-def test_polymarket_connector_prefers_nearest_active_btc_5m_market(settings) -> None:
-    payload = [
-        {
-            "id": "nearer",
-            "question": "Will Bitcoin be up or down in 5 minutes?",
-            "conditionId": "cond-nearer",
-            "slug": "btc-nearer",
-            "endDate": (datetime.now(timezone.utc) + timedelta(minutes=3)).isoformat(),
-            "clobTokenIds": '["yes-nearer","no-nearer"]',
-            "outcomePrices": "[0.51,0.49]",
-            "liquidityNum": 1000,
-            "volume24hr": 2000,
-            "description": "Resolution text",
-        },
-        {
-            "id": "later",
-            "question": "Will BTC be up or down in 5 minutes?",
-            "conditionId": "cond-later",
-            "slug": "btc-later",
-            "endDate": (datetime.now(timezone.utc) + timedelta(minutes=8)).isoformat(),
-            "clobTokenIds": '["yes-later","no-later"]',
-            "outcomePrices": "[0.52,0.48]",
-            "liquidityNum": 5000,
-            "volume24hr": 9000,
-            "description": "Resolution text",
-        },
+def test_slug_prediction_tolerates_404s(settings) -> None:
+    # First slug resolved (200), next two missing (404). Should return only the first.
+    payloads = [
+        _event_response(_make_market_dict("m1", "Bitcoin Up or Down - 10:25AM-10:30AM ET", "btc-updown-5m-aaa")),
+        DummyResponse(None, status_code=404),
+        DummyResponse(None, status_code=404),
     ]
-    connector = PolymarketConnector(settings, client=DummyClient([payload]))
-    market = connector.discover_active_market()
-    assert market is not None
-    assert market.market_id == "nearer"
-
-
-def test_polymarket_connector_ignores_far_expiry_btc_5m_markets(settings) -> None:
-    payload = [
-        {
-            "id": "too-far",
-            "question": "Will Bitcoin be up or down in 5 minutes?",
-            "conditionId": "cond-too-far",
-            "slug": "btc-too-far",
-            "endDate": (datetime.now(timezone.utc) + timedelta(minutes=45)).isoformat(),
-            "clobTokenIds": '["yes-too-far","no-too-far"]',
-            "outcomePrices": "[0.51,0.49]",
-            "liquidityNum": 1000,
-            "volume24hr": 2000,
-            "description": "Resolution text",
-        }
-    ]
-    connector = PolymarketConnector(settings, client=DummyClient([payload]))
-    assert connector.discover_active_market() is None
-
-
-def test_polymarket_connector_prefers_exact_btc_5m_match_score(settings) -> None:
-    payload = [
-        {
-            "id": "vague",
-            "question": "Will BTC move in the next few minutes?",
-            "conditionId": "cond-vague",
-            "slug": "btc-next-minutes",
-            "endDate": (datetime.now(timezone.utc) + timedelta(minutes=4)).isoformat(),
-            "clobTokenIds": '["yes-vague","no-vague"]',
-            "outcomePrices": "[0.51,0.49]",
-            "liquidityNum": 5000,
-            "volume24hr": 6000,
-            "description": "Short-term BTC direction market",
-        },
-        {
-            "id": "exact",
-            "question": "Will Bitcoin be up or down in 5 minutes?",
-            "conditionId": "cond-exact",
-            "slug": "btc-5m-exact",
-            "endDate": (datetime.now(timezone.utc) + timedelta(minutes=6)).isoformat(),
-            "clobTokenIds": '["yes-exact","no-exact"]',
-            "outcomePrices": "[0.52,0.48]",
-            "liquidityNum": 1000,
-            "volume24hr": 1500,
-            "description": "Resolution text",
-        },
-    ]
-    connector = PolymarketConnector(settings, client=DummyClient([payload]))
+    connector = PolymarketConnector(settings, client=DummyClient(payloads))
     markets = connector.discover_markets()
-    assert markets[0].market_id == "exact"
+    assert [m.market_id for m in markets] == ["m1"]
 
 
-def test_polymarket_connector_discovers_btc_1h_market(settings) -> None:
-    configured = settings.model_copy(update={"market_family": "btc_1h"})
-    payload = [
-        {
-            "id": "1h",
-            "question": "Bitcoin Up or Down - April 17, 3PM ET",
-            "conditionId": "cond-1h",
-            "slug": "bitcoin-up-or-down-april-17-2026-3pm-et",
-            "endDate": "2099-01-01T00:00:00Z",
-            "clobTokenIds": '["yes-1h","no-1h"]',
-            "outcomePrices": "[0.57,0.43]",
-            "liquidityNum": 2000,
-            "volume24hr": 8000,
-            "description": "This hourly BTC market resolves to Up or Down on Binance BTC/USDT.",
-        },
-        {
-            "id": "daily",
-            "question": "Will the price of Bitcoin be above $82,000 on April 18?",
-            "conditionId": "cond-daily",
-            "slug": "bitcoin-above-82k-on-april-18",
-            "endDate": "2099-01-01T00:00:00Z",
-            "clobTokenIds": '["yes-daily","no-daily"]',
-            "outcomePrices": "[0.55,0.45]",
-            "liquidityNum": 3000,
-            "volume24hr": 9000,
-            "description": "Daily threshold market",
-        },
-    ]
-    connector = PolymarketConnector(configured, client=DummyClient([payload]))
+def test_slug_prediction_dedupes_same_market_across_windows(settings) -> None:
+    # If Polymarket returns the same market for two consecutive slug lookups (shouldn't
+    # happen in practice), we dedupe by market_id.
+    same = _make_market_dict("m1", "Bitcoin Up or Down - 10:25AM-10:30AM ET", "btc-updown-5m-aaa")
+    payloads = [_event_response(same), _event_response(same), _event_response(same)]
+    connector = PolymarketConnector(settings, client=DummyClient(payloads))
     markets = connector.discover_markets()
-    assert len(markets) == 1
-    assert markets[0].market_id == "1h"
+    assert [m.market_id for m in markets] == ["m1"]
 
 
-def test_polymarket_connector_prefers_nearest_active_btc_1h_market(settings) -> None:
-    configured = settings.model_copy(update={"market_family": "btc_1h"})
-    payload = [
-        {
-            "id": "nearer",
-            "question": "Bitcoin Up or Down - April 17, 3PM ET",
-            "conditionId": "cond-nearer",
-            "slug": "bitcoin-up-or-down-april-17-2026-3pm-et",
-            "endDate": (datetime.now(timezone.utc) + timedelta(minutes=50)).isoformat(),
-            "clobTokenIds": '["yes-nearer","no-nearer"]',
-            "outcomePrices": "[0.51,0.49]",
-            "liquidityNum": 1200,
-            "volume24hr": 2200,
-            "description": "Hourly BTC direction market on Binance.",
-        },
-        {
-            "id": "later",
-            "question": "Bitcoin Up or Down - April 17, 4PM ET",
-            "conditionId": "cond-later",
-            "slug": "bitcoin-up-or-down-april-17-2026-4pm-et",
-            "endDate": (datetime.now(timezone.utc) + timedelta(minutes=95)).isoformat(),
-            "clobTokenIds": '["yes-later","no-later"]',
-            "outcomePrices": "[0.52,0.48]",
-            "liquidityNum": 5000,
-            "volume24hr": 9000,
-            "description": "Hourly BTC direction market on Binance.",
-        },
-    ]
-    connector = PolymarketConnector(configured, client=DummyClient([payload]))
-    market = connector.discover_active_market()
-    assert market is not None
-    assert market.market_id == "nearer"
+def test_btc_5m_match_score_requires_slug_prefix() -> None:
+    # Even with "up or down" + "bitcoin" + "5 minutes", a non-btc-updown-5m slug is rejected.
+    score = PolymarketConnector._btc_5m_match_score(
+        question="Will Bitcoin be up or down in 5 minutes?",
+        description="BTC directional market",
+        slug="bitcoin-5-minute-up-down",
+    )
+    assert score == 0
+    # With the canonical slug prefix, it passes.
+    good = PolymarketConnector._btc_5m_match_score(
+        question="Bitcoin Up or Down - 10:25AM-10:30AM ET",
+        description="",
+        slug="btc-updown-5m-1776522300",
+    )
+    assert good >= 3
 
 
-def test_polymarket_connector_ignores_far_expiry_btc_1h_markets(settings) -> None:
-    configured = settings.model_copy(update={"market_family": "btc_1h"})
-    payload = [
-        {
-            "id": "too-far",
-            "question": "Bitcoin Up or Down - April 17, 8PM ET",
-            "conditionId": "cond-too-far",
-            "slug": "bitcoin-up-or-down-april-17-2026-8pm-et",
-            "endDate": (datetime.now(timezone.utc) + timedelta(hours=5)).isoformat(),
-            "clobTokenIds": '["yes-too-far","no-too-far"]',
-            "outcomePrices": "[0.51,0.49]",
-            "liquidityNum": 1000,
-            "volume24hr": 2000,
-            "description": "Hourly BTC direction market on Binance.",
-        }
-    ]
-    connector = PolymarketConnector(configured, client=DummyClient([payload]))
-    assert connector.discover_active_market() is None
-
-
-def test_polymarket_connector_rejects_generic_hourly_non_bitcoin_market(settings) -> None:
-    configured = settings.model_copy(update={"market_family": "btc_1h"})
-    payload = [
-        {
-            "id": "spy-hourly",
-            "question": "SPY (SPY) Up or Down on April 17?",
-            "conditionId": "cond-spy",
-            "slug": "spy-up-or-down-on-april-17-2026",
-            "endDate": (datetime.now(timezone.utc) + timedelta(minutes=50)).isoformat(),
-            "clobTokenIds": '["yes-spy","no-spy"]',
-            "outcomePrices": "[0.51,0.49]",
-            "liquidityNum": 2000,
-            "volume24hr": 6000,
-            "description": "This market resolves using the 1-minute candle for SPY during regular trading hours.",
-        }
-    ]
-    connector = PolymarketConnector(configured, client=DummyClient([payload]))
-    markets = connector.discover_markets()
-    assert markets == []
+def test_btc_1h_match_score_requires_bitcoin_updown_et_slug() -> None:
+    # Decoy: "Bitcoin Up or Down on April 18?" (daily, not a rolling 1h market)
+    decoy = PolymarketConnector._btc_1h_match_score(
+        question="Bitcoin Up or Down on April 18?",
+        description="",
+        slug="bitcoin-up-or-down-april-18",  # missing -<hr>{am/pm}-et
+    )
+    assert decoy == 0
+    # Real rolling 1h market
+    good = PolymarketConnector._btc_1h_match_score(
+        question="Bitcoin Up or Down - April 18, 10AM ET",
+        description="",
+        slug="bitcoin-up-or-down-april-18-2026-10am-et",
+    )
+    assert good >= 3
 
 
 def test_polymarket_connector_builds_orderbook_snapshot(settings) -> None:

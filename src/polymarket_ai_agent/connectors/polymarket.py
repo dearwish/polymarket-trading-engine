@@ -1,8 +1,37 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
+
+_SLUG_WINDOW_SECONDS: dict[str, int] = {
+    "btc_5m": 5 * 60,
+    "btc_15m": 15 * 60,
+}
+_SLUG_PREFIX: dict[str, str] = {
+    "btc_5m": "btc-updown-5m",
+    "btc_15m": "btc-updown-15m",
+}
+_SLUG_PREDICTED_FAMILIES = frozenset({"btc_5m", "btc_15m", "btc_1h"})
+_ET = ZoneInfo("America/New_York")
+
+
+def _format_1h_et_slug(window_start_utc: datetime) -> str:
+    """Polymarket hourly market slug: bitcoin-up-or-down-{month}-{day}-{year}-{hr}{am/pm}-et."""
+    et = window_start_utc.astimezone(_ET)
+    month = et.strftime("%B").lower()
+    hour = et.hour
+    if hour == 0:
+        hr, ampm = "12", "am"
+    elif hour < 12:
+        hr, ampm = str(hour), "am"
+    elif hour == 12:
+        hr, ampm = "12", "pm"
+    else:
+        hr, ampm = str(hour - 12), "pm"
+    return f"bitcoin-up-or-down-{month}-{et.day}-{et.year}-{hr}{ampm}-et"
 
 import httpx
 from py_clob_client.client import ClobClient
@@ -28,6 +57,9 @@ class PolymarketConnector:
         self.client = client or httpx.Client(timeout=20)
 
     def discover_markets(self, limit: int = 25) -> list[MarketCandidate]:
+        family = self.settings.market_family
+        if family in _SLUG_PREDICTED_FAMILIES:
+            return self._discover_by_slug_prediction(family)
         request_limit = self._discovery_request_limit(limit)
         params = {
             "closed": "false",
@@ -40,6 +72,58 @@ class PolymarketConnector:
         payload = response.json()
         markets = [candidate for item in payload if (candidate := self._parse_market(item))]
         return self._sort_market_candidates(markets)
+
+    def _discover_by_slug_prediction(self, family: str, lookahead: int = 3) -> list[MarketCandidate]:
+        """Fetch upcoming rolling btc-updown events by directly predicting their slugs.
+
+        Polymarket does not surface these ephemeral short-horizon markets in bulk
+        /markets or /events listings, so we compute the next few window-start slugs
+        (unix-seconds aligned for 5m/15m, ET human-date+hour for 1h) and fetch each
+        directly via /events/slug/<slug>.
+        """
+        seen: set[str] = set()
+        candidates: list[MarketCandidate] = []
+        for i in range(lookahead):
+            slug = self._predicted_slug(family, i)
+            if slug is None:
+                continue
+            candidate = self._fetch_event_slug_market(slug)
+            if candidate is None or candidate.market_id in seen:
+                continue
+            seen.add(candidate.market_id)
+            candidates.append(candidate)
+        return self._sort_market_candidates(candidates)
+
+    @staticmethod
+    def _predicted_slug(family: str, window_index: int) -> str | None:
+        if family in _SLUG_WINDOW_SECONDS:
+            step = _SLUG_WINDOW_SECONDS[family]
+            prefix = _SLUG_PREFIX[family]
+            now_ts = int(time.time())
+            window_start = (now_ts // step) * step + window_index * step
+            return f"{prefix}-{window_start}"
+        if family == "btc_1h":
+            now_utc = datetime.now(timezone.utc)
+            current_et_hour = now_utc.astimezone(_ET).replace(minute=0, second=0, microsecond=0)
+            return _format_1h_et_slug(current_et_hour + timedelta(hours=window_index))
+        return None
+
+    def _fetch_event_slug_market(self, slug: str) -> MarketCandidate | None:
+        url = f"{self.settings.polymarket_gamma_url}/events/slug/{slug}"
+        try:
+            response = self.client.get(url, timeout=5.0)
+        except httpx.HTTPError:
+            return None
+        if response.status_code != 200:
+            return None
+        try:
+            data = response.json()
+        except ValueError:
+            return None
+        markets = data.get("markets") or []
+        if not markets:
+            return None
+        return self._parse_market(markets[0])
 
     def discover_active_market(self, limit: int = 50) -> MarketCandidate | None:
         markets = self.discover_markets(limit=limit)
@@ -568,6 +652,9 @@ class PolymarketConnector:
     def _btc_1h_match_score(question: str, description: str, slug: str) -> int:
         joined = " ".join([question, description, slug]).lower()
         has_btc = "bitcoin" in joined or "btc" in joined
+        # Rolling hourly markets use this slug pattern; reject decoys (e.g. "April 18?" daily markets).
+        if "bitcoin-up-or-down-" not in joined or "-et" not in joined:
+            return 0
         has_1h_window = (
             "1 hour" in joined
             or "one hour" in joined
@@ -610,6 +697,10 @@ class PolymarketConnector:
         has_btc = "bitcoin" in joined or "btc" in joined
         if not has_btc:
             return 0
+        # Rolling 15m markets carry this slug prefix; reject anything else to avoid
+        # pulling daily "Up or Down" decoys into the 15m family.
+        if "btc-updown-15m" not in joined:
+            return 0
         has_15m_window = (
             "15 minutes" in joined
             or "fifteen minutes" in joined
@@ -641,6 +732,9 @@ class PolymarketConnector:
     def _btc_5m_match_score(question: str, description: str, slug: str) -> int:
         joined = " ".join([question, description, slug]).lower()
         has_btc = "bitcoin" in joined or "btc" in joined
+        # Require the rolling 5m slug prefix so daily "Up or Down" markets can't sneak in.
+        if "btc-updown-5m" not in joined:
+            return 0
         has_5m_window = "5 minutes" in joined or "five minutes" in joined or re.search(r"\b5m\b", joined) is not None
         has_direction = any(
             phrase in joined
