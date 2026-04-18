@@ -405,7 +405,7 @@ function OverviewPage({ state }: { state: DashboardState }) {
       <section className="grid cards">
         <article className="card">
           <h2>Account</h2>
-          <p>{auth?.wallet_address || "n/a"}</p>
+          <p title={auth?.wallet_address}>{auth?.wallet_address || "n/a"}</p>
           <dl>
             <div><dt>Balance</dt><dd>{formatMoney(auth?.balance)}</dd></div>
             <div><dt>Open Orders</dt><dd>{auth?.open_orders_count ?? 0}</dd></div>
