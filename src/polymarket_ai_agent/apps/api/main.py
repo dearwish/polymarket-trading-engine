@@ -259,7 +259,10 @@ def create_app(
     def _latest_daemon_ticks(service: AgentService) -> dict:
         # read_recent_events returns file-order (oldest first); iterate newest-first
         # so "first occurrence per market_id" is the most recent tick for that market.
-        events = service.journal.read_recent_events(limit=200)
+        #
+        # Scan a wide window (~hours of runtime) so MarketCell hover + link works on
+        # older closed positions whose markets are no longer actively tracked.
+        events = service.journal.read_recent_events(limit=5000)
         seen: set[str] = set()
         ticks: list[dict] = []
         for e in reversed(events):
