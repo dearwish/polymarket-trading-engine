@@ -285,6 +285,7 @@ def create_app(
             "live_trades": _cached("live_trades", 30.0, lambda: live_trades(limit=20, service=service)),
             "daemon_heartbeat": _daemon_heartbeat_payload(service.settings),
             "daemon_ticks": _latest_daemon_ticks(service),
+            "paper_activity": paper_activity(limit=30, service=service),
         }
 
     def streamable_dashboard_sections(service: AgentService) -> dict:
@@ -304,6 +305,7 @@ def create_app(
             "live_trades": snapshot["live_trades"],
             "daemon_heartbeat": snapshot["daemon_heartbeat"],
             "daemon_ticks": snapshot["daemon_ticks"],
+            "paper_activity": snapshot["paper_activity"],
         }
 
     @app.get("/api/status")
@@ -389,6 +391,23 @@ def create_app(
         return {
             "count": len(events[:limit]),
             "decisions": events[:limit],
+        }
+
+    @app.get("/api/paper/activity")
+    def paper_activity(limit: int = Query(30, ge=1, le=200), service: AgentService = Depends(service_factory)) -> dict:
+        """Recent execution_result events — paper (and live) fills from the journal.
+
+        Unique to paper runs since Polymarket has no orders to list; complements
+        the Portfolio tab (position-centric) with an execution-centric view.
+
+        Scan window is deliberately wide (3000 events) because execution_result
+        events are rare compared to daemon_tick; a narrow window misses them.
+        """
+        scan_limit = max(limit * 20, 3000)
+        events = [e for e in service.journal.read_recent_events(limit=scan_limit) if e["event_type"] == "execution_result"]
+        return {
+            "count": len(events[-limit:]),
+            "events": events[-limit:],
         }
 
     @app.get("/api/live/orders")

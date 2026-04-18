@@ -163,6 +163,28 @@ type LiveTradesPayload = {
   trades: LiveTrade[];
 };
 
+type PaperActivityEvent = {
+  logged_at: string;
+  payload: {
+    market_id?: string;
+    success?: boolean;
+    status?: string;
+    mode?: string;
+    fill_price?: number;
+    filled_size_shares?: number;
+    remaining_size_shares?: number;
+    order_side?: string;
+    execution_style?: string;
+    asset_id?: string;
+    detail?: string;
+  };
+};
+
+type PaperActivityPayload = {
+  count: number;
+  events: PaperActivityEvent[];
+};
+
 type DaemonHeartbeatPayload = {
   age_seconds: number | null;
   heartbeat: {
@@ -233,6 +255,7 @@ type DashboardState = {
   liveTrades: LiveTrade[];
   daemonHeartbeat: DaemonHeartbeatPayload | null;
   daemonTicks: DaemonTickPayload[];
+  paperActivity: PaperActivityEvent[];
 };
 
 type DashboardSnapshotPayload = {
@@ -250,6 +273,7 @@ type DashboardSnapshotPayload = {
   live_trades: LiveTradesPayload;
   daemon_heartbeat: DaemonHeartbeatPayload;
   daemon_ticks: { ticks: DaemonTickPayload[] };
+  paper_activity: PaperActivityPayload;
 };
 
 const VIEWS: Array<{ key: ViewKey; label: string }> = [
@@ -336,6 +360,7 @@ function mapSnapshotToState(snapshot: DashboardSnapshotPayload): DashboardState 
     liveTrades: snapshot.live_trades.trades,
     daemonHeartbeat: snapshot.daemon_heartbeat ?? null,
     daemonTicks: snapshot.daemon_ticks?.ticks ?? [],
+    paperActivity: snapshot.paper_activity?.events ?? [],
   };
 }
 
@@ -369,6 +394,8 @@ function applyDashboardDelta(current: DashboardState, eventName: string, payload
       return { ...current, daemonHeartbeat: payload as DaemonHeartbeatPayload };
     case "daemon_ticks":
       return { ...current, daemonTicks: (payload as { ticks: DaemonTickPayload[] }).ticks };
+    case "paper_activity":
+      return { ...current, paperActivity: (payload as PaperActivityPayload).events };
     default:
       return current;
   }
@@ -577,7 +604,7 @@ function EventEntry({
   );
 }
 
-function OrdersPage({ liveOrders, liveTrades, liveActivity }: { liveOrders: LiveOrder[]; liveTrades: LiveTrade[]; liveActivity: LiveActivityPayload | null }) {
+function OrdersPage({ liveOrders, liveTrades, liveActivity, paperActivity }: { liveOrders: LiveOrder[]; liveTrades: LiveTrade[]; liveActivity: LiveActivityPayload | null; paperActivity: PaperActivityEvent[] }) {
   const [selectedOrderId, setSelectedOrderId] = useState<string>("");
   const [selectedTradeId, setSelectedTradeId] = useState<string>("");
   const selectedOrder = liveOrders.find((order) => order.order_id === selectedOrderId) ?? liveOrders[0];
@@ -684,6 +711,59 @@ function OrdersPage({ liveOrders, liveTrades, liveActivity }: { liveOrders: Live
             </p>
           </div>
         </div>
+      </article>
+
+      <article className="panel full-span">
+        <div className="panel-header">
+          <h2>Paper Activity</h2>
+          <span>{paperActivity.length} execution events</span>
+        </div>
+        {paperActivity.length === 0 ? (
+          <div className="empty-state">No paper executions yet — enable <code>DAEMON_AUTO_PAPER_EXECUTE</code> and wait for an APPROVED signal.</div>
+        ) : (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Market</th>
+                  <th>Side</th>
+                  <th>Status</th>
+                  <th>Fill Price (VWAP)</th>
+                  <th>Filled Shares</th>
+                  <th>Style</th>
+                  <th>Detail</th>
+                </tr>
+              </thead>
+              <tbody>
+                {[...paperActivity].reverse().map((event, index) => {
+                  const p = event.payload;
+                  const side = String(p.order_side ?? "");
+                  const sideClass = side === "BUY" ? "positive" : side === "SELL" ? "negative" : "";
+                  const status = String(p.status ?? "");
+                  const statusClass = p.success ? "positive" : status === "SKIPPED" ? "" : "negative";
+                  const price = typeof p.fill_price === "number" && p.fill_price > 0 ? p.fill_price.toFixed(4) : "n/a";
+                  const shares = typeof p.filled_size_shares === "number" ? p.filled_size_shares.toFixed(2) : "n/a";
+                  const detail = p.detail ?? "";
+                  return (
+                    <tr key={`${event.logged_at}-${index}`}>
+                      <td style={{ whiteSpace: "nowrap", color: "var(--muted)", fontSize: "12px" }}>{event.logged_at.slice(11, 19)}</td>
+                      <td>{p.market_id ?? "n/a"}</td>
+                      <td className={sideClass}>{side || "n/a"}</td>
+                      <td className={statusClass}>{status || "n/a"}</td>
+                      <td>{price}</td>
+                      <td>{shares}</td>
+                      <td style={{ fontSize: "12px", color: "var(--muted)" }}>{p.execution_style ?? "n/a"}</td>
+                      <td style={{ fontSize: "12px", color: "var(--muted)" }} title={detail}>
+                        {detail.length > 60 ? `${detail.slice(0, 60)}…` : detail}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
       </article>
     </section>
   );
@@ -1178,6 +1258,7 @@ export default function App() {
     liveTrades: [],
     daemonHeartbeat: null,
     daemonTicks: [],
+    paperActivity: [],
   });
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
@@ -1224,6 +1305,7 @@ export default function App() {
       "live_trades",
       "daemon_heartbeat",
       "daemon_ticks",
+      "paper_activity",
     ];
 
     const connect = () => {
@@ -1275,7 +1357,7 @@ export default function App() {
       case "decisions":
         return <DecisionsPage decisions={state.recentDecisions} />;
       case "orders":
-        return <OrdersPage liveOrders={state.liveOrders} liveTrades={state.liveTrades} liveActivity={state.liveActivity} />;
+        return <OrdersPage liveOrders={state.liveOrders} liveTrades={state.liveTrades} liveActivity={state.liveActivity} paperActivity={state.paperActivity} />;
       case "portfolio":
         return <PortfolioPage summary={state.portfolioSummary} positions={state.closedPositions?.positions ?? []} equityCurve={state.equityCurve} />;
       case "events":
