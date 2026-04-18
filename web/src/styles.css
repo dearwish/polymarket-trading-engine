@@ -568,9 +568,43 @@ th {
 }
 
 .market-card-title {
-  margin-bottom: 10px;
+  margin-bottom: 4px;
   font-weight: 600;
   font-size: 14px;
+}
+
+.market-card-endtime {
+  margin-bottom: 10px;
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.pill.display-pref {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+}
+
+.pill.display-pref select {
+  background: transparent;
+  color: var(--text);
+  border: none;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.pill.display-pref select option {
+  background: var(--panel-strong);
+  color: var(--text);
+}
+
+.display-pref-label {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
 }
 
 .market-card-meta {

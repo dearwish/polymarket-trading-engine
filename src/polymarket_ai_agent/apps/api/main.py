@@ -257,10 +257,12 @@ def create_app(
         }
 
     def _latest_daemon_ticks(service: AgentService) -> dict:
+        # read_recent_events returns file-order (oldest first); iterate newest-first
+        # so "first occurrence per market_id" is the most recent tick for that market.
         events = service.journal.read_recent_events(limit=200)
         seen: set[str] = set()
         ticks: list[dict] = []
-        for e in events:
+        for e in reversed(events):
             if e.get("event_type") != "daemon_tick":
                 continue
             mid = e.get("payload", {}).get("market_id", "")

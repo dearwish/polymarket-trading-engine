@@ -390,6 +390,7 @@ class DaemonRunner:
         payload: dict[str, Any] = {
             "market_id": features.market_id,
             "question": context.candidate.question,
+            "end_date_iso": context.candidate.end_date_iso,
             "seconds_to_expiry": context.assessment and self._seconds_to_expiry(context.candidate.end_date_iso),
             "bid_yes": features.bid_yes,
             "ask_yes": features.ask_yes,

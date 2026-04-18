@@ -210,6 +210,7 @@ type DaemonHeartbeatPayload = {
 type DaemonTickPayload = {
   market_id: string;
   question: string;
+  end_date_iso?: string;
   seconds_to_expiry: number;
   bid_yes: number;
   ask_yes: number;
@@ -336,6 +337,57 @@ function formatDuration(totalSeconds: number | null | undefined): string {
   if (minutes) parts.push(`${minutes}m`);
   if (!parts.length || remainingSeconds) parts.push(`${remainingSeconds}s`);
   return parts.join(" ");
+}
+
+type TimeFormat = "12h" | "24h";
+
+const BROWSER_TZ = (() => {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone; } catch { return "UTC"; }
+})();
+
+const TIMEZONE_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: BROWSER_TZ, label: `Browser (${BROWSER_TZ})` },
+  { value: "UTC", label: "UTC" },
+  { value: "Asia/Jerusalem", label: "Israel (Asia/Jerusalem)" },
+  { value: "America/New_York", label: "New York (ET)" },
+  { value: "Europe/London", label: "London" },
+  { value: "Europe/Berlin", label: "Berlin" },
+  { value: "Asia/Tokyo", label: "Tokyo" },
+  { value: "Asia/Shanghai", label: "Shanghai" },
+];
+
+function formatEndTime(endDateIso: string | null | undefined, tz: string, fmt: TimeFormat): string {
+  if (!endDateIso) return "n/a";
+  const d = new Date(endDateIso);
+  if (Number.isNaN(d.getTime())) return "n/a";
+  try {
+    return new Intl.DateTimeFormat("en-GB", {
+      timeZone: tz,
+      day: "2-digit",
+      month: "short",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: fmt === "12h",
+    }).format(d);
+  } catch {
+    return d.toISOString();
+  }
+}
+
+function useLocalStorage<T>(key: string, initial: T): [T, (next: T) => void] {
+  const [value, setValue] = useState<T>(() => {
+    try {
+      const raw = window.localStorage.getItem(key);
+      return raw === null ? initial : (JSON.parse(raw) as T);
+    } catch {
+      return initial;
+    }
+  });
+  const update = (next: T) => {
+    setValue(next);
+    try { window.localStorage.setItem(key, JSON.stringify(next)); } catch { /* ignore */ }
+  };
+  return [value, update];
 }
 
 
@@ -1127,6 +1179,8 @@ function DaemonView({ heartbeat, ticks }: { heartbeat: DaemonHeartbeatPayload | 
   const age = heartbeat?.age_seconds ?? null;
   const metrics = hb?.metrics ?? null;
   const daemonRunning = age !== null && age < 60;
+  const [timezone, setTimezone] = useLocalStorage<string>("display.timezone", BROWSER_TZ);
+  const [timeFormat, setTimeFormat] = useLocalStorage<TimeFormat>("display.timeFormat", "24h");
 
   return (
     <>
@@ -1150,6 +1204,21 @@ function DaemonView({ heartbeat, ticks }: { heartbeat: DaemonHeartbeatPayload | 
         <span className="pill">
           Family: {hb?.market_family ?? "n/a"}
         </span>
+        <label className="pill display-pref">
+          <span className="display-pref-label">TZ</span>
+          <select value={timezone} onChange={(e) => setTimezone(e.target.value)}>
+            {TIMEZONE_OPTIONS.map((opt) => (
+              <option key={opt.value} value={opt.value}>{opt.label}</option>
+            ))}
+          </select>
+        </label>
+        <label className="pill display-pref">
+          <span className="display-pref-label">Fmt</span>
+          <select value={timeFormat} onChange={(e) => setTimeFormat(e.target.value as TimeFormat)}>
+            <option value="24h">24h</option>
+            <option value="12h">12h</option>
+          </select>
+        </label>
       </div>
 
       <div className="daemon-stat-grid">
@@ -1191,6 +1260,11 @@ function DaemonView({ heartbeat, ticks }: { heartbeat: DaemonHeartbeatPayload | 
                 <div className="market-card-title">
                   {tick.question ? (tick.question.length > 55 ? `${tick.question.slice(0, 55)}...` : tick.question) : tick.market_id}
                 </div>
+                {tick.end_date_iso && (
+                  <div className="market-card-endtime">
+                    Ends: {formatEndTime(tick.end_date_iso, timezone, timeFormat)}
+                  </div>
+                )}
                 <div className="market-card-meta">
                   <span>TTE: {formatDuration(tick.seconds_to_expiry)}</span>
                   <span>Bid: {tick.bid_yes?.toFixed(3) ?? "n/a"}</span>
