@@ -52,8 +52,15 @@ class AgentService:
 
     def discover_markets(self):
         markets = self.polymarket.discover_markets()
-        self.journal.log_event("discover_markets", {"count": len(markets)})
-        return markets
+        # Drop markets that have already expired or have no remaining time.
+        # Polymarket's closed=false filter lags behind resolution; guard here.
+        min_tte = 300  # 5 minutes — no point subscribing to nearly-dead markets
+        active = [
+            m for m in markets
+            if self.polymarket.estimate_seconds_to_expiry(m.end_date_iso) >= min_tte
+        ]
+        self.journal.log_event("discover_markets", {"count": len(active)})
+        return active
 
     def get_active_market_id(self) -> str:
         market = self.polymarket.discover_active_market()
