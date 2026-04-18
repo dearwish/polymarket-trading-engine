@@ -513,7 +513,7 @@ function DecisionsPage({ decisions }: { decisions: DecisionItem[] }) {
               </tr>
             </thead>
             <tbody>
-              {decisions.map((item, index) => {
+              {[...decisions].reverse().map((item, index) => {
                 const p = item.payload;
                 const side = String(p.suggested_side ?? "");
                 const sideClass = side === "YES" ? "side-yes" : side === "NO" ? "side-no" : "side-abstain";
