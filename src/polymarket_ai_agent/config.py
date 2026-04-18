@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from functools import lru_cache
 import json
 from pathlib import Path
@@ -49,9 +50,12 @@ class Settings(BaseSettings):
     max_spread: float = 0.04
     min_depth_usd: float = 200.0
     exit_buffer_seconds: int = 5
+    exit_buffer_pct_of_tte: float = 0.0
     max_daily_loss_usd: float = 25.0
     stale_data_seconds: int = 30
     max_rejected_orders: int = 3
+    max_concurrent_positions: int = 1
+    max_net_btc_exposure_usd: float = 50.0
     paper_starting_balance_usd: float = 100.0
     paper_position_ttl_seconds: int = 60
     paper_entry_slippage_bps: float = 10.0
@@ -74,6 +78,9 @@ class Settings(BaseSettings):
     quant_high_expiry_risk_seconds: int = 15
     quant_medium_expiry_risk_seconds: int = 60
 
+    events_jsonl_max_bytes: int = 200_000_000
+    events_jsonl_keep_tail_bytes: int = 50_000_000
+
     data_dir: Path = Field(default=Path("data"))
     log_dir: Path = Field(default=Path("logs"))
     db_path: Path = Field(default=Path("data/agent.db"))
@@ -86,7 +93,7 @@ EDITABLE_SETTINGS_METADATA: dict[str, dict[str, Any]] = {
     "market_family": {
         "label": "Market Family",
         "type": "select",
-        "options": ["btc_1h", "btc_5m", "btc_daily_threshold"],
+        "options": ["btc_1h", "btc_15m", "btc_5m", "btc_daily_threshold"],
         "group": "runtime",
     },
     "loop_seconds": {"label": "Loop Seconds", "type": "number", "min": 1, "max": 300, "step": 1, "group": "runtime"},
@@ -103,6 +110,9 @@ EDITABLE_SETTINGS_METADATA: dict[str, dict[str, Any]] = {
     "max_daily_loss_usd": {"label": "Max Daily Loss USD", "type": "number", "min": 0, "max": 100000, "step": 0.5, "group": "thresholds"},
     "stale_data_seconds": {"label": "Stale Data Seconds", "type": "number", "min": 1, "max": 3600, "step": 1, "group": "thresholds"},
     "max_rejected_orders": {"label": "Max Rejected Orders", "type": "number", "min": 1, "max": 100, "step": 1, "group": "thresholds"},
+    "max_concurrent_positions": {"label": "Max Concurrent Positions", "type": "number", "min": 1, "max": 20, "step": 1, "group": "thresholds"},
+    "max_net_btc_exposure_usd": {"label": "Max Net BTC Exposure USD", "type": "number", "min": 0, "max": 1000000, "step": 1, "group": "thresholds"},
+    "exit_buffer_pct_of_tte": {"label": "Exit Buffer % of TTE", "type": "number", "min": 0, "max": 1, "step": 0.01, "group": "thresholds"},
     "paper_starting_balance_usd": {
         "label": "Paper Starting Balance USD",
         "type": "number",
@@ -197,3 +207,89 @@ def runtime_settings_payload(settings: Settings) -> dict[str, Any]:
         "overrides": overrides,
         "fields": EDITABLE_SETTINGS_METADATA,
     }
+
+
+@dataclass(slots=True, frozen=True)
+class RiskProfile:
+    """Resolved per-family risk parameters consumed by :class:`RiskEngine`.
+
+    The profile is derived from :class:`Settings` via :func:`resolve_risk_profile`:
+    if a field was explicitly overridden on ``Settings`` the override wins, so
+    existing deployments that tune globals via env vars are unchanged. If the
+    field is left at the built-in default and the active ``market_family`` has
+    a per-family override in :data:`FAMILY_PROFILE_OVERRIDES`, the tighter
+    family value is applied.
+    """
+
+    family: str
+    min_edge: float
+    max_spread: float
+    min_depth_usd: float
+    stale_data_seconds: int
+    exit_buffer_floor_seconds: int
+    exit_buffer_pct_of_tte: float
+    family_window_seconds: int
+    max_position_usd: float
+    max_concurrent_positions: int
+    max_net_btc_exposure_usd: float
+
+
+FAMILY_PROFILE_OVERRIDES: dict[str, dict[str, Any]] = {
+    "btc_1h": {
+        "stale_data_seconds": 5,
+        "exit_buffer_pct_of_tte": 0.05,
+        "max_concurrent_positions": 2,
+        "family_window_seconds": 3600,
+    },
+    "btc_15m": {
+        "stale_data_seconds": 3,
+        "exit_buffer_pct_of_tte": 0.07,
+        "max_concurrent_positions": 2,
+        "family_window_seconds": 900,
+    },
+    "btc_5m": {
+        "stale_data_seconds": 2,
+        "exit_buffer_pct_of_tte": 0.10,
+        "max_concurrent_positions": 1,
+        "family_window_seconds": 300,
+    },
+}
+
+
+_PROFILE_FIELD_TO_SETTING = {
+    "stale_data_seconds": "stale_data_seconds",
+    "exit_buffer_floor_seconds": "exit_buffer_seconds",
+    "exit_buffer_pct_of_tte": "exit_buffer_pct_of_tte",
+    "max_position_usd": "max_position_usd",
+    "max_concurrent_positions": "max_concurrent_positions",
+}
+
+
+def resolve_risk_profile(settings: Settings) -> RiskProfile:
+    family = settings.market_family
+    overrides = FAMILY_PROFILE_OVERRIDES.get(family, {})
+    explicit = settings.model_fields_set
+
+    def pick(profile_field: str) -> Any:
+        settings_field = _PROFILE_FIELD_TO_SETTING.get(profile_field, profile_field)
+        # Explicit operator override wins.
+        if settings_field in explicit:
+            return getattr(settings, settings_field)
+        if profile_field in overrides:
+            return overrides[profile_field]
+        return getattr(settings, settings_field)
+
+    family_window = int(overrides.get("family_window_seconds", 0))
+    return RiskProfile(
+        family=family,
+        min_edge=settings.min_edge,
+        max_spread=settings.max_spread,
+        min_depth_usd=settings.min_depth_usd,
+        stale_data_seconds=int(pick("stale_data_seconds")),
+        exit_buffer_floor_seconds=int(pick("exit_buffer_floor_seconds")),
+        exit_buffer_pct_of_tte=float(pick("exit_buffer_pct_of_tte")),
+        family_window_seconds=family_window,
+        max_position_usd=float(pick("max_position_usd")),
+        max_concurrent_positions=int(pick("max_concurrent_positions")),
+        max_net_btc_exposure_usd=float(settings.max_net_btc_exposure_usd),
+    )
