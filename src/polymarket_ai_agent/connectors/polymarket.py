@@ -7,10 +7,19 @@ from typing import Any
 import httpx
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import AssetType, BalanceAllowanceParams, OpenOrderParams, OrderArgs, OrderType, TradeParams
-from py_clob_client.order_builder.constants import BUY
+from py_clob_client.order_builder.constants import BUY, SELL
 
 from polymarket_ai_agent.config import Settings
-from polymarket_ai_agent.types import AuthStatus, ExecutionMode, ExecutionResult, MarketCandidate, OrderBookSnapshot, TradeDecision
+from polymarket_ai_agent.types import (
+    AuthStatus,
+    ExecutionMode,
+    ExecutionResult,
+    ExecutionStyle,
+    MarketCandidate,
+    OrderBookSnapshot,
+    OrderSide,
+    TradeDecision,
+)
 
 
 class PolymarketConnector:
@@ -64,6 +73,8 @@ class PolymarketConnector:
         bid_depth = sum(float(level["price"]) * float(level["size"]) for level in bids[:5])
         ask_depth = sum(float(level["price"]) * float(level["size"]) for level in asks[:5])
         last_trade_price = float(data.get("last_trade_price") or data.get("lastTradePrice") or midpoint or 0.0)
+        bid_levels = [(float(level["price"]), float(level["size"])) for level in bids[:10]]
+        ask_levels = [(float(level["price"]), float(level["size"])) for level in asks[:10]]
         return OrderBookSnapshot(
             bid=best_bid,
             ask=best_ask,
@@ -72,6 +83,8 @@ class PolymarketConnector:
             depth_usd=bid_depth + ask_depth,
             last_trade_price=last_trade_price,
             two_sided=bool(best_bid and best_ask),
+            bid_levels=bid_levels,
+            ask_levels=ask_levels,
         )
 
     def get_auth_status(self) -> AuthStatus:
@@ -136,6 +149,9 @@ class PolymarketConnector:
                 status="LIVE_DISABLED",
                 detail="Live trading flag is disabled.",
                 fill_price=0.0,
+                order_side=decision.order_side,
+                asset_id=decision.asset_id,
+                execution_style=decision.execution_style,
             )
         if not decision.asset_id:
             return ExecutionResult(
@@ -146,21 +162,27 @@ class PolymarketConnector:
                 status="LIVE_INVALID",
                 detail="Live trade decision is missing the Polymarket asset_id/token_id.",
                 fill_price=0.0,
+                order_side=decision.order_side,
+                asset_id=decision.asset_id,
+                execution_style=decision.execution_style,
             )
         client = self._build_authed_live_client()
-        share_size = round(decision.size_usd / decision.limit_price, 6)
+        share_size = round(decision.size_usd / max(decision.limit_price, 1e-6), 6)
+        clob_side = BUY if decision.order_side == OrderSide.BUY else SELL
         order = client.create_order(
             OrderArgs(
                 token_id=decision.asset_id,
                 price=decision.limit_price,
                 size=share_size,
-                side=BUY,
+                side=clob_side,
             )
         )
+        order_type = self._live_order_type_for_decision(decision)
+        post_only = decision.post_only or self.settings.live_post_only
         order_response = client.post_order(
             order,
-            orderType=self._live_order_type(),
-            post_only=self.settings.live_post_only,
+            orderType=order_type,
+            post_only=post_only,
         )
         order_id = str(
             order_response.get("orderID")
@@ -175,8 +197,15 @@ class PolymarketConnector:
             mode=ExecutionMode.LIVE,
             order_id=order_id,
             status=status,
-            detail=f"Live order submitted for {share_size:.6f} shares at {decision.limit_price:.4f}",
+            detail=(
+                f"Live {decision.order_side.value} {share_size:.6f} shares @ {decision.limit_price:.4f} "
+                f"via {decision.execution_style.value}"
+            ),
             fill_price=0.0,
+            order_side=decision.order_side,
+            asset_id=decision.asset_id,
+            execution_style=decision.execution_style,
+            remaining_size_shares=share_size,
         )
 
     def list_live_orders(self) -> list[dict[str, Any]]:
@@ -192,6 +221,29 @@ class PolymarketConnector:
         client = self._build_authed_live_client()
         response = client.cancel_orders([order_id])
         return self._normalize_cancel_response(order_id, response)
+
+    def replace_live_order(
+        self,
+        decision: TradeDecision,
+        existing_order_id: str,
+    ) -> dict[str, Any]:
+        """Cancel an existing resting order and post a replacement.
+
+        Used by the execution engine's cancel/replace loop when a maker quote
+        drifts off the best level. Returns a dict summarising both legs so
+        callers can reconcile the replacement without a second round trip.
+        """
+        cancel_result = self.cancel_live_order(existing_order_id)
+        new_result = self.execute_live_trade(decision)
+        return {
+            "cancelled": cancel_result,
+            "replacement": {
+                "order_id": new_result.order_id,
+                "status": new_result.status,
+                "detail": new_result.detail,
+                "success": new_result.success,
+            },
+        }
 
     def list_live_trades(self, market_id: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
         client = self._build_authed_live_client()
@@ -366,6 +418,14 @@ class PolymarketConnector:
             return getattr(OrderType, value)
         except AttributeError as exc:
             raise ValueError(f"Unsupported live_order_type: {self.settings.live_order_type}") from exc
+
+    def _live_order_type_for_decision(self, decision: TradeDecision) -> OrderType:
+        if decision.execution_style == ExecutionStyle.GTC_MAKER:
+            try:
+                return getattr(OrderType, "GTC")
+            except AttributeError:
+                return self._live_order_type()
+        return self._live_order_type()
 
     @staticmethod
     def _normalize_live_order(order: dict[str, Any]) -> dict[str, Any]:
