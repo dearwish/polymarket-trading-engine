@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from functools import lru_cache
 import json
 from pathlib import Path
 from typing import Any
@@ -156,14 +155,32 @@ EDITABLE_SETTINGS_METADATA: dict[str, dict[str, Any]] = {
 }
 
 
-@lru_cache(maxsize=1)
+# Cache Settings, but invalidate when .env changes so a live edit (e.g. MARKET_FAMILY)
+# takes effect without restarting the API / daemon process.
+_ENV_FILE = Path(".env")
+_settings_cache: dict[str, Any] = {"settings": None, "env_mtime": None}
+
+
+def _env_mtime() -> float | None:
+    try:
+        return _ENV_FILE.stat().st_mtime if _ENV_FILE.exists() else None
+    except OSError:
+        return None
+
+
 def get_settings() -> Settings:
+    current_mtime = _env_mtime()
+    cached = _settings_cache["settings"]
+    if cached is not None and _settings_cache["env_mtime"] == current_mtime:
+        return cached
     settings = Settings()
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.log_dir.mkdir(parents=True, exist_ok=True)
     settings.db_path.parent.mkdir(parents=True, exist_ok=True)
     settings.events_path.parent.mkdir(parents=True, exist_ok=True)
     settings.runtime_settings_path.parent.mkdir(parents=True, exist_ok=True)
+    _settings_cache["settings"] = settings
+    _settings_cache["env_mtime"] = current_mtime
     return settings
 
 
