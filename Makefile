@@ -12,6 +12,7 @@ INTERVAL ?= 15
 .PHONY: help venv install bootstrap reinstall bootstrap-force test status auth-check doctor api-dev web-install web-dev web-build live-preflight live-activity live-orders tracked-live-orders refresh-live-orders live-reconcile live-watch live-trades live-cancel check report \
 	simulate-active simulate-market simulate-loop-active simulate-loop-market \
 	daemon daemon-smoke \
+	analyze-soak \
 	guard-market-id
 
 $(BIN)/python:
@@ -135,6 +136,9 @@ backup: install
 heartbeat: install
 	$(CLI) heartbeat
 
+analyze-soak: install
+	$(BIN)/python scripts/analyze_soak.py
+
 help:
 	@printf '%s\n' \
 		'Available targets:' \
@@ -173,6 +177,7 @@ help:
 		'                               Run repeated read-only simulation for a specific market' \
 		'  make daemon                   Run the event-driven market-data daemon (Phase 1)' \
 		'  make daemon-smoke             Run the daemon for 15s to smoke-test websocket plumbing' \
+	'  make analyze-soak             Analyze daemon_tick journal against resolved market outcomes' \
 		'' \
 		'Variables:' \
 		'  PYTHON      Python executable to use (default: python3)' \
