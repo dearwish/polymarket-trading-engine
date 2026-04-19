@@ -711,6 +711,41 @@ def test_fixed_tp_skipped_after_ladder_tranche_fires(tmp_path) -> None:
     )
 
 
+def test_paper_exit_fill_walks_bid_book_for_yes_position(tmp_path) -> None:
+    """A YES close should walk yes_book.bids from best down, VWAP the
+    consumed notional, and return that instead of just applying slippage
+    to mid. This captures the full spread cost that real Polymarket
+    executions pay but the old mid±slippage model missed."""
+    from polymarket_ai_agent.apps.daemon.run import DecisionContext
+    from polymarket_ai_agent.engine.market_state import MarketState
+    from polymarket_ai_agent.types import SuggestedSide
+
+    runner, service, candidate, approved, btc = _setup_runner_with_open_yes_position(
+        tmp_path, entry_price=0.50, settings_overrides={
+            "paper_trailing_stop_pct": 0.05,
+            "paper_trail_arm_pct": 0.0,
+            "paper_exit_slippage_bps": 0.0,  # isolate the book-walk from slippage
+        },
+    )
+    # Replace the YES book with a multi-level bid stack: 0.60 × 15 shares
+    # then 0.58 × 50 shares. Selling 20 shares eats the top level (15 × 0.60)
+    # and 5 shares of the 0.58 level → VWAP = (15×0.60 + 5×0.58) / 20 = 0.595.
+    state = MarketState(market_id=candidate.market_id, yes_token_id="yes-tok", no_token_id="no-tok")
+    state.apply_book_snapshot({
+        "asset_id": "yes-tok",
+        "bids": [
+            {"price": "0.60", "size": "15"},
+            {"price": "0.58", "size": "50"},
+        ],
+        "asks": [{"price": "0.62", "size": "500"}],
+    })
+    runner._market_states[candidate.market_id] = state
+    # Position is ~19.96 YES shares at 0.51051 entry = $10 size.
+    # Selling 20-ish at the staggered bid gives VWAP around 0.595 not 0.61 (mid).
+    exit_price = runner._paper_exit_fill(candidate.market_id, SuggestedSide.YES, 10.0, 0.61)
+    assert 0.58 < exit_price < 0.60, f"expected book-walked VWAP in (0.58, 0.60), got {exit_price}"
+
+
 def test_paper_trail_arm_threshold_blocks_premature_trail_exit(tmp_path) -> None:
     """Without the arm threshold, a small +2% peak + 5% trail would exit
     the position at a loss. With paper_trail_arm_pct=0.05 the trail stays

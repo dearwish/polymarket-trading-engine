@@ -537,11 +537,15 @@ class DaemonRunner:
                         # ladder fractions sum to ≥ 1 the last tranche ends up
                         # fully closing the remainder.
                         effective_fraction = min(1.0, target_close_usd / max(current_size, 1e-9))
+                        tranche_size_usd = effective_fraction * current_size
+                        exit_price_walk = self._paper_exit_fill(
+                            market_id, open_pos.side, tranche_size_usd, float(current_price)
+                        )
                         await asyncio.to_thread(
                             self.service.portfolio.partial_close_position,
                             market_id,
                             effective_fraction,
-                            self.service.portfolio.apply_exit_slippage(float(current_price)),
+                            exit_price_walk,
                             f"paper_tp_ladder_{tranches_closed + 1}",
                         )
                         extras["tranches_closed"] = tranches_closed + 1
@@ -559,10 +563,13 @@ class DaemonRunner:
                 arm_threshold = entry_price * (1.0 + arm_pct)
                 trail_armed = peak >= arm_threshold
                 if trail_pct > 0.0 and trail_armed and current_price <= peak * (1.0 - trail_pct):
+                    exit_price_walk = self._paper_exit_fill(
+                        market_id, open_pos.side, float(open_pos.size_usd), float(current_price)
+                    )
                     await asyncio.to_thread(
                         self.service.portfolio.close_position,
                         market_id,
-                        self.service.portfolio.apply_exit_slippage(float(current_price)),
+                        exit_price_walk,
                         "paper_trailing_stop",
                     )
                     self._position_extras.pop(market_id, None)
@@ -584,10 +591,13 @@ class DaemonRunner:
                 elif sl_pct > 0.0 and pnl_pct <= -sl_pct:
                     close_reason = "paper_stop_loss"
                 if close_reason is not None:
+                    exit_price_walk = self._paper_exit_fill(
+                        market_id, open_pos.side, float(open_pos.size_usd), float(current_price)
+                    )
                     await asyncio.to_thread(
                         self.service.portfolio.close_position,
                         market_id,
-                        self.service.portfolio.apply_exit_slippage(float(current_price)),
+                        exit_price_walk,
                         close_reason,
                     )
                     self._position_extras.pop(market_id, None)
@@ -596,10 +606,13 @@ class DaemonRunner:
             # --- 5. TTE exit buffer ---------------------------------------
             exit_buffer = self.service.risk.exit_buffer_seconds_for_tte(tte_seconds)
             if tte_seconds <= exit_buffer and current_price > 0.0:
+                exit_price_walk = self._paper_exit_fill(
+                    market_id, open_pos.side, float(open_pos.size_usd), float(current_price)
+                )
                 await asyncio.to_thread(
                     self.service.portfolio.close_position,
                     market_id,
-                    self.service.portfolio.apply_exit_slippage(float(current_price)),
+                    exit_price_walk,
                     "paper_tte_exit",
                 )
                 self._position_extras.pop(market_id, None)
@@ -667,6 +680,45 @@ class DaemonRunner:
             bid_levels=bid_levels,
             ask_levels=ask_levels,
         )
+
+    def _paper_exit_fill(
+        self, market_id: str, side: "SuggestedSide", size_usd: float, fallback_price: float
+    ) -> float:
+        """Compute a realistic paper-mode exit fill by walking the live BID book.
+
+        Closing a position means SELLING the token back. For YES positions we
+        sell YES tokens → walk yes_book.bids best-first. For NO positions we
+        sell NO tokens → walk no_book.bids best-first. The fill is the VWAP
+        across the levels consumed by `size_usd` worth of notional, minus an
+        additional ``paper_exit_slippage_bps`` nudge. Falls back to the passed-in
+        ``fallback_price`` (usually mid) with slippage when the book has no
+        levels for the closing side.
+        """
+        state = self._market_states.get(market_id)
+        if state is None:
+            return self.service.portfolio.apply_exit_slippage(fallback_price)
+        book = state.yes_book if side == SuggestedSide.YES else state.no_book
+        levels = list(book.bids.sorted_levels())
+        if not levels:
+            return self.service.portfolio.apply_exit_slippage(fallback_price)
+        target_shares = size_usd / max(fallback_price, 1e-9)
+        remaining = target_shares
+        notional = 0.0
+        filled = 0.0
+        for price, avail in levels:
+            if remaining <= 0.0 or avail <= 0.0 or price <= 0.0:
+                continue
+            take = min(remaining, avail)
+            notional += price * take
+            filled += take
+            remaining -= take
+        if filled <= 0.0:
+            return self.service.portfolio.apply_exit_slippage(fallback_price)
+        vwap = notional / filled
+        # Apply any additional configured exit slippage on top of the realistic
+        # book-walked price so the two settings compose (walk captures spread,
+        # slippage captures latency / size-beyond-book).
+        return self.service.portfolio.apply_exit_slippage(vwap)
 
     # --- Heartbeat + maintenance --------------------------------------
 
