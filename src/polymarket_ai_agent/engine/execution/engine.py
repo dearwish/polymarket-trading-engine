@@ -36,9 +36,13 @@ class ExecutionEngine:
         live_executor: Callable[[TradeDecision, OrderBookSnapshot | None], ExecutionResult] | None = None,
         router: ExecutionRouter | None = None,
         settings: Settings | None = None,
+        initial_counter: int = 0,
     ):
         self.mode = mode
-        self._counter = 0
+        # Counter is seeded from the max existing order_id in the DB at service
+        # init, so IDs don't collide after a daemon restart. Bumped on every
+        # execute_trade call regardless of success.
+        self._counter = max(0, int(initial_counter))
         self.paper_entry_slippage_bps = paper_entry_slippage_bps
         self.live_trading_enabled = live_trading_enabled
         self.live_executor = live_executor

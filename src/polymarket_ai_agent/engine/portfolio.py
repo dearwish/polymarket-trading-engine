@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 from contextlib import closing
 from dataclasses import replace
@@ -547,6 +548,33 @@ class PortfolioEngine:
             reference = max(0.01, 1 - orderbook.ask)
         slippage = reference * (exit_slippage_bps / 10_000)
         return round(max(0.01, min(0.99, reference - slippage)), 6)
+
+    def max_paper_order_counter(self) -> int:
+        """Return the largest N in any ``paper-order-NNNNNN`` order_id on
+        record (positions or order_attempts). Used to seed the execution
+        engine's counter after a restart so new trade IDs don't collide.
+        Returns 0 when nothing relevant is stored yet.
+        """
+        max_n = 0
+        pattern = re.compile(r"paper-order-(\d+)")
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            rows = conn.execute(
+                """
+                select order_id from positions
+                union all
+                select order_id from live_orders
+                """
+            ).fetchall()
+        for (order_id,) in rows:
+            if not order_id:
+                continue
+            m = pattern.search(str(order_id))
+            if m:
+                try:
+                    max_n = max(max_n, int(m.group(1)))
+                except ValueError:
+                    continue
+        return max_n
 
     def apply_exit_slippage(self, exit_price: float) -> float:
         """Nudge a proposed exit mid by the configured slippage bps.

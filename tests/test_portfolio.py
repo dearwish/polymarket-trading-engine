@@ -139,6 +139,35 @@ def test_portfolio_exit_slippage_nudges_price_down(settings) -> None:
     assert abs(engine.apply_exit_slippage(0.55) - 0.54945) < 1e-6
 
 
+def test_portfolio_max_paper_order_counter_returns_zero_when_empty(settings) -> None:
+    engine = PortfolioEngine(settings.db_path, settings.paper_starting_balance_usd)
+    assert engine.max_paper_order_counter() == 0
+
+
+def test_portfolio_max_paper_order_counter_reads_highest_existing_id(settings) -> None:
+    """Simulates a prior run: insert a few positions with paper-order-NNNNNN
+    IDs (including a tranche suffix) and confirm the counter picks up the
+    largest N so the next ExecutionEngine won't reuse an ID."""
+    engine = PortfolioEngine(settings.db_path, settings.paper_starting_balance_usd)
+    for order_id in ("paper-order-000003", "paper-order-000007-T1000000", "paper-order-000005"):
+        decision = TradeDecision(
+            market_id=f"m-{order_id}",
+            status=DecisionStatus.APPROVED,
+            side=SuggestedSide.YES,
+            size_usd=10.0,
+            limit_price=0.50,
+            rationale=["approved"],
+            rejected_by=[],
+        )
+        result = ExecutionResult(
+            market_id=decision.market_id,
+            success=True, mode=ExecutionMode.PAPER,
+            order_id=order_id, status="FILLED_PAPER", detail="ok", fill_price=0.50,
+        )
+        engine.record_execution(decision, result)
+    assert engine.max_paper_order_counter() == 7
+
+
 def test_portfolio_round_trip_fee_deducted_from_realised_pnl(settings) -> None:
     """With fee_bps > 0, close_position should reduce realised_pnl by
     2 × size_usd × fee_bps / 10000 (buy + sell leg)."""

@@ -34,14 +34,6 @@ class AgentService:
         self.research = ResearchEngine()
         self.scoring = ScoringEngine(settings)
         self.risk = RiskEngine(settings)
-        self.execution = ExecutionEngine(
-            ExecutionMode(settings.trading_mode),
-            paper_entry_slippage_bps=settings.paper_entry_slippage_bps,
-            live_trading_enabled=settings.live_trading_enabled,
-            live_executor=self.polymarket.execute_live_trade,
-            router=ExecutionRouter(settings),
-            settings=settings,
-        )
         self.journal = Journal(
             settings.db_path,
             settings.events_path,
@@ -53,6 +45,17 @@ class AgentService:
             settings.paper_starting_balance_usd,
             exit_slippage_bps=settings.paper_exit_slippage_bps,
             fee_bps=settings.fee_bps,
+        )
+        # Seed the order-id counter from the DB so paper-order IDs remain
+        # unique across daemon restarts (otherwise 000001 reappears every run).
+        self.execution = ExecutionEngine(
+            ExecutionMode(settings.trading_mode),
+            paper_entry_slippage_bps=settings.paper_entry_slippage_bps,
+            live_trading_enabled=settings.live_trading_enabled,
+            live_executor=self.polymarket.execute_live_trade,
+            router=ExecutionRouter(settings),
+            settings=settings,
+            initial_counter=self.portfolio.max_paper_order_counter(),
         )
 
     def discover_markets(self):
