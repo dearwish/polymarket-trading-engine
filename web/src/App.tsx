@@ -78,6 +78,7 @@ type ClosedPosition = {
   exit_price: number;
   close_reason: string;
   realized_pnl: number;
+  fees_paid: number;
   cumulative_pnl: number;
   closed_at: string | null;
 };
@@ -424,6 +425,40 @@ function useDisplayPrefs() {
   const [timezone, setTimezone] = useLocalStorage<string>("display.timezone", BROWSER_TZ);
   const [timeFormat, setTimeFormat] = useLocalStorage<TimeFormat>("display.timeFormat", "24h");
   return { timezone, setTimezone, timeFormat, setTimeFormat };
+}
+
+/**
+ * Compact trade-ID display. Extracts the sequence number from the full
+ * order_id (e.g. "paper-order-000007") and assigns sequential tranche labels
+ * T1, T2, … to any "-T<unix_ts>" suffixes grouped under the same base.
+ */
+function buildTradeIdMap(orderIds: Iterable<string>): Record<string, string> {
+  // Group order_ids by base number; remember the tranche timestamp so we can
+  // sort and label them in chronological order.
+  const groups = new Map<string, { raw: string; ts: number }[]>();
+  for (const raw of orderIds) {
+    if (!raw) continue;
+    const m = raw.match(/paper-order-(\d+)(?:-T(\d+))?/);
+    if (!m) continue;
+    const base = m[1];
+    const tsRaw = m[2];
+    const ts = tsRaw ? Number(tsRaw) : 0;
+    if (!groups.has(base)) groups.set(base, []);
+    groups.get(base)!.push({ raw, ts });
+  }
+  const map: Record<string, string> = {};
+  for (const [base, entries] of groups) {
+    // Tranches get T1, T2, … in chronological order. Any row without a
+    // tranche suffix (ts=0) keeps just the base — that's the full close
+    // (non-partial) row.
+    const tranches = entries.filter((e) => e.ts > 0).sort((a, b) => a.ts - b.ts);
+    const nonTranche = entries.filter((e) => e.ts === 0);
+    for (const e of nonTranche) map[e.raw] = base;
+    tranches.forEach((e, i) => {
+      map[e.raw] = `${base}-T${i + 1}`;
+    });
+  }
+  return map;
 }
 
 function DisplayPrefsPanel() {
@@ -1119,31 +1154,42 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
                 <th>Side</th>
                 <th>Size</th>
                 <th>PnL</th>
+                <th>Fees</th>
                 <th>Cumulative</th>
                 <th>Reason</th>
               </tr>
             </thead>
             <tbody>
-              {[...positions].reverse().map((position) => {
-                const pnlPct = position.size_usd > 0 ? (position.realized_pnl / position.size_usd) : 0;
-                const pnlCls = position.realized_pnl >= 0 ? "positive" : "negative";
-                const sign = position.realized_pnl >= 0 ? "+" : "";
-                return (
-                  <tr key={position.order_id || `${position.market_id}-${position.closed_at}`}>
-                    <td style={{ fontSize: "12px", color: "var(--muted)" }} title={position.order_id}>
-                      {position.order_id ? (position.order_id.length > 22 ? `${position.order_id.slice(0, 22)}…` : position.order_id) : "n/a"}
-                    </td>
-                    <td><MarketCell marketId={position.market_id} lookup={marketLookup} timezone={timezone} timeFormat={timeFormat} /></td>
-                    <td>{position.side}</td>
-                    <td>{formatMoney(position.size_usd)}</td>
-                    <td className={pnlCls}>
-                      {sign}{formatMoney(position.realized_pnl)} ({sign}{(pnlPct * 100).toFixed(1)}%)
-                    </td>
-                    <td>{formatMoney(position.cumulative_pnl)}</td>
-                    <td>{position.close_reason}</td>
-                  </tr>
-                );
-              })}
+              {(() => {
+                // Build base + tranche labels once per render from the full
+                // list so T1/T2 ordering is chronological regardless of the
+                // reversed display order.
+                const tradeIdMap = buildTradeIdMap(positions.map((p) => p.order_id));
+                return [...positions].reverse().map((position) => {
+                  const pnlPct = position.size_usd > 0 ? (position.realized_pnl / position.size_usd) : 0;
+                  const pnlCls = position.realized_pnl >= 0 ? "positive" : "negative";
+                  const sign = position.realized_pnl >= 0 ? "+" : "";
+                  const compactId = tradeIdMap[position.order_id] || position.order_id || "n/a";
+                  return (
+                    <tr key={position.order_id || `${position.market_id}-${position.closed_at}`}>
+                      <td style={{ fontSize: "12px", color: "var(--muted)" }} title={position.order_id}>
+                        {compactId}
+                      </td>
+                      <td><MarketCell marketId={position.market_id} lookup={marketLookup} timezone={timezone} timeFormat={timeFormat} /></td>
+                      <td>{position.side}</td>
+                      <td>{formatMoney(position.size_usd)}</td>
+                      <td className={pnlCls}>
+                        {sign}{formatMoney(position.realized_pnl)} ({sign}{(pnlPct * 100).toFixed(1)}%)
+                      </td>
+                      <td style={{ fontSize: "12px", color: "var(--muted)" }}>
+                        {position.fees_paid > 0 ? formatMoney(position.fees_paid) : "—"}
+                      </td>
+                      <td>{formatMoney(position.cumulative_pnl)}</td>
+                      <td>{position.close_reason}</td>
+                    </tr>
+                  );
+                });
+              })()}
             </tbody>
           </table>
           {!positions.length && <div className="empty-state">No closed positions yet.</div>}

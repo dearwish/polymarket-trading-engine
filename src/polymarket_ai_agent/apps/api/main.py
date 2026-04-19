@@ -486,10 +486,15 @@ def create_app(
     @app.get("/api/portfolio/closed-positions")
     def closed_positions(limit: int = Query(100, ge=1, le=500), service: AgentService = Depends(service_factory)) -> dict:
         positions = service.portfolio.list_closed_positions(limit=limit)
+        fee_bps = float(service.settings.fee_bps)
         cumulative = 0.0
         items = []
         for position in reversed(positions):
             cumulative += position.realized_pnl
+            # Round-trip fee estimate on this tranche's size. Back-computed from the
+            # current fee_bps setting — accurate when fee_bps has been stable over
+            # the position's lifetime (typically the case).
+            fees_paid = round(position.size_usd * (fee_bps / 10_000.0) * 2.0, 6) if fee_bps > 0 else 0.0
             items.append(
                 {
                     "market_id": position.market_id,
@@ -502,6 +507,7 @@ def create_app(
                     "closed_at": position.closed_at.isoformat() if position.closed_at else None,
                     "close_reason": position.close_reason,
                     "realized_pnl": position.realized_pnl,
+                    "fees_paid": fees_paid,
                     "cumulative_pnl": round(cumulative, 6),
                 }
             )
