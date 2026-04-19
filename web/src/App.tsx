@@ -883,7 +883,10 @@ function OrdersPage({ liveOrders, liveTrades, liveActivity, paperActivity, tradi
 function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonTicks }: { summary: PortfolioSummaryPayload | null; positions: ClosedPosition[]; openPositions: OpenPosition[]; equityCurve: EquityCurvePayload | null; daemonTicks: DaemonTickPayload[] }) {
   const [timezone] = useLocalStorage<string>("display.timezone", BROWSER_TZ);
   const [timeFormat] = useLocalStorage<TimeFormat>("display.timeFormat", "24h");
-  const marketLookup = useMemo(() => buildMarketLookup(daemonTicks), [daemonTicks]);
+  // Rebuild the lookup on every render so the Mark / Unrealized PnL cells
+  // always reflect the freshest daemon_tick. With a handful of markets the
+  // cost is negligible and avoids any reference-stability bail in useMemo.
+  const marketLookup = buildMarketLookup(daemonTicks);
   return (
     <section className="grid detail-grid">
       <article className="panel">
