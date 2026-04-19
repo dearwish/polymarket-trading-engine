@@ -18,6 +18,7 @@ from polymarket_ai_agent.engine.research import ResearchEngine
 from polymarket_ai_agent.service import AgentService
 from polymarket_ai_agent.types import (
     DecisionStatus,
+    EvidencePacket,
     ExecutionMode,
     MarketAssessment,
     MarketCandidate,
@@ -108,6 +109,7 @@ class DecisionContext:
     btc_snapshot: BtcSnapshot | None
     assessment: MarketAssessment
     metrics: "DaemonMetrics"
+    packet: "EvidencePacket | None" = None
 
 
 DecisionCallback = Callable[[DecisionContext], Awaitable[None]]
@@ -391,6 +393,7 @@ class DaemonRunner:
             btc_snapshot=btc_snapshot,
             assessment=assessment,
             metrics=self.metrics,
+            packet=packet,
         )
         try:
             await self._decision_callback(context)
@@ -459,6 +462,8 @@ class DaemonRunner:
             "btc_price": btc.price if btc else None,
             "btc_realized_vol_30m": btc.realized_vol_30m if btc else None,
             "btc_log_return_5m": btc.log_return_5m if btc else None,
+            "btc_log_return_since_candle_open": context.packet.btc_log_return_since_candle_open if context.packet else None,
+            "time_elapsed_in_candle_s": context.packet.time_elapsed_in_candle_s if context.packet else None,
             "polymarket_events": context.metrics.polymarket_events,
             "btc_ticks": context.metrics.btc_ticks,
             "fair_probability": assessment.fair_probability,
