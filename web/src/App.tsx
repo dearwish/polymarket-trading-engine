@@ -914,6 +914,41 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
         </dl>
       </article>
 
+      {openPositions.length > 0 && (
+        <article className="panel full-span">
+          <div className="panel-header">
+            <h2>Live Markets</h2>
+            <span>{openPositions.length} embedded from Polymarket</span>
+          </div>
+          <div className="polymarket-embed-grid">
+            {openPositions.map((position) => {
+              const tick = marketLookup[position.market_id];
+              const slug = tick?.slug;
+              if (!slug) {
+                return (
+                  <div key={position.market_id} className="polymarket-embed-placeholder">
+                    <div>{position.market_id}</div>
+                    <small>No slug cached — embed unavailable.</small>
+                  </div>
+                );
+              }
+              const src = `https://embed.polymarket.com/market?market=${encodeURIComponent(slug)}&theme=dark&liveactivity=true&buttons=false&border=true&height=300`;
+              return (
+                <figure key={position.market_id} className="polymarket-embed" aria-label={`Polymarket market ${tick?.question ?? position.market_id}`}>
+                  <iframe
+                    title={tick?.question || position.market_id}
+                    src={src}
+                    width={400}
+                    height={300}
+                    loading="lazy"
+                  />
+                </figure>
+              );
+            })}
+          </div>
+        </article>
+      )}
+
       <article className="panel full-span">
         <div className="panel-header">
           <h2>Open Positions</h2>

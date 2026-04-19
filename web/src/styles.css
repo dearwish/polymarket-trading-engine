@@ -660,6 +660,38 @@ th {
   cursor: pointer;
 }
 
+.polymarket-embed-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+  gap: 16px;
+}
+
+.polymarket-embed {
+  margin: 0;
+  display: flex;
+  justify-content: center;
+}
+
+.polymarket-embed iframe {
+  max-width: 100%;
+  border: 0;
+  border-radius: 14px;
+  background: var(--panel-strong);
+}
+
+.polymarket-embed-placeholder {
+  background: var(--panel-strong);
+  border-radius: 14px;
+  padding: 24px;
+  color: var(--muted);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: center;
+  justify-content: center;
+  min-height: 300px;
+}
+
 .market-link:hover {
   color: var(--text);
   border-bottom-color: var(--accent);
