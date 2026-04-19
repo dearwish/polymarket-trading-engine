@@ -127,6 +127,48 @@ def test_portfolio_partial_close_splits_position(settings) -> None:
     assert closed[0].close_reason == "paper_tp_ladder_1"
 
 
+def test_portfolio_exit_slippage_is_a_no_op_when_disabled(settings) -> None:
+    """exit_slippage_bps=0 must leave the price unchanged (default behaviour)."""
+    engine = PortfolioEngine(settings.db_path, settings.paper_starting_balance_usd, exit_slippage_bps=0.0)
+    assert engine.apply_exit_slippage(0.55) == 0.55
+
+
+def test_portfolio_exit_slippage_nudges_price_down(settings) -> None:
+    engine = PortfolioEngine(settings.db_path, settings.paper_starting_balance_usd, exit_slippage_bps=10.0)
+    # 0.55 × (1 - 10/10000) = 0.54945
+    assert abs(engine.apply_exit_slippage(0.55) - 0.54945) < 1e-6
+
+
+def test_portfolio_round_trip_fee_deducted_from_realised_pnl(settings) -> None:
+    """With fee_bps > 0, close_position should reduce realised_pnl by
+    2 × size_usd × fee_bps / 10000 (buy + sell leg)."""
+    engine = PortfolioEngine(
+        settings.db_path,
+        settings.paper_starting_balance_usd,
+        fee_bps=50.0,  # 50bps each leg → 1% round-trip
+    )
+    decision = TradeDecision(
+        market_id="fee-mkt",
+        status=DecisionStatus.APPROVED,
+        side=SuggestedSide.YES,
+        size_usd=10.0,
+        limit_price=0.50,
+        rationale=["approved"],
+        rejected_by=[],
+    )
+    result = ExecutionResult(
+        market_id="fee-mkt", success=True, mode=ExecutionMode.PAPER,
+        order_id="paper-fee-1", status="FILLED_PAPER", detail="ok", fill_price=0.50,
+    )
+    engine.record_execution(decision, result)
+    engine.close_position("fee-mkt", exit_price=0.60, reason="test")
+    closed = engine.list_closed_positions(limit=1)
+    # Gross PnL: (0.60 - 0.50) × (10 / 0.50) = $2.00
+    # Round-trip fee: 10 × 0.005 × 2 = $0.10
+    # Net: $1.90
+    assert abs(closed[0].realized_pnl - 1.9) < 1e-6
+
+
 def test_portfolio_partial_close_at_full_fraction_falls_through_to_full_close(settings) -> None:
     engine = PortfolioEngine(settings.db_path, settings.paper_starting_balance_usd)
     decision = TradeDecision(

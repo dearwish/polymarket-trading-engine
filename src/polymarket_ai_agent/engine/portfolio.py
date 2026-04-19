@@ -24,9 +24,22 @@ def _utc_now() -> datetime:
 class PortfolioEngine:
     TERMINAL_LIVE_ORDER_STATUSES = {"CANCELED", "CANCELLED", "MATCHED", "FILLED", "EXECUTED", "REJECTED"}
 
-    def __init__(self, db_path: Path, starting_balance_usd: float):
+    def __init__(
+        self,
+        db_path: Path,
+        starting_balance_usd: float,
+        exit_slippage_bps: float = 0.0,
+        fee_bps: float = 0.0,
+    ):
         self.db_path = db_path
         self.starting_balance_usd = starting_balance_usd
+        # Applied at close: exit_price is reduced by exit_slippage_bps (the
+        # sell-side slippage — we're closing the position regardless of side,
+        # so both YES and NO exits get hit). fee_bps is deducted as a round-trip
+        # cost from the realised PnL so paper accounting matches the scorer's
+        # pre-trade edge calculation.
+        self.exit_slippage_bps = max(0.0, float(exit_slippage_bps))
+        self.fee_bps = max(0.0, float(fee_bps))
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
@@ -437,7 +450,7 @@ class PortfolioEngine:
         position = self._get_open_position(market_id)
         if not position:
             return PositionAction(market_id=market_id, action="NOOP", reason="Position not open.")
-        pnl = self._compute_pnl(position, exit_price)
+        pnl = self._compute_pnl(position, exit_price) - self._round_trip_fee(position.size_usd)
         with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute(
                 """
@@ -481,7 +494,7 @@ class PortfolioEngine:
         # Re-express the closed tranche as its own PositionRecord shape so we
         # reuse the same entry_price-based PnL formula.
         closed_tranche = replace(position, size_usd=closed_size)
-        closed_pnl = self._compute_pnl(closed_tranche, exit_price)
+        closed_pnl = self._compute_pnl(closed_tranche, exit_price) - self._round_trip_fee(closed_size)
         tranche_order_id = f"{position.order_id}-T{current.timestamp():.0f}" if position.order_id else ""
         with closing(sqlite3.connect(self.db_path)) as conn, conn:
             # Shrink the open row.
@@ -534,6 +547,29 @@ class PortfolioEngine:
             reference = max(0.01, 1 - orderbook.ask)
         slippage = reference * (exit_slippage_bps / 10_000)
         return round(max(0.01, min(0.99, reference - slippage)), 6)
+
+    def apply_exit_slippage(self, exit_price: float) -> float:
+        """Nudge a proposed exit mid by the configured slippage bps.
+
+        Paper-mode callers should invoke this BEFORE close_position so the
+        stored exit_price reflects realistic execution cost. Live-mode closes
+        already receive a real CLOB fill price and must NOT double-apply this.
+        Both YES and NO exits are sells so slippage always reduces the price.
+        """
+        if self.exit_slippage_bps <= 0.0 or exit_price <= 0.0:
+            return exit_price
+        adjusted = exit_price * (1.0 - self.exit_slippage_bps / 10_000.0)
+        return round(max(0.01, min(0.99, adjusted)), 6)
+
+    def _round_trip_fee(self, size_usd: float) -> float:
+        """Round-trip fee on a position of ``size_usd`` at the configured bps.
+
+        Applied at close (both full and partial), so buy+sell fee is recognised
+        when the tranche closes. Units: dollars.
+        """
+        if self.fee_bps <= 0.0 or size_usd <= 0.0:
+            return 0.0
+        return float(size_usd) * (self.fee_bps / 10_000.0) * 2.0
 
     @staticmethod
     def _compute_pnl(position: PositionRecord, exit_price: float) -> float:

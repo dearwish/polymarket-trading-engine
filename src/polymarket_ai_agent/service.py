@@ -48,7 +48,12 @@ class AgentService:
             events_jsonl_max_bytes=settings.events_jsonl_max_bytes,
             events_jsonl_keep_tail_bytes=settings.events_jsonl_keep_tail_bytes,
         )
-        self.portfolio = PortfolioEngine(settings.db_path, settings.paper_starting_balance_usd)
+        self.portfolio = PortfolioEngine(
+            settings.db_path,
+            settings.paper_starting_balance_usd,
+            exit_slippage_bps=settings.paper_exit_slippage_bps,
+            fee_bps=settings.fee_bps,
+        )
 
     def discover_markets(self):
         markets = self.polymarket.discover_markets()

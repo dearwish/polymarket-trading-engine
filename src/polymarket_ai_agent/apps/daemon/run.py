@@ -541,7 +541,7 @@ class DaemonRunner:
                             self.service.portfolio.partial_close_position,
                             market_id,
                             effective_fraction,
-                            float(current_price),
+                            self.service.portfolio.apply_exit_slippage(float(current_price)),
                             f"paper_tp_ladder_{tranches_closed + 1}",
                         )
                         extras["tranches_closed"] = tranches_closed + 1
@@ -562,7 +562,7 @@ class DaemonRunner:
                     await asyncio.to_thread(
                         self.service.portfolio.close_position,
                         market_id,
-                        float(current_price),
+                        self.service.portfolio.apply_exit_slippage(float(current_price)),
                         "paper_trailing_stop",
                     )
                     self._position_extras.pop(market_id, None)
@@ -587,7 +587,7 @@ class DaemonRunner:
                     await asyncio.to_thread(
                         self.service.portfolio.close_position,
                         market_id,
-                        float(current_price),
+                        self.service.portfolio.apply_exit_slippage(float(current_price)),
                         close_reason,
                     )
                     self._position_extras.pop(market_id, None)
@@ -599,7 +599,7 @@ class DaemonRunner:
                 await asyncio.to_thread(
                     self.service.portfolio.close_position,
                     market_id,
-                    float(current_price),
+                    self.service.portfolio.apply_exit_slippage(float(current_price)),
                     "paper_tte_exit",
                 )
                 self._position_extras.pop(market_id, None)
