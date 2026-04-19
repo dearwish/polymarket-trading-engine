@@ -80,6 +80,7 @@ type ClosedPosition = {
   realized_pnl: number;
   fees_paid: number;
   cumulative_pnl: number;
+  opened_at: string;
   closed_at: string | null;
 };
 
@@ -1156,6 +1157,8 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
                 <th>PnL</th>
                 <th>Fees</th>
                 <th>Cumulative</th>
+                <th>Opened</th>
+                <th>Closed</th>
                 <th>Reason</th>
               </tr>
             </thead>
@@ -1185,6 +1188,12 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
                         {position.fees_paid > 0 ? formatMoney(position.fees_paid) : "—"}
                       </td>
                       <td>{formatMoney(position.cumulative_pnl)}</td>
+                      <td style={{ whiteSpace: "nowrap", fontSize: "12px", color: "var(--muted)" }}>
+                        {formatInstant(position.opened_at, timezone, timeFormat, "datetime")}
+                      </td>
+                      <td style={{ whiteSpace: "nowrap", fontSize: "12px", color: "var(--muted)" }}>
+                        {formatInstant(position.closed_at, timezone, timeFormat, "datetime")}
+                      </td>
                       <td>{position.close_reason}</td>
                     </tr>
                   );
