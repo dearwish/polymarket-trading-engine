@@ -887,6 +887,14 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
   // always reflect the freshest daemon_tick. With a handful of markets the
   // cost is negligible and avoids any reference-stability bail in useMemo.
   const marketLookup = buildMarketLookup(daemonTicks);
+  // Force the Polymarket embed iframes to refresh every 30s — their chart is
+  // rendered once at load and doesn't update client-side, so we remount to
+  // pull a fresh snapshot. Cachebuster query string defeats the iframe cache.
+  const [embedRefresh, setEmbedRefresh] = useState<number>(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setEmbedRefresh(Date.now()), 30_000);
+    return () => window.clearInterval(id);
+  }, []);
   return (
     <section className="grid detail-grid">
       <article className="panel">
@@ -932,9 +940,9 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
                   </div>
                 );
               }
-              const src = `https://embed.polymarket.com/market?market=${encodeURIComponent(slug)}&theme=dark&liveactivity=true&buttons=false&border=true&height=300`;
+              const src = `https://embed.polymarket.com/market?market=${encodeURIComponent(slug)}&theme=dark&liveactivity=true&buttons=false&border=true&height=300&_t=${embedRefresh}`;
               return (
-                <figure key={position.market_id} className="polymarket-embed" aria-label={`Polymarket market ${tick?.question ?? position.market_id}`}>
+                <figure key={`${position.market_id}-${embedRefresh}`} className="polymarket-embed" aria-label={`Polymarket market ${tick?.question ?? position.market_id}`}>
                   <iframe
                     title={tick?.question || position.market_id}
                     src={src}
