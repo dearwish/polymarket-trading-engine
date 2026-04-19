@@ -389,21 +389,72 @@ const TIMEZONE_OPTIONS: Array<{ value: string; label: string }> = (() => {
 })();
 
 function formatEndTime(endDateIso: string | null | undefined, tz: string, fmt: TimeFormat): string {
-  if (!endDateIso) return "n/a";
-  const d = new Date(endDateIso);
+  return formatInstant(endDateIso, tz, fmt, "datetime");
+}
+
+type InstantVariant = "datetime" | "time" | "date";
+
+function formatInstant(
+  iso: string | null | undefined,
+  tz: string,
+  fmt: TimeFormat,
+  variant: InstantVariant = "datetime",
+): string {
+  if (!iso) return "n/a";
+  const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "n/a";
+  const opts: Intl.DateTimeFormatOptions = { timeZone: tz, hour12: fmt === "12h" };
+  if (variant === "datetime" || variant === "date") {
+    opts.day = "2-digit";
+    opts.month = "short";
+  }
+  if (variant === "datetime" || variant === "time") {
+    opts.hour = "2-digit";
+    opts.minute = "2-digit";
+    if (variant === "time") opts.second = "2-digit";
+  }
   try {
-    return new Intl.DateTimeFormat("en-GB", {
-      timeZone: tz,
-      day: "2-digit",
-      month: "short",
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: fmt === "12h",
-    }).format(d);
+    return new Intl.DateTimeFormat("en-GB", opts).format(d);
   } catch {
     return d.toISOString();
   }
+}
+
+function useDisplayPrefs() {
+  const [timezone, setTimezone] = useLocalStorage<string>("display.timezone", BROWSER_TZ);
+  const [timeFormat, setTimeFormat] = useLocalStorage<TimeFormat>("display.timeFormat", "24h");
+  return { timezone, setTimezone, timeFormat, setTimeFormat };
+}
+
+function DisplayPrefsPanel() {
+  const { timezone, setTimezone, timeFormat, setTimeFormat } = useDisplayPrefs();
+  return (
+    <article className="panel">
+      <div className="panel-header">
+        <h2>Display</h2>
+        <span>Applies to every date and time across the dashboard</span>
+      </div>
+      <div className="settings-grid">
+        <label className="settings-field">
+          <span>Timezone</span>
+          <select value={timezone} onChange={(e) => setTimezone(e.target.value)}>
+            {TIMEZONE_OPTIONS.map((opt) => (
+              <option key={opt.value} value={opt.value}>{opt.label}</option>
+            ))}
+          </select>
+          <small>Stored locally in your browser.</small>
+        </label>
+        <label className="settings-field">
+          <span>Time Format</span>
+          <select value={timeFormat} onChange={(e) => setTimeFormat(e.target.value as TimeFormat)}>
+            <option value="24h">24-hour (14:30)</option>
+            <option value="12h">12-hour (2:30 PM)</option>
+          </select>
+          <small>Stored locally in your browser.</small>
+        </label>
+      </div>
+    </article>
+  );
 }
 
 function useLocalStorage<T>(key: string, initial: T): [T, (next: T) => void] {
@@ -603,6 +654,7 @@ function OverviewPage({ state }: { state: DashboardState }) {
 }
 
 function DecisionsPage({ decisions }: { decisions: DecisionItem[] }) {
+  const { timezone, timeFormat } = useDisplayPrefs();
   return (
     <section className="panel">
       <div className="panel-header">
@@ -639,7 +691,7 @@ function DecisionsPage({ decisions }: { decisions: DecisionItem[] }) {
                 const question = typeof p.question === "string" ? p.question : String(p.market_id ?? "");
                 return (
                   <tr key={`${item.logged_at}-${index}`}>
-                    <td style={{ whiteSpace: "nowrap", color: "var(--muted)", fontSize: "12px" }}>{item.logged_at.slice(11, 19)}</td>
+                    <td style={{ whiteSpace: "nowrap", color: "var(--muted)", fontSize: "12px" }}>{formatInstant(item.logged_at, timezone, timeFormat, "time")}</td>
                     <td title={question}>{question.length > 42 ? `${question.slice(0, 42)}…` : question}</td>
                     <td><span className={sideClass}>{side || "n/a"}</span></td>
                     <td>{fair !== null ? `${(fair * 100).toFixed(1)}%` : "n/a"}</td>
@@ -693,8 +745,7 @@ function EventEntry({
 
 function OrdersPage({ liveOrders, liveTrades, liveActivity, paperActivity, tradingMode, daemonTicks }: { liveOrders: LiveOrder[]; liveTrades: LiveTrade[]; liveActivity: LiveActivityPayload | null; paperActivity: PaperActivityEvent[]; tradingMode: string; daemonTicks: DaemonTickPayload[] }) {
   const isLive = tradingMode === "live";
-  const [timezone] = useLocalStorage<string>("display.timezone", BROWSER_TZ);
-  const [timeFormat] = useLocalStorage<TimeFormat>("display.timeFormat", "24h");
+  const { timezone, timeFormat } = useDisplayPrefs();
   const marketLookup = useMemo(() => buildMarketLookup(daemonTicks), [daemonTicks]);
   const [selectedOrderId, setSelectedOrderId] = useState<string>("");
   const [selectedTradeId, setSelectedTradeId] = useState<string>("");
@@ -860,7 +911,7 @@ function OrdersPage({ liveOrders, liveTrades, liveActivity, paperActivity, tradi
                   const detail = p.detail ?? "";
                   return (
                     <tr key={`${event.logged_at}-${index}`}>
-                      <td style={{ whiteSpace: "nowrap", color: "var(--muted)", fontSize: "12px" }}>{event.logged_at.slice(11, 19)}</td>
+                      <td style={{ whiteSpace: "nowrap", color: "var(--muted)", fontSize: "12px" }}>{formatInstant(event.logged_at, timezone, timeFormat, "time")}</td>
                       <td>{p.market_id ? <MarketCell marketId={p.market_id} lookup={marketLookup} timezone={timezone} timeFormat={timeFormat} /> : "n/a"}</td>
                       <td className={sideClass}>{side || "n/a"}</td>
                       <td className={statusClass}>{status || "n/a"}</td>
@@ -885,8 +936,7 @@ function OrdersPage({ liveOrders, liveTrades, liveActivity, paperActivity, tradi
 }
 
 function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonTicks, heartbeat }: { summary: PortfolioSummaryPayload | null; positions: ClosedPosition[]; openPositions: OpenPosition[]; equityCurve: EquityCurvePayload | null; daemonTicks: DaemonTickPayload[]; heartbeat: DaemonHeartbeatPayload | null }) {
-  const [timezone] = useLocalStorage<string>("display.timezone", BROWSER_TZ);
-  const [timeFormat] = useLocalStorage<TimeFormat>("display.timeFormat", "24h");
+  const { timezone, timeFormat } = useDisplayPrefs();
   // Rebuild the lookup on every render so the Mark / Unrealized PnL cells
   // always reflect the freshest daemon_tick. With a handful of markets the
   // cost is negligible and avoids any reference-stability bail in useMemo.
@@ -914,8 +964,8 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
         </div>
         <PnlChart points={equityCurve?.points ?? []} />
         <div className="axis-labels">
-          <span>{equityCurve?.points[0]?.closed_at?.slice(0, 10) || "start"}</span>
-          <span>{equityCurve?.points[equityCurve.points.length - 1]?.closed_at?.slice(0, 10) || "latest"}</span>
+          <span>{formatInstant(equityCurve?.points[0]?.closed_at, timezone, timeFormat, "date") || "start"}</span>
+          <span>{formatInstant(equityCurve?.points[equityCurve.points.length - 1]?.closed_at, timezone, timeFormat, "date") || "latest"}</span>
         </div>
       </article>
 
@@ -1044,7 +1094,7 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
                       <td>{mark !== null ? mark.toFixed(4) : <span style={{ color: "var(--muted)" }}>—</span>}</td>
                       <td>{unrealizedCell}</td>
                       <td>{trailCell}</td>
-                      <td style={{ whiteSpace: "nowrap", fontSize: "12px", color: "var(--muted)" }}>{position.opened_at.slice(11, 19)}</td>
+                      <td style={{ whiteSpace: "nowrap", fontSize: "12px", color: "var(--muted)" }}>{formatInstant(position.opened_at, timezone, timeFormat, "time")}</td>
                       <td style={{ fontSize: "12px", color: "var(--muted)" }}>{position.order_id || "n/a"}</td>
                     </tr>
                   );
@@ -1104,6 +1154,7 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
 }
 
 function EventsPage({ events, report }: { events: RecentEvent[]; report: ReportPayload | null }) {
+  const { timezone, timeFormat } = useDisplayPrefs();
   const visibleEvents = events.length ? events : [];
   return (
     <section className="grid detail-grid">
@@ -1117,7 +1168,7 @@ function EventsPage({ events, report }: { events: RecentEvent[]; report: ReportP
             <EventEntry
               key={`${item.logged_at}-${index}`}
               title={item.event_type}
-              timestamp={item.logged_at}
+              timestamp={formatInstant(item.logged_at, timezone, timeFormat, "datetime")}
               content={JSON.stringify(item.payload, null, 2)}
             />
           ))}
@@ -1134,7 +1185,7 @@ function EventsPage({ events, report }: { events: RecentEvent[]; report: ReportP
             <EventEntry
               key={`${report?.session_id ?? "report"}-${index}`}
               title="report_item"
-              timestamp={report?.generated_at || "n/a"}
+              timestamp={formatInstant(report?.generated_at, timezone, timeFormat, "datetime")}
               content={item}
             />
           ))}
@@ -1259,6 +1310,7 @@ function SettingsPage({
 
   return (
     <section className="grid detail-grid">
+      <DisplayPrefsPanel />
       <article className="panel">
         <div className="panel-header">
           <h2>Runtime Settings</h2>
@@ -1485,8 +1537,7 @@ function DaemonView({ heartbeat, ticks }: { heartbeat: DaemonHeartbeatPayload | 
   const heartbeatLoaded = heartbeat !== null;
   const daemonRunning = age !== null && age < 60;
   const showStaleBanner = heartbeatLoaded && !daemonRunning;
-  const [timezone, setTimezone] = useLocalStorage<string>("display.timezone", BROWSER_TZ);
-  const [timeFormat, setTimeFormat] = useLocalStorage<TimeFormat>("display.timeFormat", "24h");
+  const { timezone, timeFormat } = useDisplayPrefs();
 
   return (
     <>
@@ -1510,21 +1561,6 @@ function DaemonView({ heartbeat, ticks }: { heartbeat: DaemonHeartbeatPayload | 
         <span className="pill">
           Family: {hb?.market_family ?? "n/a"}
         </span>
-        <label className="pill display-pref">
-          <span className="display-pref-label">TZ</span>
-          <select value={timezone} onChange={(e) => setTimezone(e.target.value)}>
-            {TIMEZONE_OPTIONS.map((opt) => (
-              <option key={opt.value} value={opt.value}>{opt.label}</option>
-            ))}
-          </select>
-        </label>
-        <label className="pill display-pref">
-          <span className="display-pref-label">Fmt</span>
-          <select value={timeFormat} onChange={(e) => setTimeFormat(e.target.value as TimeFormat)}>
-            <option value="24h">24h</option>
-            <option value="12h">12h</option>
-          </select>
-        </label>
       </div>
 
       <div className="daemon-stat-grid">
