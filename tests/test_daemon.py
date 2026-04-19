@@ -601,11 +601,55 @@ def test_paper_tp_ladder_closes_position_in_tranches(tmp_path) -> None:
     )
     asyncio.run(runner._paper_execute_decision_callback(ctx2))
     open_positions = service.portfolio.list_open_positions()
-    # Tranche 2 closes 25% of CURRENT remaining = 25% × 5 = 1.25, leaving 3.75.
+    # Tranche 2 closes 25% of ORIGINAL ($10) = $2.50, leaving $2.50 open.
     assert len(open_positions) == 1
-    assert abs(open_positions[0].size_usd - 3.75) < 1e-6
+    assert abs(open_positions[0].size_usd - 2.5) < 1e-6
     closed_after_second = service.portfolio.list_closed_positions(limit=5)
     assert any(p.close_reason == "paper_tp_ladder_2" for p in closed_after_second)
+
+
+def test_paper_tp_ladder_three_tranches_each_one_third_of_original(tmp_path) -> None:
+    """With ladder "0.10:0.33,0.20:0.33,0.30:0.33" and a $10 position, each
+    tranche should close ~$3.33 (1/3 of ORIGINAL), leaving ~$3.33 for the
+    trail to manage. Regression for user-observed issue where second tranche
+    only took 33% of the already-shrunk remainder."""
+    from polymarket_ai_agent.apps.daemon.run import DecisionContext
+    from polymarket_ai_agent.engine.market_state import MarketState
+
+    runner, service, candidate, approved, btc = _setup_runner_with_open_yes_position(
+        tmp_path, entry_price=0.50,
+        settings_overrides={
+            "paper_tp_ladder": "0.10:0.33,0.20:0.33,0.30:0.33",
+            "paper_trailing_stop_pct": 0.0,  # trail off, we only test ladder
+        },
+    )
+
+    def push(bid: str, ask: str):
+        st = MarketState(market_id=candidate.market_id, yes_token_id="yes-tok", no_token_id="no-tok")
+        st.apply_book_snapshot({
+            "asset_id": "yes-tok",
+            "bids": [{"price": bid, "size": "500"}],
+            "asks": [{"price": ask, "size": "500"}],
+        })
+        runner._market_states[candidate.market_id] = st
+        ctx = DecisionContext(
+            market_id=candidate.market_id, candidate=candidate,
+            features=st.features(), btc_snapshot=btc, assessment=approved, metrics=runner.metrics,
+        )
+        asyncio.run(runner._paper_execute_decision_callback(ctx))
+
+    # Tranche 1 at +17% → closes 0.33 × $10 = $3.30, leaves $6.70.
+    push("0.59", "0.61")
+    assert abs(service.portfolio.list_open_positions()[0].size_usd - 6.7) < 0.05
+    # Tranche 2 at +25% → closes another 0.33 × $10 = $3.30, leaves $3.40.
+    push("0.64", "0.66")
+    assert abs(service.portfolio.list_open_positions()[0].size_usd - 3.4) < 0.05
+    # Tranche 3 at +35% → closes another 0.33 × $10 = $3.30; but only $3.40
+    # remains, so the effective close is capped at ~$3.30 and ~$0.10 is left.
+    push("0.69", "0.71")
+    opens = service.portfolio.list_open_positions()
+    assert len(opens) == 1
+    assert abs(opens[0].size_usd - 0.1) < 0.05
 
 
 def test_fixed_tp_skipped_after_ladder_tranche_fires(tmp_path) -> None:

@@ -509,7 +509,20 @@ class DaemonRunner:
             entry_price = float(open_pos.entry_price)
             if current_price > 0.0 and entry_price > 0.0:
                 pnl_pct = (current_price - entry_price) / entry_price
-                extras = self._position_extras.setdefault(market_id, {"peak_price": 0.0, "tranches_closed": 0.0})
+                # Bootstrap per-position state on first sight. original_size_usd
+                # is pinned from the opening size so ladder fractions apply to
+                # the ORIGINAL position (1/3 of $10 = $3.33 every time), not to
+                # the ever-shrinking remainder (which would give $3.33, $2.22,
+                # $1.48, …). On daemon restart we lose in-memory state and fall
+                # back to treating the current remaining size as the original.
+                extras = self._position_extras.setdefault(
+                    market_id,
+                    {
+                        "peak_price": 0.0,
+                        "tranches_closed": 0.0,
+                        "original_size_usd": float(open_pos.size_usd),
+                    },
+                )
                 if current_price > extras["peak_price"]:
                     extras["peak_price"] = current_price
                 # --- 1. TP ladder (partial close) -------------------------
@@ -517,10 +530,17 @@ class DaemonRunner:
                 if tranches_closed < len(self._tp_ladder):
                     next_pct, next_frac = self._tp_ladder[tranches_closed]
                     if pnl_pct >= next_pct:
+                        original_size = float(extras.get("original_size_usd", open_pos.size_usd))
+                        current_size = float(open_pos.size_usd)
+                        target_close_usd = next_frac * original_size
+                        # Never try to close more than what's open. If the
+                        # ladder fractions sum to ≥ 1 the last tranche ends up
+                        # fully closing the remainder.
+                        effective_fraction = min(1.0, target_close_usd / max(current_size, 1e-9))
                         await asyncio.to_thread(
                             self.service.portfolio.partial_close_position,
                             market_id,
-                            float(next_frac),
+                            effective_fraction,
                             float(current_price),
                             f"paper_tp_ladder_{tranches_closed + 1}",
                         )
