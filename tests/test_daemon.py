@@ -534,16 +534,17 @@ def test_paper_trailing_stop_rides_up_then_exits_on_reversal(tmp_path) -> None:
         features=state_up.features(), btc_snapshot=btc, assessment=approved, metrics=runner.metrics,
     )
     asyncio.run(runner._paper_execute_decision_callback(ctx_up))
-    # Still open — trailing stop is 0.80 × 0.90 = 0.72, mid is 0.80, well above.
+    # Still open — peak now tracks the BID (0.79) since exit triggers use the
+    # sellable price. Trail level = 0.79 × 0.90 = 0.711, current bid = 0.79.
     assert len(service.portfolio.list_open_positions()) == 1
-    assert runner._position_extras[candidate.market_id]["peak_price"] >= 0.80
+    assert runner._position_extras[candidate.market_id]["peak_price"] >= 0.79
 
-    # Reverse: mid drops to 0.70, below the 0.72 trailing level → exit.
+    # Reverse: bid drops to 0.60, well below the 0.711 trail level → exit.
     state_down = MarketState(market_id=candidate.market_id, yes_token_id="yes-tok", no_token_id="no-tok")
     state_down.apply_book_snapshot({
         "asset_id": "yes-tok",
-        "bids": [{"price": "0.69", "size": "500"}],
-        "asks": [{"price": "0.71", "size": "500"}],
+        "bids": [{"price": "0.60", "size": "500"}],
+        "asks": [{"price": "0.62", "size": "500"}],
     })
     runner._market_states[candidate.market_id] = state_down
     ctx_down = DecisionContext(

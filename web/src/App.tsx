@@ -236,6 +236,9 @@ type DaemonTickPayload = {
   bid_yes: number;
   ask_yes: number;
   mid_yes?: number;
+  bid_no?: number;
+  ask_no?: number;
+  mid_no?: number;
   fair_probability: number;
   fair_probability_no: number;
   edge_yes: number;
@@ -1426,16 +1429,25 @@ function buildMarketLookup(ticks: DaemonTickPayload[]): MarketLookup {
   return lookup;
 }
 
-/** Current token price in the position's own frame. YES sees mid_yes; NO sees 1-mid_yes. */
+/** Realisable mark price in the position's own frame — the bid we could
+ *  actually sell into right now, not the optimistic mid. Matches what the
+ *  daemon uses for SL/TP/trail triggers, so the Mark + Unrealized PnL cells
+ *  line up with the thresholds that will fire. Falls back to mid when bid
+ *  isn't populated (cold-start book) and to the ask-derived complement for
+ *  NO positions if no_book bid isn't in the tick payload.
+ */
 function currentTokenPrice(tick: DaemonTickPayload | undefined, side: string): number | null {
   if (!tick) return null;
-  const midYes = typeof tick.mid_yes === "number" && tick.mid_yes > 0
-    ? tick.mid_yes
-    : (typeof tick.bid_yes === "number" && typeof tick.ask_yes === "number" && tick.bid_yes > 0 && tick.ask_yes > 0
-      ? (tick.bid_yes + tick.ask_yes) / 2
-      : null);
-  if (midYes === null) return null;
-  return side === "YES" ? midYes : 1 - midYes;
+  if (side === "YES") {
+    if (typeof tick.bid_yes === "number" && tick.bid_yes > 0) return tick.bid_yes;
+    if (typeof tick.mid_yes === "number" && tick.mid_yes > 0) return tick.mid_yes;
+    return null;
+  }
+  // NO side: prefer direct NO bid, then NO mid, then 1 - YES ask.
+  if (typeof tick.bid_no === "number" && tick.bid_no > 0) return tick.bid_no;
+  if (typeof tick.mid_no === "number" && tick.mid_no > 0) return tick.mid_no;
+  if (typeof tick.ask_yes === "number" && tick.ask_yes > 0) return 1 - tick.ask_yes;
+  return null;
 }
 
 function MarketCell({

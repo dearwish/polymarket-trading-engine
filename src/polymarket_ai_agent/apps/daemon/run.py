@@ -452,6 +452,9 @@ class DaemonRunner:
             "bid_yes": features.bid_yes,
             "ask_yes": features.ask_yes,
             "mid_yes": features.mid_yes,
+            "bid_no": features.bid_no,
+            "ask_no": features.ask_no,
+            "mid_no": features.mid_no,
             "microprice_yes": features.microprice_yes,
             "imbalance_top5_yes": features.imbalance_top5_yes,
             "depth_usd_yes": features.depth_usd_yes,
@@ -505,7 +508,17 @@ class DaemonRunner:
         #   5. TTE exit buffer (full close near expiry at current mid)
         open_pos = await asyncio.to_thread(self.service.portfolio.get_open_position, market_id)
         if open_pos is not None:
-            current_price = features.mid_yes if open_pos.side == SuggestedSide.YES else features.mid_no
+            # Use the BID we could actually sell into (YES bid for YES, NO bid
+            # for NO) as the exit-trigger price, not the mid. Mid-based triggers
+            # + bid-based fills produce a nasty gap on wide-spread books: SL
+            # thresholded on mid (say −20%) fires when the bid is already at
+            # −45% and we realise the full −45% at close. Using bid on both
+            # sides keeps the threshold and the realisation in the same frame.
+            # Fall back to mid only if bid isn't populated yet (cold-start book).
+            if open_pos.side == SuggestedSide.YES:
+                current_price = features.bid_yes if features.bid_yes > 0.0 else features.mid_yes
+            else:
+                current_price = features.bid_no if features.bid_no > 0.0 else features.mid_no
             entry_price = float(open_pos.entry_price)
             if current_price > 0.0 and entry_price > 0.0:
                 pnl_pct = (current_price - entry_price) / entry_price
