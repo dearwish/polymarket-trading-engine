@@ -87,7 +87,9 @@ def _candidate(market_id: str, yes: str, no: str) -> MarketCandidate:
 
 
 def _settings(tmp_path: Path) -> Settings:
-    return Settings(
+    from polymarket_ai_agent.engine.migrations import MigrationRunner
+
+    s = Settings(
         openrouter_api_key="",
         market_family="btc_1h",
         polymarket_private_key="",
@@ -107,6 +109,9 @@ def _settings(tmp_path: Path) -> Settings:
         min_entry_tte_seconds=0,
         max_consecutive_losses=0,
     )
+    s.db_path.parent.mkdir(parents=True, exist_ok=True)
+    MigrationRunner(s.db_path).run()
+    return s
 
 
 def test_daemon_processes_ws_events_and_updates_state(tmp_path: Path) -> None:
@@ -1070,3 +1075,104 @@ def test_min_candle_elapsed_blocks_early_entry(tmp_path: Path) -> None:
     positions = service.portfolio.list_open_positions()
     assert len(positions) == 1, "entry should be allowed at t=90s"
     assert positions[0].market_id == candidate.market_id
+
+
+# ---------------------------------------------------------------------------
+# Settings reload loop — new in the DB-owned runtime settings change.
+# ---------------------------------------------------------------------------
+
+def test_settings_reload_loop_rebinds_engines_and_journals_change(tmp_path: Path) -> None:
+    """Writing a new row to settings_changes while the daemon is running
+    must flow through _maybe_reload_settings and propagate to the quant
+    scorer + risk profile + execution engine."""
+    settings = _settings(tmp_path)
+    service = AgentService(settings)
+    runner = DaemonRunner(
+        settings=settings,
+        service=service,
+        config=DaemonConfig(market_family=settings.market_family),
+        market_stream_factory=lambda url: FakeMarketStream([]),  # type: ignore[arg-type]
+        btc_feed_factory=lambda: FakeBtcFeed([]),  # type: ignore[arg-type]
+    )
+    # Seed a baseline value so the daemon has a "before" to diff against.
+    service.settings_store.record_changes(
+        [("min_edge", runner.settings.min_edge, 0.25)], source="api"
+    )
+    runner._last_settings_id = service.settings_store.get_max_id() - 1  # rewind cursor
+    runner._maybe_reload_settings()
+    assert runner.settings.min_edge == 0.25
+    assert runner.quant.settings.min_edge == 0.25
+    # Risk engine caches a profile; refresh_profile must have run.
+    assert service.risk.profile.min_edge == 0.25
+    # Cursor advanced.
+    assert runner._last_settings_id == service.settings_store.get_max_id()
+
+
+def test_settings_reload_emits_settings_changed_event(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    service = AgentService(settings)
+    runner = DaemonRunner(
+        settings=settings,
+        service=service,
+        config=DaemonConfig(market_family=settings.market_family),
+        market_stream_factory=lambda url: FakeMarketStream([]),  # type: ignore[arg-type]
+        btc_feed_factory=lambda: FakeBtcFeed([]),  # type: ignore[arg-type]
+    )
+    runner._last_settings_id = service.settings_store.get_max_id()
+    service.settings_store.record_changes(
+        [("paper_stop_loss_pct", runner.settings.paper_stop_loss_pct, 0.10)],
+        source="cli",
+        reason="tighter stop",
+    )
+    runner._maybe_reload_settings()
+    # Tail events.jsonl for the settings_changed event.
+    import json
+
+    events = [json.loads(line) for line in settings.events_path.read_text().splitlines() if line.strip()]
+    changed = [e for e in events if e["event_type"] == "settings_changed"]
+    assert len(changed) == 1
+    payload = changed[-1]["payload"]
+    assert "paper_stop_loss_pct" in payload["changed"]
+    assert payload["changed"]["paper_stop_loss_pct"]["after"] == 0.10
+    assert "cli" in payload["source"]
+
+
+def test_settings_reload_loop_survives_db_errors(tmp_path: Path) -> None:
+    """A transient DB read failure must not crash the reload loop."""
+    settings = _settings(tmp_path)
+    service = AgentService(settings)
+    runner = DaemonRunner(
+        settings=settings,
+        service=service,
+        config=DaemonConfig(market_family=settings.market_family),
+        market_stream_factory=lambda url: FakeMarketStream([]),  # type: ignore[arg-type]
+        btc_feed_factory=lambda: FakeBtcFeed([]),  # type: ignore[arg-type]
+    )
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated DB failure")
+
+    original = runner.service.settings_store.get_max_id
+    runner.service.settings_store.get_max_id = boom  # type: ignore[assignment]
+    try:
+        async def _drive() -> None:
+            stop_event = asyncio.Event()
+
+            async def stopper() -> None:
+                await asyncio.sleep(0.05)
+                stop_event.set()
+
+            # One tick is enough — the loop body catches + journals the error.
+            asyncio.create_task(stopper())
+            await runner._settings_reload_loop(stop_event)
+
+        asyncio.run(_drive())
+    finally:
+        runner.service.settings_store.get_max_id = original  # type: ignore[assignment]
+
+    import json
+
+    events = [json.loads(line) for line in settings.events_path.read_text().splitlines() if line.strip()]
+    failed = [e for e in events if e["event_type"] == "settings_reload_failed"]
+    assert failed, "loop should have emitted a settings_reload_failed event"
+    assert "simulated DB failure" in failed[-1]["payload"]["error"]

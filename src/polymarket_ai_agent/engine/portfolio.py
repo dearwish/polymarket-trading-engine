@@ -7,6 +7,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from polymarket_ai_agent.engine.db import configure_connection
 from polymarket_ai_agent.types import (
     AccountState,
     ExecutionMode,
@@ -676,63 +677,16 @@ class PortfolioEngine:
         )
 
     def _init_db(self) -> None:
-        with closing(sqlite3.connect(self.db_path)) as conn, conn:
-            # WAL mode lets the daemon's async writes coexist with operator
-            # reads (status/report/dashboard) without blocking. synchronous=NORMAL
-            # is a good default for WAL journaling on a single-node trader.
-            conn.execute("pragma journal_mode = WAL")
-            conn.execute("pragma synchronous = NORMAL")
-            conn.execute("pragma temp_store = MEMORY")
-            conn.execute(
-                """
-                create table if not exists positions (
-                    market_id text not null,
-                    side text not null,
-                    size_usd real not null,
-                    entry_price real not null,
-                    order_id text not null,
-                    opened_at text not null,
-                    status text not null,
-                    close_reason text,
-                    closed_at text,
-                    exit_price real,
-                    realized_pnl real not null default 0.0
+        # Schema is owned by the migrations framework — see
+        # src/polymarket_ai_agent/migrations/. This just applies the
+        # per-connection pragmas and sanity-checks that migrations have run.
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            configure_connection(conn)
+            row = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='positions'"
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(
+                    "PortfolioEngine: `positions` table missing. "
+                    "Run MigrationRunner before constructing the engine."
                 )
-                """
-            )
-            conn.execute(
-                """
-                create table if not exists order_attempts (
-                    market_id text not null,
-                    success integer not null,
-                    counted_rejection integer not null,
-                    status text not null,
-                    detail text not null,
-                    recorded_at text not null
-                )
-                """
-            )
-            conn.execute(
-                """
-                create table if not exists live_orders (
-                    order_id text primary key,
-                    market_id text not null,
-                    asset_id text not null,
-                    side text not null,
-                    status text not null,
-                    detail text not null,
-                    created_at text not null,
-                    updated_at text not null
-                )
-                """
-            )
-            # Indexes keep hot-path reads O(log n) as the DB grows. All three
-            # tables are append-heavy and queried by status/date or market_id.
-            conn.execute("create index if not exists positions_status_idx on positions(status)")
-            conn.execute("create index if not exists positions_market_status_idx on positions(market_id, status)")
-            conn.execute("create index if not exists positions_closed_at_idx on positions(closed_at)")
-            conn.execute("create index if not exists order_attempts_recorded_at_idx on order_attempts(recorded_at)")
-            conn.execute("create index if not exists order_attempts_market_idx on order_attempts(market_id)")
-            conn.execute("create index if not exists live_orders_status_idx on live_orders(status)")
-            conn.execute("create index if not exists live_orders_updated_at_idx on live_orders(updated_at)")
-            conn.commit()

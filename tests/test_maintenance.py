@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from polymarket_ai_agent.engine.journal import Journal
+from polymarket_ai_agent.engine.migrations import MigrationRunner
 from polymarket_ai_agent.engine.portfolio import PortfolioEngine
 from polymarket_ai_agent.types import (
     DecisionStatus,
@@ -18,6 +19,7 @@ from polymarket_ai_agent.types import (
 
 
 def _portfolio(tmp_path: Path) -> PortfolioEngine:
+    MigrationRunner(tmp_path / "agent.db").run()
     return PortfolioEngine(tmp_path / "agent.db", starting_balance_usd=100.0)
 
 
@@ -161,6 +163,7 @@ def test_row_counts_matches_inserts(tmp_path: Path) -> None:
 
 
 def test_journal_size_helpers(tmp_path: Path) -> None:
+    MigrationRunner(tmp_path / "agent.db").run()
     journal = Journal(tmp_path / "agent.db", tmp_path / "events.jsonl")
     journal.log_event("a", {"k": 1})
     assert journal.events_jsonl_size_bytes() > 0
@@ -171,6 +174,7 @@ def test_journal_size_helpers(tmp_path: Path) -> None:
 
 
 def test_journal_size_bytes_includes_wal_sidecars(tmp_path: Path) -> None:
+    MigrationRunner(tmp_path / "agent.db").run()
     journal = Journal(tmp_path / "agent.db", tmp_path / "events.jsonl")
     # Force some WAL traffic by writing a report.
     journal.save_report("s", "summary")

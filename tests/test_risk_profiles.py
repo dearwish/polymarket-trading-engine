@@ -9,6 +9,7 @@ from polymarket_ai_agent.config import (
     Settings,
     resolve_risk_profile,
 )
+from polymarket_ai_agent.engine.migrations import MigrationRunner
 from polymarket_ai_agent.engine.portfolio import PortfolioEngine
 from polymarket_ai_agent.engine.risk import RiskEngine
 from polymarket_ai_agent.types import (
@@ -205,6 +206,7 @@ def test_risk_engine_dynamic_exit_buffer_scales_with_family_window(tmp_path: Pat
 
 
 def test_portfolio_exposure_summary_reflects_yes_and_no_positions(tmp_path: Path) -> None:
+    MigrationRunner(tmp_path / "agent.db").run()
     portfolio = PortfolioEngine(tmp_path / "agent.db", starting_balance_usd=100.0)
     # Insert one YES and one NO position directly via record_live_fill.
     portfolio.record_live_fill(
@@ -223,6 +225,7 @@ def test_portfolio_exposure_summary_reflects_yes_and_no_positions(tmp_path: Path
 
 
 def test_portfolio_account_state_carries_exposure_into_risk(tmp_path: Path) -> None:
+    MigrationRunner(tmp_path / "agent.db").run()
     portfolio = PortfolioEngine(tmp_path / "agent.db", starting_balance_usd=100.0)
     portfolio.record_live_fill(
         order_id="o1", market_id="m1", asset_id="token-yes", side=SuggestedSide.YES,

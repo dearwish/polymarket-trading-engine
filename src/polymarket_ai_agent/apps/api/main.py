@@ -328,9 +328,30 @@ def create_app(
         return runtime_settings_payload(settings_factory())
 
     @app.put("/api/settings")
-    def update_settings(body: SettingsUpdateRequest) -> dict:
+    def update_settings(
+        body: SettingsUpdateRequest,
+        service: AgentService = Depends(service_factory),
+    ) -> dict:
         base_settings = base_settings_factory()
+        # save_runtime_overrides writes one settings_changes row per changed
+        # field (source='api'). We also emit a mirror api_settings_write
+        # event so the audit timeline distinguishes operator intent (this
+        # event) from daemon-observed effect (the settings_changed event
+        # the reload loop emits once it picks up the rows).
+        store = getattr(service, "settings_store", None)
+        last_id_before = store.get_max_id() if store is not None else 0
         save_runtime_overrides(base_settings, body.values)
+        new_ids: list[int] = []
+        if store is not None:
+            new_ids = [row.id for row in store.list_changes(since_id=last_id_before)]
+        try:
+            service.journal.log_event(
+                "api_settings_write",
+                {"source": "api", "received": dict(body.values), "row_ids": new_ids},
+            )
+        except Exception:
+            # Journal failures never break a settings write.
+            pass
         return runtime_settings_payload(settings_factory())
 
     @app.get("/api/markets")

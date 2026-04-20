@@ -49,6 +49,20 @@ class ExecutionEngine:
         self.router = router
         self.settings = settings
 
+    def refresh(self) -> None:
+        """Re-read settings-dependent attributes that were copied at init.
+
+        Called by :class:`DaemonRunner._apply_settings` when the operator
+        changes an editable field that feeds into execution — e.g.
+        ``paper_entry_slippage_bps`` or ``live_trading_enabled``. Kept
+        symmetric with :meth:`RiskEngine.refresh_profile` so the daemon's
+        swap path treats both engines the same way.
+        """
+        if self.settings is None:
+            return
+        self.paper_entry_slippage_bps = float(self.settings.paper_entry_slippage_bps)
+        self.live_trading_enabled = bool(self.settings.live_trading_enabled)
+
     def execute_trade(
         self,
         decision: TradeDecision,

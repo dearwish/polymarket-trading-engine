@@ -355,34 +355,55 @@ def test_api_live_activity_returns_404_when_active_market_missing() -> None:
 
 
 def test_api_settings_round_trip(tmp_path: Path) -> None:
+    from polymarket_ai_agent.engine.migrations import MigrationRunner
+    from polymarket_ai_agent.engine.settings_store import SettingsStore
+    from polymarket_ai_agent.config import load_runtime_overrides
+
+    db_path = tmp_path / "data" / "agent.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    MigrationRunner(db_path).run()
+
     base_settings = Settings(
         data_dir=tmp_path / "data",
         log_dir=tmp_path / "logs",
-        db_path=tmp_path / "data" / "agent.db",
+        db_path=db_path,
         events_path=tmp_path / "logs" / "events.jsonl",
         runtime_settings_path=tmp_path / "data" / "runtime_settings.json",
     )
+    # settings_factory now materialises runtime overrides from the DB — the
+    # same path `get_effective_settings()` uses in production.
+    def effective_factory() -> Settings:
+        overrides = load_runtime_overrides(base_settings)
+        if not overrides:
+            return base_settings
+        return Settings.model_validate({**base_settings.model_dump(), **overrides})
+
     client = TestClient(
         create_app(
             lambda: StubService(),
-            settings_factory=lambda: Settings.model_validate(
-                {
-                    **base_settings.model_dump(),
-                    **(__import__("json").loads(base_settings.runtime_settings_path.read_text()) if base_settings.runtime_settings_path.exists() else {}),
-                }
-            ),
+            settings_factory=effective_factory,
             base_settings_factory=lambda: base_settings,
         )
     )
     response = client.get("/api/settings")
     assert response.status_code == 200
-    assert response.json()["values"]["market_family"] == base_settings.market_family
+    # After migration, every editable field is overridden by the baseline
+    # seed row — effective value = INITIAL_SETTINGS_BASELINE, not the
+    # pydantic default on base_settings.
+    from polymarket_ai_agent.initial_settings import INITIAL_SETTINGS_BASELINE
+    assert response.json()["values"]["market_family"] == INITIAL_SETTINGS_BASELINE["market_family"]
 
     updated = client.put("/api/settings", json={"values": {"market_family": "btc_daily_threshold", "min_edge": 0.02}})
     assert updated.status_code == 200
     payload = updated.json()
     assert payload["values"]["market_family"] == "btc_daily_threshold"
     assert payload["overrides"]["min_edge"] == 0.02
+
+    # Every PUT lands as an append-only row in settings_changes with source='api'.
+    store = SettingsStore(db_path)
+    recent = store.list_timeline()[-2:]
+    assert {r.field for r in recent} == {"market_family", "min_edge"}
+    assert all(r.source == "api" for r in recent)
 
 
 def test_api_action_simulate_active() -> None:

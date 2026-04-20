@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
+from polymarket_ai_agent.engine.migrations import MigrationRunner
 from polymarket_ai_agent.engine.portfolio import PortfolioEngine
 from polymarket_ai_agent.types import (
     DecisionStatus,
@@ -16,6 +17,7 @@ from polymarket_ai_agent.types import (
 
 def _portfolio(tmp_path: Path) -> PortfolioEngine:
     db_path = tmp_path / "agent.db"
+    MigrationRunner(db_path).run()
     return PortfolioEngine(db_path=db_path, starting_balance_usd=100.0)
 
 

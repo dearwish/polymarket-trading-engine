@@ -9,10 +9,12 @@ from polymarket_ai_agent.connectors.external_feeds import ExternalFeedConnector
 from polymarket_ai_agent.connectors.polymarket import PolymarketConnector
 from polymarket_ai_agent.engine.execution import ExecutionEngine, ExecutionRouter
 from polymarket_ai_agent.engine.journal import Journal
+from polymarket_ai_agent.engine.migrations import MigrationRunner
 from polymarket_ai_agent.engine.portfolio import PortfolioEngine
 from polymarket_ai_agent.engine.research import ResearchEngine
 from polymarket_ai_agent.engine.risk import RiskEngine
 from polymarket_ai_agent.engine.scoring import ScoringEngine
+from polymarket_ai_agent.engine.settings_store import SettingsStore
 from polymarket_ai_agent.types import (
     AccountState,
     ExecutionMode,
@@ -28,6 +30,19 @@ from polymarket_ai_agent.types import (
 
 class AgentService:
     def __init__(self, settings: Settings):
+        # Migrations own all DB schema — run them FIRST, before any engine
+        # that touches the DB is constructed. Engines now assume the
+        # expected tables exist (see PortfolioEngine._init_db / Journal._init_db
+        # sanity checks). Also creates settings_changes + seeds the baseline
+        # on a fresh DB.
+        #
+        # AgentService trusts the caller's ``settings`` verbatim. Callers that
+        # want DB overrides layered on top (i.e. the production daemon/CLI
+        # entrypoints) should call ``get_effective_settings()`` themselves
+        # *after* constructing AgentService — migrations have run by then so
+        # the baseline rows are visible. Tests that pass an explicit
+        # ``settings`` object get their explicit values preserved.
+        self.migrations_applied = MigrationRunner(settings.db_path).run()
         self.settings = settings
         self.polymarket = PolymarketConnector(settings)
         self.external = ExternalFeedConnector()
@@ -46,6 +61,7 @@ class AgentService:
             exit_slippage_bps=settings.paper_exit_slippage_bps,
             fee_bps=settings.fee_bps,
         )
+        self.settings_store = SettingsStore(settings.db_path)
         # Seed the order-id counter from the DB so paper-order IDs remain
         # unique across daemon restarts (otherwise 000001 reappears every run).
         self.execution = ExecutionEngine(

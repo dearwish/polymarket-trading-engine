@@ -26,7 +26,9 @@ def _isolate_env_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture()
 def settings(tmp_path: Path) -> Settings:
-    return Settings(
+    from polymarket_ai_agent.engine.migrations import MigrationRunner
+
+    s = Settings(
         openrouter_api_key="",
         market_family="btc_5m",
         polymarket_private_key="",
@@ -37,6 +39,13 @@ def settings(tmp_path: Path) -> Settings:
         db_path=tmp_path / "data" / "agent.db",
         events_path=tmp_path / "logs" / "events.jsonl",
     )
+    # Schema is owned by the migrations framework; every engine that touches
+    # the DB now assumes tables exist. Run migrations here so any test using
+    # this fixture sees the full schema (incl. settings_changes seeded with
+    # the baseline).
+    s.db_path.parent.mkdir(parents=True, exist_ok=True)
+    MigrationRunner(s.db_path).run()
+    return s
 
 
 @pytest.fixture()

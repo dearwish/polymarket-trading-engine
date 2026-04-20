@@ -558,7 +558,21 @@ def main() -> None:
         default=0.0,
         help="Additive US-session bias for retro-shadow (default: 0.0)",
     )
+    parser.add_argument(
+        "--settings-timeline",
+        action="store_true",
+        help="Print chronological settings_changes from the DB and exit",
+    )
+    parser.add_argument(
+        "--db",
+        default="data/agent.db",
+        help="Path to the soak DB for --settings-timeline (default: data/agent.db)",
+    )
     args = parser.parse_args()
+
+    if args.settings_timeline:
+        _print_settings_timeline(Path(args.db))
+        return
 
     events_path = Path(args.events)
     if not events_path.exists():
@@ -587,6 +601,53 @@ def main() -> None:
         closed_positions=closed_positions,
         hold_to_expiry=args.hold_to_expiry,
     )
+
+
+def _print_settings_timeline(db_path: Path) -> None:
+    """Print the full contents of ``settings_changes`` from ``db_path``.
+
+    Queries the DB directly (not via ``SettingsStore``) so this script stays
+    usable against a backup DB without importing the rest of the package.
+    Backup DBs are the intended A/B-analysis artefact — being able to point
+    this at any ``agent.db`` snapshot is the whole reason the history table
+    exists.
+    """
+    import sqlite3
+
+    if not db_path.exists():
+        print(f"DB not found: {db_path}", file=sys.stderr)
+        sys.exit(1)
+    conn = sqlite3.connect(db_path)
+    try:
+        try:
+            rows = conn.execute(
+                "SELECT id, changed_at, field, value_before, value_after, source, reason "
+                "FROM settings_changes ORDER BY id ASC"
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            print(f"Cannot read settings_changes from {db_path}: {exc}", file=sys.stderr)
+            sys.exit(1)
+    finally:
+        conn.close()
+    if not rows:
+        print(f"No settings_changes rows in {db_path}.")
+        return
+    print(f"\n=== Settings timeline ({db_path}) ===")
+    print(f"{'id':>5s}  {'changed_at':26s}  {'source':10s}  {'field':38s}  before → after  reason")
+    for row in rows:
+        id_, changed_at, field, before, after, source, reason = row
+        def _fmt(raw: Any) -> str:
+            if raw is None:
+                return "—"
+            try:
+                return json.dumps(json.loads(raw))
+            except (TypeError, json.JSONDecodeError):
+                return str(raw)
+        print(
+            f"{id_:>5d}  {str(changed_at):26s}  {str(source):10s}  "
+            f"{field:38s}  {_fmt(before)} → {_fmt(after)}  "
+            f"{reason or ''}"
+        )
 
 
 if __name__ == "__main__":

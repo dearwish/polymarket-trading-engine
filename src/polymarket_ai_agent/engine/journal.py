@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from polymarket_ai_agent.engine.db import configure_connection
+
 
 class Journal:
     def __init__(
@@ -157,20 +159,17 @@ class Journal:
         return [(str(row[0]), str(row[1]), str(row[2])) for row in rows]
 
     def _init_db(self) -> None:
-        with closing(sqlite3.connect(self.db_path)) as conn, conn:
-            conn.execute("pragma journal_mode = WAL")
-            conn.execute("pragma synchronous = NORMAL")
-            conn.execute(
-                """
-                create table if not exists reports (
-                    session_id text not null,
-                    summary text not null,
-                    created_at text not null
+        # Schema owned by migrations; here we only apply pragmas and verify.
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            configure_connection(conn)
+            row = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='reports'"
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(
+                    "Journal: `reports` table missing. "
+                    "Run MigrationRunner before constructing the Journal."
                 )
-                """
-            )
-            conn.execute("create index if not exists reports_created_at_idx on reports(created_at)")
-            conn.commit()
 
     def _normalize(self, payload: Any) -> Any:
         if is_dataclass(payload):

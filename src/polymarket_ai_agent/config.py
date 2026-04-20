@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-import json
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +36,10 @@ class Settings(BaseSettings):
     ws_ssl_verify: bool = True
     daemon_discovery_interval_seconds: int = 60
     daemon_decision_min_interval_seconds: float = 1.0
+    # How often the daemon polls settings_changes.id for operator overrides.
+    # 2s matches human-perceived "instant" and mirrors the other interval
+    # loops; see DaemonRunner._settings_reload_loop.
+    daemon_settings_reload_interval_seconds: float = 2.0
     # When True the daemon auto-executes APPROVED decisions as paper trades.
     # Positions are recorded in the portfolio so the dashboard / report paths
     # fill in without any separate CLI invocation. Safe by default (opt-in).
@@ -210,15 +213,26 @@ class Settings(BaseSettings):
 
 
 EDITABLE_SETTINGS_METADATA: dict[str, dict[str, Any]] = {
-    "trading_mode": {"label": "Mode", "type": "select", "options": ["paper", "live"], "group": "runtime"},
+    # Every field here must also appear in INITIAL_SETTINGS_BASELINE — enforced
+    # by tests/test_initial_settings.py. Fields marked requires_restart=True
+    # are still editable via the API/CLI but the daemon's reload loop surfaces
+    # the flag to the operator instead of hot-swapping them.
+    "trading_mode": {"label": "Mode", "type": "select", "options": ["paper", "live"], "group": "runtime", "requires_restart": True},
     "market_family": {
         "label": "Market Family",
         "type": "select",
         "options": ["btc_1h", "btc_15m", "btc_5m", "btc_daily_threshold"],
         "group": "runtime",
+        "requires_restart": True,
     },
     "loop_seconds": {"label": "Loop Seconds", "type": "number", "min": 1, "max": 300, "step": 1, "group": "runtime"},
     "openrouter_model": {"label": "OpenRouter Model", "type": "text", "group": "runtime"},
+    "daemon_auto_paper_execute": {
+        "label": "Daemon Auto Paper Execute",
+        "type": "boolean",
+        "group": "runtime",
+        "requires_restart": True,
+    },
     "live_trading_enabled": {"label": "Live Trading Enabled", "type": "boolean", "group": "live"},
     "live_order_type": {"label": "Live Order Type", "type": "select", "options": ["FOK", "GTC"], "group": "live"},
     "live_post_only": {"label": "Live Post Only", "type": "boolean", "group": "live"},
@@ -241,6 +255,7 @@ EDITABLE_SETTINGS_METADATA: dict[str, dict[str, Any]] = {
         "max": 1000000,
         "step": 1,
         "group": "paper",
+        "requires_restart": True,
     },
     "paper_position_ttl_seconds": {
         "label": "Paper Position TTL Seconds",
@@ -335,7 +350,58 @@ EDITABLE_SETTINGS_METADATA: dict[str, dict[str, Any]] = {
         "step": 1,
         "group": "thresholds",
     },
+    "min_candle_elapsed_seconds": {
+        "label": "Min Candle Elapsed Seconds",
+        "type": "number",
+        "min": 0,
+        "max": 3600,
+        "step": 1,
+        "group": "thresholds",
+    },
+    "max_candle_elapsed_seconds": {
+        "label": "Max Candle Elapsed Seconds",
+        "type": "number",
+        "min": 0,
+        "max": 3600,
+        "step": 1,
+        "group": "thresholds",
+    },
+    "fee_bps": {
+        "label": "Fee BPS",
+        "type": "number",
+        "min": 0,
+        "max": 10000,
+        "step": 0.1,
+        "group": "paper",
+    },
+    # Quant scorer gates
+    "quant_invert_drift": {"label": "Invert Drift", "type": "boolean", "group": "thresholds"},
+    "quant_max_abs_edge": {"label": "Max |Edge| Ceiling", "type": "number", "min": 0, "max": 1, "step": 0.01, "group": "thresholds"},
+    "quant_trend_filter_enabled": {"label": "Trend Filter Enabled", "type": "boolean", "group": "thresholds"},
+    "quant_trend_filter_min_abs_return": {"label": "Trend Filter Min |Return|", "type": "number", "min": 0, "max": 0.1, "step": 0.0005, "group": "thresholds"},
+    "quant_trend_opposed_strong_min_edge": {"label": "Counter-Trend Min Edge (4h)", "type": "number", "min": 0, "max": 1, "step": 0.01, "group": "thresholds"},
+    "quant_trend_opposed_weak_min_edge": {"label": "Counter-Trend Min Edge (1h)", "type": "number", "min": 0, "max": 1, "step": 0.01, "group": "thresholds"},
+    "quant_trend_distressed_max_ask": {"label": "Distressed Max Ask", "type": "number", "min": 0, "max": 1, "step": 0.01, "group": "thresholds"},
+    "quant_min_entry_price": {"label": "Min Entry Price", "type": "number", "min": 0, "max": 1, "step": 0.01, "group": "thresholds"},
+    "quant_ofi_gate_enabled": {"label": "OFI Gate Enabled", "type": "boolean", "group": "thresholds"},
+    "quant_ofi_gate_min_abs_flow": {"label": "OFI Gate Min |Flow|", "type": "number", "min": 0, "max": 10000, "step": 1, "group": "thresholds"},
+    "quant_vol_regime_enabled": {"label": "Vol Regime Enabled", "type": "boolean", "group": "thresholds"},
+    "quant_vol_regime_high_threshold": {"label": "Vol Regime High Threshold", "type": "number", "min": 0, "max": 1, "step": 0.0005, "group": "thresholds"},
+    "quant_vol_regime_extreme_threshold": {"label": "Vol Regime Extreme Threshold", "type": "number", "min": 0, "max": 1, "step": 0.0005, "group": "thresholds"},
+    "quant_vol_regime_high_min_edge": {"label": "Vol Regime High Min Edge", "type": "number", "min": 0, "max": 1, "step": 0.01, "group": "thresholds"},
+    "quant_shadow_variant": {"label": "Shadow Variant", "type": "text", "group": "thresholds"},
+    "quant_shadow_htf_tilt_strength": {"label": "Shadow HTF Tilt Strength", "type": "number", "min": 0, "max": 1, "step": 0.01, "group": "thresholds"},
+    "quant_shadow_session_bias_eu": {"label": "Shadow Session Bias (EU)", "type": "number", "min": -1, "max": 1, "step": 0.01, "group": "thresholds"},
+    "quant_shadow_session_bias_us": {"label": "Shadow Session Bias (US)", "type": "number", "min": -1, "max": 1, "step": 0.01, "group": "thresholds"},
 }
+
+# Mark fields requires_restart=True on their metadata entries above. Mirrors
+# initial_settings.REQUIRES_RESTART so callers that touch config.py don't
+# have to import two modules.
+REQUIRES_RESTART_FIELDS: frozenset[str] = frozenset(
+    key for key, meta in EDITABLE_SETTINGS_METADATA.items() if meta.get("requires_restart")
+)
+
 
 
 # Cache Settings, but invalidate when .env changes so a live edit (e.g. MARKET_FAMILY)
@@ -367,31 +433,56 @@ def get_settings() -> Settings:
     return settings
 
 
+def _settings_store_for(settings: Settings):
+    # Local import avoids a config ↔ engine cycle at module import time.
+    from polymarket_ai_agent.engine.settings_store import SettingsStore
+
+    return SettingsStore(settings.db_path)
+
+
 def load_runtime_overrides(settings: Settings) -> dict[str, Any]:
-    path = settings.runtime_settings_path
-    if not path.exists():
-        return {}
+    """Return the editable-field overrides currently in the DB.
+
+    Filtered through ``EDITABLE_SETTINGS_METADATA`` so stray rows for fields
+    that have since been removed from the whitelist don't leak into the
+    effective settings. Safe to call before the DB has been initialised;
+    returns ``{}`` if the table doesn't exist yet.
+    """
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+        overrides = _settings_store_for(settings).current_overrides()
+    except Exception:
+        # DB not yet migrated (table missing) or unreadable — treat as no
+        # overrides and let the caller fall back to code defaults.
         return {}
-    if not isinstance(raw, dict):
-        return {}
-    return {key: value for key, value in raw.items() if key in EDITABLE_SETTINGS_METADATA}
+    return {key: value for key, value in overrides.items() if key in EDITABLE_SETTINGS_METADATA}
 
 
 def save_runtime_overrides(settings: Settings, updates: dict[str, Any]) -> dict[str, Any]:
+    """Persist ``updates`` as new ``settings_changes`` rows and return the
+    materialised effective overrides after the write.
+
+    Only fields that (a) appear in ``EDITABLE_SETTINGS_METADATA`` and (b)
+    differ from the current effective value are recorded — idempotent writes
+    don't pollute the audit trail.
+    """
     editable_updates = {key: value for key, value in updates.items() if key in EDITABLE_SETTINGS_METADATA}
-    merged = {**load_runtime_overrides(settings), **editable_updates}
-    candidate = Settings.model_validate({**settings.model_dump(), **merged})
-    clean_overrides = {
-        key: getattr(candidate, key)
-        for key in EDITABLE_SETTINGS_METADATA
-        if key in merged and getattr(candidate, key) != getattr(settings, key)
-    }
-    settings.runtime_settings_path.parent.mkdir(parents=True, exist_ok=True)
-    settings.runtime_settings_path.write_text(json.dumps(clean_overrides, indent=2, sort_keys=True), encoding="utf-8")
-    return clean_overrides
+    if not editable_updates:
+        return load_runtime_overrides(settings)
+    # Validate via pydantic so string→int/bool coercion matches the Settings
+    # class — keeps the DB clean of weird string "true" values where bools
+    # are expected.
+    current_overrides = load_runtime_overrides(settings)
+    candidate = Settings.model_validate({**settings.model_dump(), **current_overrides, **editable_updates})
+    effective_now = Settings.model_validate({**settings.model_dump(), **current_overrides})
+    changes: list[tuple[str, Any, Any]] = []
+    for key in editable_updates:
+        new_value = getattr(candidate, key)
+        old_value = getattr(effective_now, key)
+        if new_value != old_value:
+            changes.append((key, old_value, new_value))
+    if changes:
+        _settings_store_for(settings).record_changes(changes, source="api")
+    return load_runtime_overrides(settings)
 
 
 def get_effective_settings() -> Settings:
@@ -406,6 +497,29 @@ def get_effective_settings() -> Settings:
     effective.events_path.parent.mkdir(parents=True, exist_ok=True)
     effective.runtime_settings_path.parent.mkdir(parents=True, exist_ok=True)
     return effective
+
+
+def diff_editable(old: Settings, new: Settings) -> dict[str, dict[str, Any]]:
+    """Return ``{field: {'before': old_value, 'after': new_value}}`` for every
+    editable field whose value changed between ``old`` and ``new``.
+
+    Used by the daemon reload loop to emit precise ``settings_changed``
+    journal events and by the API handler to skip no-op writes.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for field in EDITABLE_SETTINGS_METADATA:
+        before = getattr(old, field, None)
+        after = getattr(new, field, None)
+        if before != after:
+            out[field] = {"before": before, "after": after}
+    return out
+
+
+def editable_values_snapshot(settings: Settings) -> dict[str, Any]:
+    """Flat ``{field: value}`` snapshot of every editable field — the shape the
+    daemon emits on startup as the baseline for audit segmentation.
+    """
+    return {field: getattr(settings, field, None) for field in EDITABLE_SETTINGS_METADATA}
 
 
 def runtime_settings_payload(settings: Settings) -> dict[str, Any]:

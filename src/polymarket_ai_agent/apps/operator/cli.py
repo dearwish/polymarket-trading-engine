@@ -503,9 +503,16 @@ def daemon(
 ) -> None:
     """Run the event-driven market-data daemon (Phase 1: read-only feeds)."""
     try:
-        settings = get_settings()
-        service = AgentService(settings)
-        run_daemon(settings, service, duration_seconds=duration_seconds or None)
+        # AgentService runs migrations on construction; re-resolve effective
+        # settings (.env + DB overrides) AFTER that so baseline rows written
+        # during migration are visible, then rebuild the service on the
+        # effective settings so all engines see the same coherent config.
+        from polymarket_ai_agent.config import get_effective_settings
+
+        service = AgentService(get_settings())
+        effective = get_effective_settings()
+        service = AgentService(effective)
+        run_daemon(effective, service, duration_seconds=duration_seconds or None)
     except Exception as exc:
         _handle_operator_error(exc)
 
@@ -619,6 +626,140 @@ def simulate_loop(
                     "stop_reason": stop_reason,
                     "cycles": cycles,
                 }
+            )
+        )
+    except Exception as exc:
+        _handle_operator_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# settings — DB-backed runtime-override management
+#
+# Every ``set`` lands as an append-only row in ``settings_changes``; the
+# running daemon's reload loop picks it up within ``daemon_settings_reload
+# _interval_seconds`` (default 2 s) and the change flows to every engine.
+# ---------------------------------------------------------------------------
+
+settings_app = typer.Typer(help="Inspect and modify runtime settings stored in the DB.")
+app.add_typer(settings_app, name="settings")
+
+
+def _coerce_setting_value(raw: str) -> object:
+    """Interpret ``raw`` as a JSON literal when possible (numbers, bools,
+    ``null``, quoted strings), otherwise return the bare string.
+
+    ``settings set min_edge 0.05`` → float 0.05.
+    ``settings set paper_tp_ladder 0.30:0.5`` → string (not valid JSON).
+    ``settings set live_trading_enabled true`` → boolean True.
+    """
+    try:
+        return json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return raw
+
+
+@settings_app.command("list")
+def settings_list() -> None:
+    """Print every editable field with its current effective value."""
+    try:
+        from polymarket_ai_agent.config import editable_values_snapshot
+
+        service = _service()
+        # editable_values_snapshot reads from ``self.settings`` which, at
+        # service init, already layers the DB overrides over the env defaults.
+        console.print_json(json.dumps({"values": editable_values_snapshot(service.settings)}))
+    except Exception as exc:
+        _handle_operator_error(exc)
+
+
+@settings_app.command("get")
+def settings_get(field: str = typer.Argument(..., help="Setting field name.")) -> None:
+    """Print the current effective value of a single field."""
+    try:
+        service = _service()
+        value = service.settings_store.current_overrides().get(field)
+        if value is None:
+            value = getattr(service.settings, field, None)
+        console.print_json(json.dumps({"field": field, "value": value}))
+    except Exception as exc:
+        _handle_operator_error(exc)
+
+
+@settings_app.command("set")
+def settings_set(
+    field: str = typer.Argument(..., help="Setting field name."),
+    value: str = typer.Argument(..., help="New value (JSON-encoded: numbers, true/false, strings)."),
+    reason: str = typer.Option("", "--reason", help="Free-text note stored alongside the change."),
+) -> None:
+    """Write a new override to ``settings_changes``.
+
+    The daemon reload loop picks this up automatically; no restart needed
+    unless the field is flagged ``requires_restart`` in
+    ``EDITABLE_SETTINGS_METADATA``.
+    """
+    try:
+        from polymarket_ai_agent.config import EDITABLE_SETTINGS_METADATA, save_runtime_overrides
+
+        if field not in EDITABLE_SETTINGS_METADATA:
+            console.print(f"[red]Unknown editable field: {field}[/red]")
+            raise typer.Exit(code=1)
+        service = _service()
+        coerced = _coerce_setting_value(value)
+        last_id_before = service.settings_store.get_max_id()
+        save_runtime_overrides(service.settings, {field: coerced})
+        new_ids = [r.id for r in service.settings_store.list_changes(since_id=last_id_before)]
+        # Attach the reason to the just-inserted row(s). Cheap: one UPDATE.
+        if reason and new_ids:
+            import sqlite3
+
+            with sqlite3.connect(service.settings.db_path) as conn:
+                conn.executemany(
+                    "UPDATE settings_changes SET reason = ? WHERE id = ?",
+                    [(reason, rid) for rid in new_ids],
+                )
+                conn.commit()
+        meta = EDITABLE_SETTINGS_METADATA[field]
+        requires_restart = bool(meta.get("requires_restart"))
+        console.print_json(
+            json.dumps(
+                {
+                    "field": field,
+                    "value": coerced,
+                    "row_ids": new_ids,
+                    "requires_restart": requires_restart,
+                }
+            )
+        )
+    except Exception as exc:
+        _handle_operator_error(exc)
+
+
+@settings_app.command("history")
+def settings_history(
+    field: str = typer.Option("", "--field", help="Filter by field name."),
+    limit: int = typer.Option(50, "--limit", min=1, max=1000),
+) -> None:
+    """Print the change history (most recent last)."""
+    try:
+        service = _service()
+        rows = service.settings_store.list_timeline()
+        if field:
+            rows = [r for r in rows if r.field == field]
+        rows = rows[-limit:]
+        console.print_json(
+            json.dumps(
+                [
+                    {
+                        "id": r.id,
+                        "changed_at": r.changed_at,
+                        "field": r.field,
+                        "before": r.value_before,
+                        "after": r.value_after,
+                        "source": r.source,
+                        "reason": r.reason,
+                    }
+                    for r in rows
+                ]
             )
         )
     except Exception as exc:

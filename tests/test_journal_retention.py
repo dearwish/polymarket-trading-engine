@@ -4,11 +4,16 @@ import json
 from pathlib import Path
 
 from polymarket_ai_agent.engine.journal import Journal
+from polymarket_ai_agent.engine.migrations import MigrationRunner
 
 
 def _journal(tmp_path: Path, **kwargs) -> Journal:
+    db_path = tmp_path / "agent.db"
+    # Schema now lives in the migrations framework — run them before any
+    # engine that touches the DB is constructed.
+    MigrationRunner(db_path).run()
     return Journal(
-        db_path=tmp_path / "agent.db",
+        db_path=db_path,
         events_path=tmp_path / "events.jsonl",
         **kwargs,
     )
@@ -30,6 +35,7 @@ def test_read_recent_events_handles_huge_files_via_tail_read(tmp_path: Path) -> 
     with events_path.open("w") as handle:
         for i in range(20_000):
             handle.write(json.dumps({"event_type": "noise", "logged_at": "x", "payload": {"i": i}}) + "\n")
+    MigrationRunner(tmp_path / "agent.db").run()
     j = Journal(db_path=tmp_path / "agent.db", events_path=events_path)
     tail = j.read_recent_events(limit=3)
     assert [event["payload"]["i"] for event in tail] == [19_997, 19_998, 19_999]

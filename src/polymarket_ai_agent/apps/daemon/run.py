@@ -8,7 +8,13 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Protocol
 
 from polymarket_ai_agent.apps.daemon.heartbeat import HeartbeatWriter
-from polymarket_ai_agent.config import Settings
+from polymarket_ai_agent.config import (
+    EDITABLE_SETTINGS_METADATA,
+    Settings,
+    diff_editable,
+    editable_values_snapshot,
+    get_effective_settings,
+)
 from polymarket_ai_agent.connectors.binance_ws import BinanceBtcFeed, BtcTick
 from polymarket_ai_agent.connectors.polymarket_ws import MarketStreamEvent, PolymarketMarketStream
 from polymarket_ai_agent.engine.btc_state import BtcSnapshot, BtcState
@@ -188,6 +194,14 @@ class DaemonRunner:
         # Last close timestamp per market, used to enforce an entry cooldown
         # that blocks whipsaw re-entries on the same market. In-memory only.
         self._last_close_at: dict[str, datetime] = {}
+        # Cursor into settings_changes for the reload loop. Set to the table's
+        # MAX(id) at startup so the loop only reacts to *subsequent* changes;
+        # the baseline seed that landed during migration isn't replayed as a
+        # "settings_changed" event.
+        try:
+            self._last_settings_id: int = self.service.settings_store.get_max_id()
+        except Exception:  # noqa: BLE001 — DB may not exist in unit tests
+            self._last_settings_id = 0
 
     @property
     def active_asset_ids(self) -> list[str]:
@@ -202,10 +216,15 @@ class DaemonRunner:
 
     async def run(self, stop_event: asyncio.Event | None = None) -> None:
         self._stop_event = stop_event or asyncio.Event()
+        # Emit the baseline snapshot + migration record BEFORE starting other
+        # loops so analyze_soak always has a "state-at-t0" reference point
+        # that precedes every trade_decision / daemon_tick event.
+        await self._emit_startup_settings_events()
         discovery_task = asyncio.create_task(self._discovery_loop(self._stop_event))
         btc_task = asyncio.create_task(self._btc_loop(self._stop_event))
         heartbeat_task = asyncio.create_task(self._heartbeat_loop(self._stop_event))
         maintenance_task = asyncio.create_task(self._maintenance_loop(self._stop_event))
+        reload_task = asyncio.create_task(self._settings_reload_loop(self._stop_event))
         try:
             await self._stop_event.wait()
         finally:
@@ -215,6 +234,7 @@ class DaemonRunner:
                     btc_task,
                     heartbeat_task,
                     maintenance_task,
+                    reload_task,
                     self._market_subscriber_task,
                 ]
             )
@@ -526,6 +546,14 @@ class DaemonRunner:
         """
         await self._default_decision_callback(context)
 
+        # Pin a single Settings snapshot for this callback — the reload loop
+        # can swap self.settings at any moment, and we want every field read
+        # below (ladder / trail / TP / SL / force-exit / cooldown / candle
+        # window) to reflect the same coherent config. Without this pin a
+        # reload between line 608 and 609 could mix old trail_pct with new
+        # arm_pct for one tick.
+        settings = self.settings
+
         market_id = context.market_id
         candidate = context.candidate
         features = context.features
@@ -605,8 +633,8 @@ class DaemonRunner:
                 # at entry: a freshly-armed trail with arm_pct < trail_pct / (1 -
                 # trail_pct) would otherwise place its floor below entry and
                 # could fire as a realised loss on the first pullback.
-                trail_pct = float(self.settings.paper_trailing_stop_pct)
-                arm_pct = float(self.settings.paper_trail_arm_pct)
+                trail_pct = float(settings.paper_trailing_stop_pct)
+                arm_pct = float(settings.paper_trail_arm_pct)
                 peak = extras["peak_price"]
                 arm_threshold = entry_price * (1.0 + arm_pct)
                 trail_armed = peak >= arm_threshold
@@ -626,8 +654,8 @@ class DaemonRunner:
                 # So fixed TP only applies when NO tranche has fired yet (either
                 # no ladder configured, or ladder hasn't hit its first threshold
                 # yet). Stop-loss still applies unconditionally as a safety floor.
-                tp_pct = float(self.settings.paper_take_profit_pct)
-                sl_pct = float(self.settings.paper_stop_loss_pct)
+                tp_pct = float(settings.paper_take_profit_pct)
+                sl_pct = float(settings.paper_stop_loss_pct)
                 ladder_has_fired = int(extras["tranches_closed"]) > 0
                 close_reason: str | None = None
                 if tp_pct > 0.0 and not ladder_has_fired and pnl_pct >= tp_pct:
@@ -647,7 +675,7 @@ class DaemonRunner:
             # the trailing stop tends to fire on spread widening rather than
             # real adverse moves. Kicks in strictly before the exit buffer so
             # the two don't race; exit buffer is kept as a safety floor.
-            force_tte = int(self.settings.position_force_exit_tte_seconds)
+            force_tte = int(settings.position_force_exit_tte_seconds)
             if force_tte > 0 and tte_seconds <= force_tte and current_price > 0.0:
                 exit_price_walk = self._paper_exit_fill(
                     market_id, open_pos.side, float(open_pos.size_usd), float(current_price)
@@ -670,7 +698,7 @@ class DaemonRunner:
         self._position_extras.pop(market_id, None)
 
         # Enforce entry cooldown after a recent close on this market.
-        cooldown_seconds = int(self.settings.paper_entry_cooldown_seconds)
+        cooldown_seconds = int(settings.paper_entry_cooldown_seconds)
         if cooldown_seconds > 0:
             last_close = self._last_close_at.get(market_id)
             if last_close is not None:
@@ -681,13 +709,13 @@ class DaemonRunner:
         # Block entry until enough of the candle has elapsed for the drift
         # signal (btc_log_return_since_candle_open) to carry real information.
         # Skipped for threshold markets where time_elapsed_in_candle_s is 0.
-        family_window = _FAMILY_WINDOW_SECONDS.get(self.settings.market_family, 0)
+        family_window = _FAMILY_WINDOW_SECONDS.get(settings.market_family, 0)
         if family_window > 0:
             candle_elapsed = context.packet.time_elapsed_in_candle_s if context.packet else 0
-            min_elapsed = int(self.settings.min_candle_elapsed_seconds)
+            min_elapsed = int(settings.min_candle_elapsed_seconds)
             if min_elapsed > 0 and candle_elapsed < min_elapsed:
                 return
-            max_elapsed = int(self.settings.max_candle_elapsed_seconds)
+            max_elapsed = int(settings.max_candle_elapsed_seconds)
             if max_elapsed > 0 and candle_elapsed > max_elapsed:
                 return
 
@@ -899,6 +927,129 @@ class DaemonRunner:
                 await asyncio.wait_for(stop_event.wait(), timeout=interval)
             except asyncio.TimeoutError:
                 continue
+
+    async def _emit_startup_settings_events(self) -> None:
+        """Journal the list of migrations applied on this boot plus a
+        snapshot of every editable-field value.
+
+        Downstream tooling (analyze_soak.py, the event log viewer) keys off
+        these two events to establish the pre-change baseline for any
+        settings_changed event that appears later in the same log.
+        """
+        try:
+            applied = getattr(self.service, "migrations_applied", []) or []
+            if applied:
+                await asyncio.to_thread(
+                    self.service.journal.log_event,
+                    "migrations_applied",
+                    {"applied": [m.name for m in applied]},
+                )
+            await asyncio.to_thread(
+                self.service.journal.log_event,
+                "settings_snapshot",
+                {"source": "startup", "values": editable_values_snapshot(self.settings)},
+            )
+        except Exception as exc:  # noqa: BLE001 — never block daemon start
+            logger.warning("failed to emit startup settings events: %s", exc)
+
+    async def _settings_reload_loop(self, stop_event: asyncio.Event) -> None:
+        """Poll ``settings_changes.MAX(id)``; on advance, rebind engines and
+        journal a ``settings_changed`` event with the before/after diff.
+
+        Cheap in the steady state: a single indexed ``MAX(id)`` query per
+        tick. The rebind happens on the same task as the poll so no
+        cross-task coordination on ``self.settings`` is needed — readers on
+        other tasks either see the old object or the new one, never a
+        partial state.
+        """
+        interval = max(0.2, float(self.settings.daemon_settings_reload_interval_seconds))
+        while not stop_event.is_set():
+            try:
+                await asyncio.to_thread(self._maybe_reload_settings)
+            except Exception as exc:  # noqa: BLE001 — keep the loop alive
+                logger.warning("settings reload tick failed: %s", exc)
+                try:
+                    await asyncio.to_thread(
+                        self.service.journal.log_event,
+                        "settings_reload_failed",
+                        {"error": str(exc), "last_seen_id": self._last_settings_id},
+                    )
+                except Exception:
+                    pass
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                continue
+
+    def _maybe_reload_settings(self) -> None:
+        """Synchronous body of ``_settings_reload_loop`` — safe to run from
+        ``asyncio.to_thread`` since every step (``get_max_id``,
+        ``list_changes``, ``get_effective_settings``, engine rebind) is
+        pure Python / SQLite.
+        """
+        store = self.service.settings_store
+        current_max = store.get_max_id()
+        if current_max <= self._last_settings_id:
+            return
+        new_rows = store.list_changes(since_id=self._last_settings_id)
+        if not new_rows:
+            self._last_settings_id = current_max
+            return
+        new_settings = get_effective_settings()
+        diff = diff_editable(self.settings, new_settings)
+        # Even if ``diff`` is empty (e.g. a row that merely re-wrote the
+        # existing value), advance the cursor so we don't keep re-reading
+        # the same row. A ``settings_changed`` event is still emitted so
+        # the audit trail matches the DB rows.
+        changed_fields = list(diff.keys()) or [r.field for r in new_rows]
+        requires_restart = sorted(
+            f for f in changed_fields
+            if EDITABLE_SETTINGS_METADATA.get(f, {}).get("requires_restart")
+        )
+        source_sources = sorted({r.source for r in new_rows})
+        payload = {
+            "source": ",".join(source_sources),
+            "row_ids": [r.id for r in new_rows],
+            "changed": diff,
+            "requires_restart": requires_restart,
+        }
+        try:
+            self.service.journal.log_event("settings_changed", payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("settings_changed journal emit failed: %s", exc)
+        self._apply_settings(new_settings)
+        self._last_settings_id = current_max
+
+    def _apply_settings(self, new_settings: Settings) -> None:
+        """Rebind every place a live reference to ``Settings`` is held.
+
+        Fields copied out at engine init (``paper_entry_slippage_bps``,
+        ``live_trading_enabled``) are refreshed via the engine's ``refresh()``
+        hooks. Cached derived state (``_tp_ladder``, the ``RiskProfile``) is
+        recomputed here.
+
+        Fields flagged ``requires_restart=True`` still get rebound on the
+        Settings object so operators can see the new value reflected in
+        ``/api/settings``, but the engines keep running on whatever callback
+        / balance / market_family they were built with until the next restart.
+        The ``settings_changed`` event's ``requires_restart`` list surfaces
+        this to the operator.
+        """
+        self.settings = new_settings
+        self.quant.settings = new_settings
+        self._tp_ladder = self._parse_tp_ladder(new_settings.paper_tp_ladder)
+        # RiskEngine caches a RiskProfile derived from settings.
+        try:
+            self.service.risk.settings = new_settings
+            self.service.risk.refresh_profile()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("risk.refresh_profile failed: %s", exc)
+        # ExecutionEngine copies slippage / live_trading_enabled at init.
+        try:
+            self.service.execution.settings = new_settings
+            self.service.execution.refresh()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("execution.refresh failed: %s", exc)
 
     async def _maintenance_loop(self, stop_event: asyncio.Event) -> None:
         """Periodic retention + WAL checkpoint + VACUUM-lite upkeep.
