@@ -126,6 +126,9 @@ class RiskEngine:
         effective_buffer = self._effective_exit_buffer(snapshot.seconds_to_expiry)
         if snapshot.seconds_to_expiry <= effective_buffer:
             rejected_by.append("expiry_buffer")
+        min_tte = int(self.settings.min_entry_tte_seconds)
+        if min_tte > 0 and snapshot.seconds_to_expiry < min_tte:
+            rejected_by.append("min_entry_tte")
         if assessment.confidence < self.settings.min_confidence:
             rejected_by.append("confidence_limit")
         if abs(assessment.edge) < profile.min_edge:

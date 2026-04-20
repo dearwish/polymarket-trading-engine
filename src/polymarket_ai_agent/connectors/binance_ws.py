@@ -16,6 +16,9 @@ class BtcTick:
     price: float
     observed_at: datetime
     source: str  # "aggTrade" | "bookTicker" | "rest"
+    # aggTrade payloads carry the executed quantity (base-asset units). Other
+    # sources leave this at 0.0 — they don't correspond to a trade event.
+    quantity: float = 0.0
 
 
 def _utc_from_ms(ms: int | None) -> datetime:
@@ -99,6 +102,83 @@ class BinanceBtcFeed:
         except (httpx.HTTPError, ValueError, TypeError):
             return None
 
+    # Binance /api/v3/klines caps per-call results at 1000 rows. For 1440 × 1m
+    # bars (24 h) we need pagination via the `endTime` parameter.
+    _BINANCE_KLINES_MAX_PER_CALL = 1000
+
+    def rest_klines(
+        self,
+        interval: str = "1m",
+        limit: int = 1440,
+        base_url: str = "https://api.binance.com/api/v3/klines",
+    ) -> list[tuple[datetime, float, float]]:
+        """Fetch historical kline bars as a list of ``(open_time, close, volume)``.
+
+        Used once at daemon startup to seed the minute-bar buffer for HTF
+        indicators (log-return over 1h / 4h / 24h, later RSI / EMA / VWAP).
+        Paginates automatically when ``limit`` exceeds Binance's per-call cap
+        of 1000 rows. On any failure we return whatever was fetched so far
+        (possibly ``[]``) rather than raising — HTF features emit their
+        defaults until enough bars accumulate.
+        """
+        remaining = max(1, int(limit))
+        end_time_ms: int | None = None
+        gathered: list[tuple[datetime, float, float]] = []
+        while remaining > 0:
+            page_limit = min(remaining, self._BINANCE_KLINES_MAX_PER_CALL)
+            page = self._rest_klines_once(interval, page_limit, base_url, end_time_ms)
+            if not page:
+                break
+            # Prepend so the final list is chronologically ascending and
+            # contiguous even across pages.
+            gathered = page + gathered
+            remaining -= len(page)
+            # Page back: next endTime is one ms before the earliest bar we got.
+            earliest_ms = int(page[0][0].timestamp() * 1000)
+            if end_time_ms is not None and earliest_ms >= end_time_ms:
+                break  # defensive — shouldn't happen, avoids infinite loop
+            end_time_ms = earliest_ms - 1
+            if len(page) < page_limit:
+                break  # source exhausted
+        return gathered
+
+    def _rest_klines_once(
+        self,
+        interval: str,
+        limit: int,
+        base_url: str,
+        end_time_ms: int | None,
+    ) -> list[tuple[datetime, float, float]]:
+        params: dict[str, str | int] = {
+            "symbol": self._symbol.upper(),
+            "interval": interval,
+            "limit": max(1, min(self._BINANCE_KLINES_MAX_PER_CALL, int(limit))),
+        }
+        if end_time_ms is not None:
+            params["endTime"] = end_time_ms
+        try:
+            response = self._http_client.get(base_url, params=params)
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.HTTPError, ValueError, TypeError):
+            return []
+        if not isinstance(payload, list):
+            return []
+        bars: list[tuple[datetime, float, float]] = []
+        for row in payload:
+            if not isinstance(row, list) or len(row) < 6:
+                continue
+            try:
+                open_time_ms = int(row[0])
+                close = float(row[4])
+                volume = float(row[5])
+            except (TypeError, ValueError):
+                continue
+            if close <= 0.0 or volume < 0.0:
+                continue
+            bars.append((_utc_from_ms(open_time_ms), close, volume))
+        return bars
+
     @staticmethod
     def parse_message(raw_message: Any) -> BtcTick | None:
         if isinstance(raw_message, (bytes, bytearray)):
@@ -116,16 +196,21 @@ class BinanceBtcFeed:
         if not isinstance(data, dict):
             return None
         stream = str(envelope.get("stream") or "") if isinstance(envelope, dict) else ""
-        # aggTrade payload: {"e":"aggTrade","p":"<price>","T":<trade_time_ms>,...}
+        # aggTrade payload: {"e":"aggTrade","p":"<price>","q":"<qty>","T":<trade_time_ms>,...}
         if (data.get("e") == "aggTrade" or stream.endswith("@aggTrade")) and "p" in data:
             try:
                 price = float(data["p"])
             except (TypeError, ValueError):
                 return None
+            try:
+                quantity = float(data.get("q") or 0.0)
+            except (TypeError, ValueError):
+                quantity = 0.0
             return BtcTick(
                 price=price,
                 observed_at=_utc_from_ms(data.get("T") or data.get("E")),
                 source="aggTrade",
+                quantity=max(0.0, quantity),
             )
         # bookTicker payload: {"u":..., "s":"BTCUSDT", "b":"<bid>", "a":"<ask>", ...}
         if ("b" in data and "a" in data) or stream.endswith("@bookTicker"):

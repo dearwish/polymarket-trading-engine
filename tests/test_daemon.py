@@ -98,8 +98,14 @@ def _settings(tmp_path: Path) -> Settings:
         db_path=tmp_path / "data" / "agent.db",
         events_path=tmp_path / "logs" / "events.jsonl",
         runtime_settings_path=tmp_path / "data" / "runtime_settings.json",
+        heartbeat_path=tmp_path / "data" / "daemon_heartbeat.json",
         daemon_discovery_interval_seconds=60,
         daemon_decision_min_interval_seconds=0.0,
+        # Pin experiment flags so live .env values don't bleed into tests.
+        min_candle_elapsed_seconds=0,
+        position_force_exit_tte_seconds=0,
+        min_entry_tte_seconds=0,
+        max_consecutive_losses=0,
     )
 
 
@@ -847,6 +853,61 @@ def test_paper_trail_arm_threshold_blocks_premature_trail_exit(tmp_path) -> None
     assert len(service.portfolio.list_open_positions()) == 1
 
 
+def test_paper_trail_floor_clamps_to_entry_when_arm_below_invariant(tmp_path) -> None:
+    """When arm_pct (5%) < trail_pct / (1 - trail_pct) (~8.7%), the unclamped
+    trail floor would sit below entry — a freshly-armed trail could fire as a
+    realised loss on the first pullback. Mirrors the production config that
+    fired a −7.4% trail on market 2013005.
+    """
+    from polymarket_ai_agent.apps.daemon.run import DecisionContext
+    from polymarket_ai_agent.engine.market_state import MarketState
+
+    runner, service, candidate, approved, btc = _setup_runner_with_open_yes_position(
+        tmp_path, entry_price=0.37, settings_overrides={
+            "paper_trailing_stop_pct": 0.08,
+            "paper_trail_arm_pct": 0.05,
+            "paper_exit_slippage_bps": 0.0,
+        },
+    )
+    # Entry fill is 0.38 × (1 + 10 bps) = 0.38038 — mirrors the live example.
+    # Push the peak to bid=0.40 so the arm threshold (0.38038 × 1.05 = 0.3994)
+    # clears and the trail arms. Unclamped floor would be 0.40 × 0.92 = 0.368,
+    # below entry.
+    state_peak = MarketState(market_id=candidate.market_id, yes_token_id="yes-tok", no_token_id="no-tok")
+    state_peak.apply_book_snapshot({
+        "asset_id": "yes-tok",
+        "bids": [{"price": "0.40", "size": "500"}],
+        "asks": [{"price": "0.42", "size": "500"}],
+    })
+    runner._market_states[candidate.market_id] = state_peak
+    ctx_peak = DecisionContext(
+        market_id=candidate.market_id, candidate=candidate,
+        features=state_peak.features(), btc_snapshot=btc, assessment=approved, metrics=runner.metrics,
+    )
+    asyncio.run(runner._paper_execute_decision_callback(ctx_peak))
+    assert len(service.portfolio.list_open_positions()) == 1
+
+    # Pull bid down to 0.37: below the (unclamped) peak × 0.92 = 0.368? No —
+    # 0.37 > 0.368, so the PRE-fix code would NOT have triggered here. With
+    # the entry clamp the floor is max(0.368, 0.38038) = 0.38038; 0.37 ≤ 0.38038
+    # → trail must fire.
+    state_drop = MarketState(market_id=candidate.market_id, yes_token_id="yes-tok", no_token_id="no-tok")
+    state_drop.apply_book_snapshot({
+        "asset_id": "yes-tok",
+        "bids": [{"price": "0.37", "size": "500"}],
+        "asks": [{"price": "0.39", "size": "500"}],
+    })
+    runner._market_states[candidate.market_id] = state_drop
+    ctx_drop = DecisionContext(
+        market_id=candidate.market_id, candidate=candidate,
+        features=state_drop.features(), btc_snapshot=btc, assessment=approved, metrics=runner.metrics,
+    )
+    asyncio.run(runner._paper_execute_decision_callback(ctx_drop))
+    assert service.portfolio.list_open_positions() == []
+    closed = service.portfolio.list_closed_positions(limit=1)
+    assert closed[0].close_reason == "paper_trailing_stop"
+
+
 def test_paper_entry_cooldown_blocks_immediate_reentry(tmp_path) -> None:
     from polymarket_ai_agent.apps.daemon.run import DecisionContext
     from polymarket_ai_agent.engine.market_state import MarketState
@@ -905,3 +966,107 @@ def test_agent_service_attributes_available() -> None:
     # daemon's expectations on the service API stay coupled to the production type.
     assert hasattr(AgentService, "discover_markets")
     assert "journal" in AgentService.__init__.__annotations__ or True
+
+
+def test_min_candle_elapsed_blocks_early_entry(tmp_path: Path) -> None:
+    """Entry must be blocked until time_elapsed_in_candle_s >= min_candle_elapsed_seconds.
+
+    Verifies that setting min_candle_elapsed_seconds=60 prevents a new position
+    from opening at t=30s, and allows one at t=90s — for a candle-style family.
+    """
+    from polymarket_ai_agent.apps.daemon.run import DecisionContext
+    from polymarket_ai_agent.engine.btc_state import BtcSnapshot
+    from polymarket_ai_agent.engine.market_state import MarketState
+    from polymarket_ai_agent.types import EvidencePacket, MarketAssessment, SuggestedSide
+
+    settings = _settings(tmp_path).model_copy(update={
+        "daemon_auto_paper_execute": True,
+        "market_family": "btc_15m",
+        "min_candle_elapsed_seconds": 60,
+        "max_position_usd": 10.0,
+        "min_confidence": 0.0,
+        "min_edge": 0.0,
+        "max_spread": 0.10,
+        "min_depth_usd": 0.0,
+        "stale_data_seconds": 3600,
+        "max_concurrent_positions": 5,
+    })
+    service = AgentService(settings)
+    candidate = _candidate("m-elapsed", "yes-tok", "no-tok")
+
+    runner = DaemonRunner(
+        settings=settings,
+        service=service,
+        config=DaemonConfig(market_family=settings.market_family),
+        market_stream_factory=lambda url: FakeMarketStream([]),  # type: ignore[arg-type]
+        btc_feed_factory=lambda: FakeBtcFeed([]),  # type: ignore[arg-type]
+    )
+    state = MarketState(market_id=candidate.market_id, yes_token_id="yes-tok", no_token_id="no-tok")
+    state.apply_book_snapshot({
+        "asset_id": "yes-tok",
+        "bids": [{"price": "0.40", "size": "500"}],
+        "asks": [{"price": "0.42", "size": "500"}],
+    })
+    runner._market_states[candidate.market_id] = state
+    runner._candidates[candidate.market_id] = candidate
+
+    approved = MarketAssessment(
+        market_id=candidate.market_id,
+        fair_probability=0.60,
+        confidence=0.80,
+        suggested_side=SuggestedSide.YES,
+        expiry_risk="LOW",
+        reasons_for_trade=["test"],
+        reasons_to_abstain=[],
+        edge=0.15,
+        raw_model_output="unit-test",
+        edge_yes=0.15,
+        edge_no=-0.17,
+        fair_probability_no=0.40,
+        slippage_bps=10.0,
+    )
+    btc = BtcSnapshot(
+        price=70000.0,
+        observed_at=datetime.now(timezone.utc),
+        log_return_10s=0.0, log_return_1m=0.0, log_return_5m=0.0,
+        log_return_15m=0.0, realized_vol_30m=0.01, sample_count=50,
+    )
+
+    def _make_packet(elapsed: int) -> EvidencePacket:
+        return EvidencePacket(
+            market_id=candidate.market_id,
+            question="test",
+            resolution_criteria="-",
+            market_probability=0.5,
+            orderbook_midpoint=0.5,
+            spread=0.02,
+            depth_usd=500.0,
+            seconds_to_expiry=900 - elapsed,
+            external_price=70000.0,
+            recent_price_change_bps=0.0,
+            recent_trade_count=0,
+            reasons_context=[],
+            citations=[],
+            time_elapsed_in_candle_s=elapsed,
+        )
+
+    def _ctx(elapsed: int) -> DecisionContext:
+        return DecisionContext(
+            market_id=candidate.market_id,
+            candidate=candidate,
+            features=state.features(),
+            btc_snapshot=btc,
+            assessment=approved,
+            metrics=runner.metrics,
+            packet=_make_packet(elapsed),
+        )
+
+    # t=30s — before the guard expires: no entry.
+    asyncio.run(runner._paper_execute_decision_callback(_ctx(30)))
+    assert service.portfolio.list_open_positions() == [], "entry should be blocked at t=30s"
+
+    # t=90s — guard cleared: entry allowed.
+    asyncio.run(runner._paper_execute_decision_callback(_ctx(90)))
+    positions = service.portfolio.list_open_positions()
+    assert len(positions) == 1, "entry should be allowed at t=90s"
+    assert positions[0].market_id == candidate.market_id

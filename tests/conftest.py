@@ -14,6 +14,16 @@ from polymarket_ai_agent.types import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_env_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run every test with cwd set to an empty temp dir so Settings() can't
+    find the repo's .env file. Tests that need specific settings pass them
+    explicitly; this keeps local operator tuning in .env from leaking in and
+    silently breaking defaults-based test assertions.
+    """
+    monkeypatch.chdir(tmp_path)
+
+
 @pytest.fixture()
 def settings(tmp_path: Path) -> Settings:
     return Settings(

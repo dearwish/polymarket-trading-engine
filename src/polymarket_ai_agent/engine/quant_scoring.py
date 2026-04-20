@@ -44,10 +44,46 @@ class QuantScoringEngine:
         fair_yes, fair_reasons = self._fair_value(packet)
         breakdown = self._edge_breakdown(packet, fair_yes)
         side, chosen_edge, side_reasons = self._pick_side(breakdown)
-        confidence = self._confidence(breakdown, chosen_edge)
+
+        # Regime gate: replaces the old binary trend veto with a unified check
+        # that varies the required minimum edge by regime (trend strength,
+        # microstructure flow, and volatility). Counter-trend trades need more
+        # edge; with-trend and ranging trades use the normal threshold.
+        gate_reason: str | None = None
+        if side is not SuggestedSide.ABSTAIN:
+            gate_reason = self._regime_gate(packet, side, chosen_edge)
+            if gate_reason:
+                side = SuggestedSide.ABSTAIN
+                chosen_edge = 0.0
+                side_reasons = []
+
+        ceiling = float(self.settings.quant_max_abs_edge)
+        ceiling_hit = (
+            ceiling > 0.0
+            and side is not SuggestedSide.ABSTAIN
+            and abs(chosen_edge) > ceiling
+        )
+        if ceiling_hit:
+            side = SuggestedSide.ABSTAIN
+            side_reasons = []
+        gated = gate_reason is not None
+        confidence = self._confidence(breakdown, chosen_edge) if not (ceiling_hit or gated) else 0.0
         reasons_for_trade, reasons_to_abstain = self._reasons(
             packet, breakdown, side, chosen_edge, fair_reasons, side_reasons
         )
+        # Primary-cause first: when the regime gate or |edge| ceiling forced
+        # ABSTAIN, `_reasons` has already prepended the generic "No positive
+        # edge after costs …" string (because side was rewritten to ABSTAIN
+        # before _reasons ran). Put the real driver at position 0 so
+        # downstream consumers — dashboards, analyze_soak — get the binding
+        # constraint as the headline reason.
+        if gate_reason:
+            reasons_to_abstain.insert(0, gate_reason)
+        if ceiling_hit:
+            reasons_to_abstain.insert(
+                0,
+                f"Chosen edge {chosen_edge:+.4f} exceeds |edge| ceiling {ceiling:.2f}.",
+            )
         expiry_risk = self._expiry_risk(packet)
         return MarketAssessment(
             market_id=packet.market_id,
@@ -180,6 +216,95 @@ class QuantScoringEngine:
             [f"NO edge {breakdown.edge_no:+.4f} beats YES edge {breakdown.edge_yes:+.4f}"],
         )
 
+    def _regime_gate(self, packet: EvidencePacket, side: SuggestedSide, chosen_edge: float) -> str | None:
+        """Return a rejection reason string if the regime blocks this trade, else None.
+
+        Four independent checks run in priority order:
+          0. Minimum entry price — ask below floor means gap-out risk exceeds SL width.
+          1. Trend-based minimum edge — counter-trend trades need more edge to pass.
+          2. OFI gate — strong informed flow opposing the trade direction is a veto.
+          3. Volatility regime — high vol raises the edge bar; extreme vol abstains.
+        """
+        # 0. Unconditional minimum entry price: if our side's ask is too low the
+        # bid-ask spread alone can exceed the stop-loss width, causing an immediate
+        # stop-out with no real adverse movement (gap risk at distressed prices).
+        min_price = float(self.settings.quant_min_entry_price)
+        if min_price > 0.0:
+            ask_our_side = float(packet.ask_yes if side is SuggestedSide.YES else packet.ask_no)
+            if ask_our_side < min_price:
+                return f"Min price: {side.value} ask {ask_our_side:.3f} < floor {min_price:.3f}."
+
+        # 1. Trend-based minimum edge (replaces the old binary trend veto)
+        if bool(self.settings.quant_trend_filter_enabled):
+            min_ret = float(self.settings.quant_trend_filter_min_abs_return)
+            r4h = float(packet.btc_log_return_4h)
+            r1h = float(packet.btc_log_return_1h)
+            if abs(r4h) >= min_ret:
+                trend_return, label = r4h, "4h"
+            elif abs(r1h) >= min_ret:
+                trend_return, label = r1h, "1h"
+            else:
+                trend_return, label = 0.0, ""
+            if trend_return != 0.0:
+                trend_up = trend_return > 0.0
+                opposed = (trend_up and side is SuggestedSide.NO) or (
+                    not trend_up and side is SuggestedSide.YES
+                )
+                if opposed:
+                    required = float(
+                        self.settings.quant_trend_opposed_strong_min_edge
+                        if label == "4h"
+                        else self.settings.quant_trend_opposed_weak_min_edge
+                    )
+                    if chosen_edge < required:
+                        trend_dir = "UP" if trend_up else "DOWN"
+                        return (
+                            f"Regime ({label} {trend_dir} {trend_return:+.4f}): "
+                            f"counter-trend edge {chosen_edge:+.4f} < required {required:.4f}."
+                        )
+                    # Distressed market: market is already heavily priced against our
+                    # side (ask is very low). Even with sufficient edge, the GBM model
+                    # is structurally late — the market has already priced in the move.
+                    max_ask = float(self.settings.quant_trend_distressed_max_ask)
+                    if max_ask > 0.0:
+                        ask_our_side = float(
+                            packet.ask_yes if side is SuggestedSide.YES else packet.ask_no
+                        )
+                        if ask_our_side < max_ask:
+                            trend_dir = "UP" if trend_up else "DOWN"
+                            return (
+                                f"Distressed ({label} {trend_dir}): "
+                                f"{side.value} ask {ask_our_side:.3f} < floor {max_ask:.3f}."
+                            )
+
+        # 2. OFI gate: don't trade against strong informed order flow.
+        if bool(self.settings.quant_ofi_gate_enabled):
+            flow = float(packet.signed_flow_5s)
+            ofi_min = float(self.settings.quant_ofi_gate_min_abs_flow)
+            if abs(flow) >= ofi_min:
+                flow_bullish = flow > 0.0
+                if (side is SuggestedSide.YES and not flow_bullish) or (
+                    side is SuggestedSide.NO and flow_bullish
+                ):
+                    return f"OFI gate: flow {flow:+.1f} opposes {side.value}."
+
+        # 3. Volatility regime gate.
+        if bool(self.settings.quant_vol_regime_enabled):
+            vol = float(packet.realized_vol_30m)
+            extreme = float(self.settings.quant_vol_regime_extreme_threshold)
+            high = float(self.settings.quant_vol_regime_high_threshold)
+            if vol >= extreme:
+                return f"Vol regime: realized_vol {vol:.5f} exceeds extreme threshold {extreme:.5f}."
+            if vol >= high:
+                high_edge = float(self.settings.quant_vol_regime_high_min_edge)
+                if chosen_edge < high_edge:
+                    return (
+                        f"Vol regime: high vol {vol:.5f}, "
+                        f"edge {chosen_edge:+.4f} < required {high_edge:.4f}."
+                    )
+
+        return None
+
     def _confidence(self, breakdown: EdgeBreakdown, chosen_edge: float) -> float:
         if chosen_edge <= 0.0:
             return 0.0
@@ -195,6 +320,52 @@ class QuantScoringEngine:
         if packet.seconds_to_expiry <= int(self.settings.quant_medium_expiry_risk_seconds):
             return "MEDIUM"
         return "LOW"
+
+    def score_shadow(self, packet: EvidencePacket) -> MarketAssessment | None:
+        """Compute a shadow assessment for the configured HTF-tilt variant.
+
+        Returns None when quant_shadow_variant is empty (disabled). Trades
+        continue to use score_market() exclusively; this output is logged
+        alongside the base assessment for offline A/B comparison only.
+        """
+        variant = str(self.settings.quant_shadow_variant)
+        if not variant:
+            return None
+        base_fair, _ = self._fair_value(packet)
+        tilt = 0.0
+        if variant == "htf_tilt":
+            r1h = float(packet.btc_log_return_1h)
+            if r1h != 0.0:
+                strength = float(self.settings.quant_shadow_htf_tilt_strength)
+                tilt += (1.0 if r1h > 0.0 else -1.0) * strength
+            session_biases: dict[str, float] = {
+                "eu": float(self.settings.quant_shadow_session_bias_eu),
+                "us": float(self.settings.quant_shadow_session_bias_us),
+            }
+            tilt += session_biases.get(packet.btc_session, 0.0)
+        fair_yes = max(0.01, min(0.99, base_fair + tilt))
+        breakdown = self._edge_breakdown(packet, fair_yes)
+        side, chosen_edge, _ = self._pick_side(breakdown)
+        ceiling = float(self.settings.quant_max_abs_edge)
+        if ceiling > 0.0 and side is not SuggestedSide.ABSTAIN and abs(chosen_edge) > ceiling:
+            side = SuggestedSide.ABSTAIN
+            chosen_edge = 0.0
+        confidence = self._confidence(breakdown, chosen_edge)
+        return MarketAssessment(
+            market_id=packet.market_id,
+            fair_probability=round(fair_yes, 6),
+            confidence=round(confidence, 4),
+            suggested_side=side,
+            expiry_risk=self._expiry_risk(packet),
+            reasons_for_trade=[],
+            reasons_to_abstain=[],
+            edge=round(chosen_edge, 6),
+            raw_model_output=f"quant-shadow-{variant}",
+            edge_yes=round(breakdown.edge_yes, 6),
+            edge_no=round(breakdown.edge_no, 6),
+            fair_probability_no=round(1.0 - fair_yes, 6),
+            slippage_bps=round(breakdown.slippage_bps, 4),
+        )
 
     def _reasons(
         self,

@@ -704,6 +704,9 @@ class AgentService:
             return "daily_loss_limit"
         if state.rejected_orders >= self.settings.max_rejected_orders:
             return "rejected_order_limit"
+        max_streak = int(self.settings.max_consecutive_losses)
+        if max_streak > 0 and self.portfolio.get_consecutive_losses(limit=max_streak) >= max_streak:
+            return "consecutive_loss_limit"
         if (
             auth_readonly_ready is False
             and ExecutionMode(self.settings.trading_mode) == ExecutionMode.LIVE

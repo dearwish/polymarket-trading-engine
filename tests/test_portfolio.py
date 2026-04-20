@@ -270,6 +270,40 @@ def test_portfolio_estimates_exit_price_for_yes(settings) -> None:
     assert price < 0.60
 
 
+def test_portfolio_consecutive_losses_counts_trailing_streak(settings) -> None:
+    """get_consecutive_losses walks closed positions newest-first and stops
+    at the first non-losing close. A zero-PnL scratch counts as a loss."""
+    engine = PortfolioEngine(settings.db_path, settings.paper_starting_balance_usd)
+    now = utc_now()
+    rows = [
+        ("a", -1.0, now - timedelta(minutes=5)),  # oldest
+        ("b", -2.0, now - timedelta(minutes=4)),
+        ("c",  3.0, now - timedelta(minutes=3)),  # break at winner
+        ("d", -1.0, now - timedelta(minutes=2)),
+        ("e",  0.0, now - timedelta(minutes=1)),  # zero counts as loss
+        ("f", -1.0, now),                          # most recent
+    ]
+    with sqlite3.connect(settings.db_path) as conn:
+        for mid, pnl, closed_at in rows:
+            conn.execute(
+                """
+                insert into positions(
+                    market_id, side, size_usd, entry_price, order_id, opened_at, status,
+                    close_reason, closed_at, exit_price, realized_pnl
+                ) values (?, ?, ?, ?, ?, ?, 'CLOSED', 'x', ?, 0.0, ?)
+                """,
+                (mid, "YES", 10.0, 0.50, f"o-{mid}", closed_at.isoformat(), closed_at.isoformat(), pnl),
+            )
+        conn.commit()
+    # Scanning newest-first: f(loss), e(zero=loss), d(loss), c(win → break) → 3
+    assert engine.get_consecutive_losses() == 3
+
+
+def test_portfolio_consecutive_losses_zero_when_empty(settings) -> None:
+    engine = PortfolioEngine(settings.db_path, settings.paper_starting_balance_usd)
+    assert engine.get_consecutive_losses() == 0
+
+
 def test_portfolio_daily_realized_pnl_ignores_previous_days(settings) -> None:
     engine = PortfolioEngine(settings.db_path, settings.paper_starting_balance_usd)
     opened_at = utc_now() - timedelta(days=1, minutes=5)

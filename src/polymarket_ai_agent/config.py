@@ -61,6 +61,30 @@ class Settings(BaseSettings):
     # same market for this many seconds. Prevents immediate re-entry whipsaw
     # where the scorer flips sides and each flip gets stopped out. 0 disables.
     paper_entry_cooldown_seconds: int = 0
+    # Minimum TTE for a new entry. Trades opened inside the last minute of a
+    # candle have no time for the thesis to develop before the exit buffer
+    # forces a close, and price noise in the final seconds dominates the GBM
+    # drift signal. 0 disables. Typical value: 60–90.
+    min_entry_tte_seconds: int = 0
+    # Force-close any open position at this TTE regardless of PnL (supersedes
+    # the exit_buffer sweep when > exit_buffer_seconds). Lets us widen the
+    # fixed stop without holding through the final-seconds noise that eats
+    # trailing stops. 0 disables — the normal exit buffer still applies.
+    position_force_exit_tte_seconds: int = 0
+    # Consecutive-loss circuit breaker. If the most recent N CLOSED positions
+    # all have realized_pnl ≤ 0 the daemon halts with safety_stop_reason=
+    # "consecutive_loss_limit" until an operator reviews. 0 disables.
+    max_consecutive_losses: int = 0
+    # Minimum seconds elapsed since the candle opened before a new entry is
+    # allowed. Prevents entering at candle open when btc_log_return_since_candle_open
+    # is ~0 and GBM uncertainty is at its maximum. Only applied to candle-style
+    # families (btc_15m, btc_5m, btc_1h); threshold markets are unaffected.
+    # 0 disables (default). A value of 60–90 is a reasonable starting point.
+    min_candle_elapsed_seconds: int = 0
+    # Upper bound: don't enter after this many seconds into the candle. Avoids
+    # entering in the final third where there is no time for the TP/trail to
+    # develop but the full stop-loss can still fire. 0 disables.
+    max_candle_elapsed_seconds: int = 0
     # Scale-out / tiered take-profit ladder. Comma-separated list of
     #   "<pnl_pct>:<fraction_to_close>" pairs, e.g. "0.15:0.5,0.30:0.25"
     # meaning: at +15% PnL close 50% of the position, at +30% close another
@@ -104,6 +128,12 @@ class Settings(BaseSettings):
     # GBM continuation: if the unflipped hit rate is significantly < 50% with
     # a strong Brier score, flipping should land the signal in the 60-90% band.
     quant_invert_drift: bool = False
+    # Hard abstain ceiling on the chosen-side edge. Empirical soak data showed
+    # the highest-conviction picks (|edge| ≥ 0.30) had the worst hit rates,
+    # likely because extreme edges come from model/market disagreements the
+    # GBM prior can't actually resolve. Set > 0 to force ABSTAIN whenever the
+    # chosen edge exceeds the ceiling; 0.0 disables the guard.
+    quant_max_abs_edge: float = 0.0
     quant_imbalance_tilt: float = 0.03
     quant_slippage_baseline_bps: float = 15.0
     quant_slippage_spread_coef: float = 0.25
@@ -113,6 +143,54 @@ class Settings(BaseSettings):
     quant_confidence_per_edge: float = 10.0
     quant_high_expiry_risk_seconds: int = 15
     quant_medium_expiry_risk_seconds: int = 60
+    # Shadow scorer (Phase 4 A/B). Empty string disables; set to "htf_tilt" to
+    # run a parallel scorer on every tick without affecting live trade logic.
+    # When enabled, daemon_tick gains shadow_fair_probability / shadow_suggested_side
+    # / shadow_edge_yes / shadow_edge_no fields for offline comparison.
+    # Regime-aware gate (replaces the old binary trend veto).
+    # When enabled, counter-trend trades must clear a higher minimum edge
+    # proportional to trend strength. With-trend and ranging trades are
+    # unaffected. 4h takes priority over 1h (highest-timeframe-wins).
+    quant_trend_filter_enabled: bool = False
+    quant_trend_filter_min_abs_return: float = 0.003
+    # Required edge when the chosen side opposes the 4h / 1h trend.
+    quant_trend_opposed_strong_min_edge: float = 0.15  # vs 4h trend
+    quant_trend_opposed_weak_min_edge: float = 0.06    # vs 1h trend only
+    # Distressed market floor: block counter-trend entry when the ask on our side
+    # is below this price. A low ask means the market has already heavily priced
+    # in the opposing outcome — the GBM edge is structural lag, not real alpha.
+    # E.g. 0.30 blocks buying YES when ask_yes < 0.30 in a downtrend. 0 = off.
+    quant_trend_distressed_max_ask: float = 0.0
+    # Unconditional minimum entry price: skip any trade where our side's ask is
+    # below this floor regardless of trend direction. Very low ask prices (< 0.20)
+    # have bid-ask spreads that exceed the stop-loss width, causing immediate
+    # gap-out on entry. 0 = off.
+    quant_min_entry_price: float = 0.0
+
+    # OFI gate: veto trades where strong signed order flow opposes the direction.
+    # Informed flow (signed_flow_5s) is the single best short-term price-impact
+    # predictor per Cont et al. 2014. Only fires when |flow| >= min_abs_flow.
+    quant_ofi_gate_enabled: bool = False
+    quant_ofi_gate_min_abs_flow: float = 30.0
+
+    # Volatility regime gate: raise edge bar or abstain in high-vol conditions
+    # where GBM fair-value estimates are less reliable (wider confidence intervals).
+    quant_vol_regime_enabled: bool = False
+    quant_vol_regime_high_threshold: float = 0.005    # 30m realized vol
+    quant_vol_regime_extreme_threshold: float = 0.010
+    quant_vol_regime_high_min_edge: float = 0.08
+
+    quant_shadow_variant: str = ""
+    # Magnitude of the HTF-trend tilt applied by the shadow scorer.
+    # sign(btc_log_return_1h) * this value is added to the base fair_yes.
+    # Calibrated from soak: 1h return predicted 57% of outcomes (vs 50% random)
+    # while the base scorer agreed with the trend only 41% of the time.
+    quant_shadow_htf_tilt_strength: float = 0.10
+    # Per-session additive bias for the shadow scorer. Derived from observed
+    # fair_yes vs actual YES-rate gaps in the first HTF soak (EU −14pp, US −27pp).
+    # These are regime-conditional and should be re-calibrated after each soak.
+    quant_shadow_session_bias_eu: float = 0.0
+    quant_shadow_session_bias_us: float = 0.0
 
     events_jsonl_max_bytes: int = 200_000_000
     events_jsonl_keep_tail_bytes: int = 50_000_000
@@ -232,6 +310,30 @@ EDITABLE_SETTINGS_METADATA: dict[str, dict[str, Any]] = {
         "max": 3600,
         "step": 1,
         "group": "paper",
+    },
+    "min_entry_tte_seconds": {
+        "label": "Min Entry TTE Seconds",
+        "type": "number",
+        "min": 0,
+        "max": 3600,
+        "step": 1,
+        "group": "thresholds",
+    },
+    "position_force_exit_tte_seconds": {
+        "label": "Position Force-Exit TTE Seconds",
+        "type": "number",
+        "min": 0,
+        "max": 3600,
+        "step": 1,
+        "group": "paper",
+    },
+    "max_consecutive_losses": {
+        "label": "Max Consecutive Losses",
+        "type": "number",
+        "min": 0,
+        "max": 100,
+        "step": 1,
+        "group": "thresholds",
     },
 }
 

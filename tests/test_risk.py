@@ -104,6 +104,24 @@ def test_risk_rejects_daily_loss_limit() -> None:
     assert "daily_loss_limit" in risk.rejected_by
 
 
+def test_risk_rejects_entry_below_min_tte() -> None:
+    settings = Settings(min_entry_tte_seconds=90)
+    engine = RiskEngine(settings)
+    state = AccountState(mode=ExecutionMode.PAPER, available_usd=100.0, open_positions=0, daily_realized_pnl=0.0)
+    risk = engine.evaluate(build_snapshot(seconds_to_expiry=60), build_assessment(), state)
+    assert not risk.approved
+    assert "min_entry_tte" in risk.rejected_by
+
+
+def test_risk_approves_when_min_tte_disabled() -> None:
+    # With min_entry_tte_seconds=0 a 60s-TTE snapshot must not be flagged.
+    settings = Settings(min_entry_tte_seconds=0, market_family="btc_5m")
+    engine = RiskEngine(settings)
+    state = AccountState(mode=ExecutionMode.PAPER, available_usd=100.0, open_positions=0, daily_realized_pnl=0.0)
+    risk = engine.evaluate(build_snapshot(seconds_to_expiry=200), build_assessment(), state)
+    assert "min_entry_tte" not in risk.rejected_by
+
+
 def test_risk_rejects_stale_data() -> None:
     settings = Settings(stale_data_seconds=30)
     engine = RiskEngine(settings)

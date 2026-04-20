@@ -218,9 +218,11 @@ type DaemonHeartbeatPayload = {
     };
     btc_last_price: number | null;
     btc_seconds_since_last_update: number | null;
+    btc_session?: string | null;
     safety_stop_reason: string | null;
     market_family: string;
     active_market_ids: string[];
+    active_market_slugs?: Record<string, string>;
     position_extras?: Record<string, { peak_price?: number; tranches_closed?: number; original_size_usd?: number }>;
     paper_trailing_stop_pct?: number;
     paper_trail_arm_pct?: number;
@@ -248,7 +250,126 @@ type DaemonTickPayload = {
   btc_price: number | null;
   btc_realized_vol_30m: number | null;
   expiry_risk: string;
+  time_elapsed_in_candle_s?: number | null;
+  signed_flow_5s?: number | null;
+  btc_log_return_1h?: number | null;
+  btc_log_return_4h?: number | null;
+  reasons_to_abstain?: string[] | null;
+  reasons_for_trade?: string[] | null;
 };
+
+type SettingsValues = Record<string, string | number | boolean>;
+
+function settingNumber(values: SettingsValues | undefined, key: string, fallback: number): number {
+  const raw = values?.[key];
+  if (typeof raw === "number" && Number.isFinite(raw)) return raw;
+  if (typeof raw === "string") {
+    const n = Number(raw);
+    if (Number.isFinite(n)) return n;
+  }
+  return fallback;
+}
+
+/** Condense a verbose scorer reason (e.g.
+ *  "Regime (4h UP +0.0040): counter-trend edge +0.0512 < required 0.1500.")
+ *  into a dashboard-friendly one-liner. Falls back to the first ~72 chars when
+ *  no bespoke shortener matches so new backend reasons still render readably.
+ */
+function formatBackendReason(raw: string): string {
+  const trimmed = raw.replace(/\s+/g, " ").trim().replace(/\.$/, "");
+  const m1 = trimmed.match(/^Regime \((\w+) (UP|DOWN) ([+-]?\d+\.\d+)\): counter-trend edge ([+-]?\d+\.\d+) < required ([+-]?\d+\.\d+)/);
+  if (m1) {
+    const [, tf, dir, , edge, required] = m1;
+    return `Trend gate — ${tf} ${dir}, edge ${(parseFloat(edge) * 100).toFixed(1)}% < ${(parseFloat(required) * 100).toFixed(0)}%`;
+  }
+  const m2 = trimmed.match(/^Distressed \((\w+) (UP|DOWN)\): (YES|NO) ask (\d+\.\d+) < floor (\d+\.\d+)/);
+  if (m2) {
+    const [, tf, dir, side, ask, floor] = m2;
+    return `Distressed ${tf} ${dir} — ${side} ask ${(parseFloat(ask) * 100).toFixed(0)}¢ < ${(parseFloat(floor) * 100).toFixed(0)}¢`;
+  }
+  const m3 = trimmed.match(/^OFI gate: flow ([+-]?\d+\.\d+) opposes (YES|NO|ABSTAIN)/);
+  if (m3) return `OFI gate — flow ${parseFloat(m3[1]).toFixed(0)} opposes ${m3[2]}`;
+  const m4 = trimmed.match(/^Vol regime: realized_vol (\d+\.\d+) exceeds extreme threshold (\d+\.\d+)/);
+  if (m4) return `Vol extreme — σ₃₀ ${(parseFloat(m4[1]) * 100).toFixed(3)}%`;
+  const m5 = trimmed.match(/^Vol regime: high vol (\d+\.\d+), edge ([+-]?\d+\.\d+) < required (\d+\.\d+)/);
+  if (m5) return `Vol gate — σ₃₀ ${(parseFloat(m5[1]) * 100).toFixed(2)}%, edge ${(parseFloat(m5[2]) * 100).toFixed(1)}% < ${(parseFloat(m5[3]) * 100).toFixed(0)}%`;
+  const m6 = trimmed.match(/^Min price: (YES|NO) ask (\d+\.\d+) < floor (\d+\.\d+)/);
+  if (m6) return `Price floor — ${m6[1]} ask ${(parseFloat(m6[2]) * 100).toFixed(0)}¢ < ${(parseFloat(m6[3]) * 100).toFixed(0)}¢`;
+  const m7 = trimmed.match(/^Chosen edge ([+-]?\d+\.\d+) exceeds \|edge\| ceiling (\d+\.\d+)/);
+  if (m7) return `Edge ceiling — ${(parseFloat(m7[1]) * 100).toFixed(1)}% > ${(parseFloat(m7[2]) * 100).toFixed(0)}%`;
+  const m8 = trimmed.match(/^No positive edge after costs \(yes=([+-]?\d+\.\d+), no=([+-]?\d+\.\d+)\)/);
+  if (m8) {
+    const ey = parseFloat(m8[1]);
+    const en = parseFloat(m8[2]);
+    const best = ey >= en ? ey : en;
+    return `No positive edge — best ${(best * 100).toFixed(1)}%`;
+  }
+  if (/high-expiry-risk window/i.test(trimmed)) return "Expiry-risk window";
+  if (/Slippage estimate/i.test(trimmed)) return trimmed.replace(/\.$/, "");
+  return trimmed.length > 72 ? `${trimmed.slice(0, 72)}…` : trimmed;
+}
+
+function deriveDecisionReason(tick: DaemonTickPayload, values?: SettingsValues): string {
+  const side = tick.suggested_side;
+  const elapsed = tick.time_elapsed_in_candle_s ?? null;
+  const ey = tick.edge_yes ?? 0;
+  const en = tick.edge_no ?? 0;
+  const askYes = tick.ask_yes ?? 0;
+  const askNo = tick.ask_no ?? 0;
+  const conf = tick.confidence ?? 0;
+  const flow = tick.signed_flow_5s ?? 0;
+  const r1h = tick.btc_log_return_1h ?? 0;
+  const vol = tick.btc_realized_vol_30m ?? 0;
+
+  if (side !== "ABSTAIN") {
+    const edge = side === "YES" ? ey : en;
+    const ask = side === "YES" ? askYes : askNo;
+    const trend = r1h > 0.003 ? "↑ 1h" : r1h < -0.003 ? "↓ 1h" : "ranging";
+    const flowGate = settingNumber(values, "quant_ofi_gate_min_abs_flow", 60);
+    const flowNote = Math.abs(flow) > flowGate ? ` · flow ${flow > 0 ? "+" : ""}${flow.toFixed(0)}` : "";
+    return `${trend} · ask ${(ask * 100).toFixed(0)}¢ · edge ${(edge * 100).toFixed(1)}%${flowNote}`;
+  }
+
+  // Prefer the scorer's verbatim reason when the daemon emitted one — no
+  // heuristic guessing. The list is ordered by the scorer; the first entry is
+  // the primary driver of the ABSTAIN.
+  const backendReasons = tick.reasons_to_abstain ?? [];
+  if (backendReasons.length > 0) {
+    return formatBackendReason(backendReasons[0]);
+  }
+
+  // Legacy fallback for ticks logged before reasons_to_abstain was added:
+  // re-implement the waterfall, but source thresholds from /api/settings so
+  // the labels stay in sync with .env instead of hardcoded 3% / 30¢ / 0.008.
+  const minCandleElapsed = settingNumber(values, "min_candle_elapsed_seconds", 60);
+  if (elapsed !== null && elapsed < minCandleElapsed) {
+    return `Candle too young — ${Math.round(elapsed)}s elapsed`;
+  }
+  const wouldBeSide = ey > en ? "YES" : "NO";
+  const wouldBeAsk = wouldBeSide === "YES" ? askYes : askNo;
+  const wouldBeEdge = wouldBeSide === "YES" ? ey : en;
+  const minEntryPrice = settingNumber(values, "quant_min_entry_price", 0.30);
+  if (wouldBeAsk > 0 && wouldBeAsk < minEntryPrice) {
+    return `Price floor — ${wouldBeSide} ask ${(wouldBeAsk * 100).toFixed(0)}¢ < ${(minEntryPrice * 100).toFixed(0)}¢`;
+  }
+  const minEdge = settingNumber(values, "min_edge", 0.03);
+  if (wouldBeEdge < minEdge) {
+    return `Edge too thin — best ${(wouldBeEdge * 100).toFixed(1)}% < ${(minEdge * 100).toFixed(0)}%`;
+  }
+  const minConf = settingNumber(values, "min_confidence", 0.60);
+  if (conf < minConf && conf > 0) {
+    return `Low confidence — ${(conf * 100).toFixed(0)}% < ${(minConf * 100).toFixed(0)}%`;
+  }
+  const volExtreme = settingNumber(values, "quant_vol_regime_extreme_threshold", 0.008);
+  if (vol > volExtreme) {
+    return `Vol extreme — σ₃₀ ${(vol * 100).toFixed(3)}%`;
+  }
+  const flowGate = settingNumber(values, "quant_ofi_gate_min_abs_flow", 60);
+  if (Math.abs(flow) >= flowGate) {
+    return `OFI gate — flow ${flow > 0 ? "+" : ""}${flow.toFixed(0)} opposes ${wouldBeSide}`;
+  }
+  return "Regime gate";
+}
 
 type SettingsFieldMeta = {
   label: string;
@@ -423,6 +544,52 @@ function formatInstant(
   } catch {
     return d.toISOString();
   }
+}
+
+const SESSION_UTC_RANGES: Record<string, [number, number]> = {
+  asia: [0, 8],
+  eu: [8, 13],
+  us: [13, 21],
+  off: [21, 24],
+};
+
+function formatUtcHourInTz(utcHour: number, tz: string, fmt: TimeFormat): string {
+  // Anchor on today's date so DST is applied for the current period.
+  const now = new Date();
+  const hour = ((utcHour % 24) + 24) % 24;
+  const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), hour, 0, 0));
+  try {
+    return new Intl.DateTimeFormat("en-GB", {
+      timeZone: tz,
+      hour12: fmt === "12h",
+      hour: "2-digit",
+      minute: "2-digit",
+    }).format(d);
+  } catch {
+    return `${String(hour).padStart(2, "0")}:00`;
+  }
+}
+
+function sessionTooltip(session: string | null | undefined, tz: string, fmt: TimeFormat): string {
+  // Mirrors session_bucket() in btc_state.py; boundaries are UTC, shown in the
+  // user's display timezone with the UTC range as a fallback note.
+  const key = (session ?? "").toLowerCase();
+  const range = SESSION_UTC_RANGES[key];
+  if (!range) return "Session unknown";
+  const [startUtc, endUtc] = range;
+  const startLocal = formatUtcHourInTz(startUtc, tz, fmt);
+  const endLocal = formatUtcHourInTz(endUtc, tz, fmt);
+  const name = key === "off" ? "OFF (low liquidity)" : key.toUpperCase();
+  return `${name} — ${startLocal}–${endLocal} ${tz}  (${String(startUtc).padStart(2, "0")}:00–${String(endUtc).padStart(2, "0")}:00 UTC)`;
+}
+
+function btcLastUpdateIso(heartbeat: DaemonHeartbeatPayload | null): string | null {
+  const hb = heartbeat?.heartbeat;
+  if (!hb?.written_at) return null;
+  const ageSeconds = hb.btc_seconds_since_last_update ?? 0;
+  const t = new Date(hb.written_at).getTime() - ageSeconds * 1000;
+  if (Number.isNaN(t)) return null;
+  return new Date(t).toISOString();
 }
 
 function useDisplayPrefs() {
@@ -974,7 +1141,7 @@ function OrdersPage({ liveOrders, liveTrades, liveActivity, paperActivity, tradi
   );
 }
 
-function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonTicks, heartbeat }: { summary: PortfolioSummaryPayload | null; positions: ClosedPosition[]; openPositions: OpenPosition[]; equityCurve: EquityCurvePayload | null; daemonTicks: DaemonTickPayload[]; heartbeat: DaemonHeartbeatPayload | null }) {
+function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonTicks, heartbeat, settings }: { summary: PortfolioSummaryPayload | null; positions: ClosedPosition[]; openPositions: OpenPosition[]; equityCurve: EquityCurvePayload | null; daemonTicks: DaemonTickPayload[]; heartbeat: DaemonHeartbeatPayload | null; settings: SettingsPayload | null }) {
   const { timezone, timeFormat } = useDisplayPrefs();
   // Rebuild the lookup on every render so the Mark / Unrealized PnL cells
   // always reflect the freshest daemon_tick. With a handful of markets the
@@ -986,14 +1153,6 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
   const positionExtras = hb?.position_extras ?? {};
   const trailPct = hb?.paper_trailing_stop_pct ?? 0;
   const trailArmPct = hb?.paper_trail_arm_pct ?? 0;
-  // Force the Polymarket embed iframes to refresh every 30s — their chart is
-  // rendered once at load and doesn't update client-side, so we remount to
-  // pull a fresh snapshot. Cachebuster query string defeats the iframe cache.
-  const [embedRefresh, setEmbedRefresh] = useState<number>(() => Date.now());
-  useEffect(() => {
-    const id = window.setInterval(() => setEmbedRefresh(Date.now()), 30_000);
-    return () => window.clearInterval(id);
-  }, []);
   return (
     <section className="grid detail-grid">
       <article className="panel">
@@ -1021,40 +1180,139 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
         </dl>
       </article>
 
-      {openPositions.length > 0 && (
-        <article className="panel full-span">
-          <div className="panel-header">
-            <h2>Live Markets</h2>
-            <span>{openPositions.length} embedded from Polymarket</span>
-          </div>
-          <div className="polymarket-embed-grid">
-            {openPositions.map((position) => {
-              const tick = marketLookup[position.market_id];
-              const slug = tick?.slug;
-              if (!slug) {
+      {(() => {
+        const activeIds: string[] = hb?.active_market_ids ?? [];
+        const activeTicks = activeIds.map((id) => marketLookup[id]).filter((t): t is DaemonTickPayload => Boolean(t));
+        if (!activeTicks.length) return null;
+        return (
+          <article className="panel full-span">
+            <div className="panel-header">
+              <h2>Last Signal</h2>
+              <span>{activeTicks.length} active markets</span>
+            </div>
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Market</th>
+                    <th>Decision</th>
+                    <th>Edge</th>
+                    <th>Conf</th>
+                    <th>TTE</th>
+                    <th>Reason</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {activeTicks.map((tick) => {
+                    const side = tick.suggested_side;
+                    const sideClass = side === "YES" ? "side-yes" : side === "NO" ? "side-no" : "side-abstain";
+                    const icon = side === "YES" ? "▲" : side === "NO" ? "▼" : "—";
+                    const edge = side === "YES" ? tick.edge_yes : side === "NO" ? tick.edge_no : null;
+                    const reason = deriveDecisionReason(tick, settings?.values);
+                    const question = tick.question ?? tick.market_id;
+                    const label = question.length > 36 ? `${question.slice(0, 36)}…` : question;
+                    // BTC 15m candle window = 900s. If TTE > 900 the candle
+                    // hasn't opened yet — suppress the signal entirely.
+                    const preMarket = tick.seconds_to_expiry > 900;
+                    return (
+                      <tr key={tick.market_id}>
+                        <td title={question} style={{ fontSize: "12px" }}>{label}</td>
+                        <td>
+                          {preMarket ? (
+                            <span className="side-abstain" style={{ fontStyle: "italic", opacity: 0.6 }}>pre-market</span>
+                          ) : (
+                            <span className={sideClass} style={{ fontWeight: 600, letterSpacing: "0.02em" }}>
+                              {icon} {side}
+                            </span>
+                          )}
+                        </td>
+                        <td className={!preMarket && edge != null && edge > 0 ? "positive" : !preMarket && edge != null ? "negative" : ""}>
+                          {!preMarket && edge != null ? `${edge >= 0 ? "+" : ""}${(edge * 100).toFixed(1)}%` : "—"}
+                        </td>
+                        <td>{!preMarket && tick.confidence > 0 ? `${(tick.confidence * 100).toFixed(0)}%` : "—"}</td>
+                        <td style={{ whiteSpace: "nowrap" }}>{formatDuration(tick.seconds_to_expiry)}</td>
+                        <td style={{ fontSize: "12px", color: "var(--muted)" }}>
+                          {preMarket ? `Opens in ${formatDuration(tick.seconds_to_expiry - 900)}` : reason}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </article>
+        );
+      })()}
+
+      {(() => {
+        // Merge active markets from daemon heartbeat with open-position markets.
+        // Show even when there are no open positions.
+        const activeIds: string[] = hb?.active_market_ids ?? [];
+        const slugOverrides: Record<string, string> = hb?.active_market_slugs ?? {};
+        const seen = new Set<string>(activeIds);
+        const allIds = [...activeIds];
+        for (const position of openPositions) {
+          if (!seen.has(position.market_id)) {
+            seen.add(position.market_id);
+            allIds.push(position.market_id);
+          }
+        }
+        if (allIds.length === 0) return null;
+        return (
+          <article className="panel full-span">
+            <div className="panel-header">
+              <h2>Live Markets</h2>
+              <span>{allIds.length} active</span>
+            </div>
+            <div className="polymarket-embed-grid">
+              {allIds.map((market_id) => {
+                const tick = marketLookup[market_id];
+                const slug = tick?.slug ?? slugOverrides[market_id];
+                if (!slug) {
+                  return (
+                    <div key={market_id} className="polymarket-embed-placeholder">
+                      <div>{market_id}</div>
+                      <small>Loading market data…</small>
+                    </div>
+                  );
+                }
+                const src = `https://embed.polymarket.com/market?market=${encodeURIComponent(slug)}&theme=dark&liveactivity=true&border=true&creator=0x43424Ed47ec4e4aC737534bea1DFd5d992B34732-1756591618869&height=300`;
+                const question = tick?.question ?? market_id;
                 return (
-                  <div key={position.market_id} className="polymarket-embed-placeholder">
-                    <div>{position.market_id}</div>
-                    <small>No slug cached — embed unavailable.</small>
-                  </div>
+                  <figure
+                    key={market_id}
+                    className="polymarket-embed"
+                    id={`polymarket-${slug}`}
+                    aria-label={`Polymarket prediction market: ${question}`}
+                    itemScope
+                    itemType="https://schema.org/WebPage"
+                    style={{ position: "relative", display: "inline-block", margin: 0 }}
+                  >
+                    <iframe
+                      title={`${question} — Polymarket Prediction Market`}
+                      src={src}
+                      width={400}
+                      height={300}
+                      style={{ border: "none" }}
+                      loading="lazy"
+                    />
+                    <a
+                      href={`https://polymarket.com/event/${slug}`}
+                      aria-label="View on Polymarket"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      style={{ position: "absolute", top: 16, right: 20, width: 120, height: 24, zIndex: 10 }}
+                    />
+                    <figcaption style={{ position: "absolute", width: 1, height: 1, padding: 0, margin: -1, overflow: "hidden", clip: "rect(0,0,0,0)", whiteSpace: "nowrap", border: 0 }}>
+                      <strong>{question}</strong>
+                    </figcaption>
+                  </figure>
                 );
-              }
-              const src = `https://embed.polymarket.com/market?market=${encodeURIComponent(slug)}&theme=dark&liveactivity=true&buttons=false&border=true&height=300&_t=${embedRefresh}`;
-              return (
-                <figure key={`${position.market_id}-${embedRefresh}`} className="polymarket-embed" aria-label={`Polymarket market ${tick?.question ?? position.market_id}`}>
-                  <iframe
-                    title={tick?.question || position.market_id}
-                    src={src}
-                    width={400}
-                    height={300}
-                    loading="lazy"
-                  />
-                </figure>
-              );
-            })}
-          </div>
-        </article>
-      )}
+              })}
+            </div>
+          </article>
+        );
+      })()}
 
       <article className="panel full-span">
         <div className="panel-header">
@@ -1098,8 +1356,9 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
                   } else {
                     unrealizedCell = <span style={{ color: "var(--muted)" }}>—</span>;
                   }
-                  // Live trailing-stop level: peak × (1 - trail_pct) once armed
-                  // (peak ≥ entry × (1 + arm_pct)). Until armed, trail cannot fire.
+                  // Live trailing-stop level: max(peak × (1 - trail_pct), entry)
+                  // once armed (peak ≥ entry × (1 + arm_pct)). Entry floor mirrors
+                  // the daemon so a freshly-armed trail can't fire at a loss.
                   let trailCell: ReactNode = <span style={{ color: "var(--muted)" }}>—</span>;
                   const extras = positionExtras[position.market_id];
                   if (trailPct > 0 && extras && extras.peak_price && position.entry_price > 0) {
@@ -1107,7 +1366,7 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
                     const armThreshold = position.entry_price * (1 + trailArmPct);
                     const armed = peak >= armThreshold;
                     if (armed) {
-                      const trailLevel = peak * (1 - trailPct);
+                      const trailLevel = Math.max(peak * (1 - trailPct), position.entry_price);
                       const trailPctFromEntry = (trailLevel - position.entry_price) / position.entry_price;
                       const cls = trailPctFromEntry >= 0 ? "positive" : "negative";
                       const sign = trailPctFromEntry >= 0 ? "+" : "";
@@ -1488,12 +1747,25 @@ function MarketCell({
 function InfoBar({ heartbeat, items }: { heartbeat: DaemonHeartbeatPayload | null; items: InfoBarItem[] }) {
   const hb = heartbeat?.heartbeat ?? null;
   const age = heartbeat?.age_seconds ?? null;
+  const { timezone, timeFormat } = useDisplayPrefs();
+  const btcLastIso = btcLastUpdateIso(heartbeat);
+  const btcTitle = btcLastIso ? `Last BTC tick: ${formatInstant(btcLastIso, timezone, timeFormat, "datetime")}` : "";
   return (
     <div className="info-bar">
-      <span className="pill">
+      <span className="pill has-tooltip" data-tooltip={btcTitle} aria-label={btcTitle}>
         <span className="info-bar-label">BTC</span>
         {formatMoney(hb?.btc_last_price)}
       </span>
+      {hb?.btc_session && (
+        <span
+          className="pill has-tooltip"
+          data-tooltip={sessionTooltip(hb.btc_session, timezone, timeFormat)}
+          aria-label={sessionTooltip(hb.btc_session, timezone, timeFormat)}
+        >
+          <span className="info-bar-label">Session</span>
+          {hb.btc_session.toUpperCase()}
+        </span>
+      )}
       {heartbeat !== null && (
         <span className={heartbeatAgeClass(age)}>
           <span className="info-bar-label">HB</span>
@@ -1528,9 +1800,24 @@ function DaemonView({ heartbeat, ticks }: { heartbeat: DaemonHeartbeatPayload | 
       )}
 
       <div className="daemon-header">
-        <span className="pill">
-          BTC: {formatMoney(hb?.btc_last_price)}
-        </span>
+        {(() => {
+          const iso = btcLastUpdateIso(heartbeat);
+          const tip = iso ? `Last BTC tick: ${formatInstant(iso, timezone, timeFormat, "datetime")}` : "";
+          return (
+            <span className="pill has-tooltip" data-tooltip={tip} aria-label={tip}>
+              BTC: {formatMoney(hb?.btc_last_price)}
+            </span>
+          );
+        })()}
+        {hb?.btc_session && (
+          <span
+            className="pill has-tooltip"
+            data-tooltip={sessionTooltip(hb.btc_session, timezone, timeFormat)}
+            aria-label={sessionTooltip(hb.btc_session, timezone, timeFormat)}
+          >
+            Session: {hb.btc_session.toUpperCase()}
+          </span>
+        )}
         <span className={heartbeatAgeClass(age)}>
           Heartbeat: {age !== null ? `${age.toFixed(1)}s ago` : "absent"}
         </span>
@@ -1803,7 +2090,7 @@ export default function App() {
       case "orders":
         return <OrdersPage liveOrders={state.liveOrders} liveTrades={state.liveTrades} liveActivity={state.liveActivity} paperActivity={state.paperActivity} tradingMode={state.status?.trading_mode ?? "paper"} daemonTicks={state.daemonTicks} />;
       case "portfolio":
-        return <PortfolioPage summary={state.portfolioSummary} positions={state.closedPositions?.positions ?? []} openPositions={state.openPositions?.positions ?? []} equityCurve={state.equityCurve} daemonTicks={state.daemonTicks} heartbeat={state.daemonHeartbeat} />;
+        return <PortfolioPage summary={state.portfolioSummary} positions={state.closedPositions?.positions ?? []} openPositions={state.openPositions?.positions ?? []} equityCurve={state.equityCurve} daemonTicks={state.daemonTicks} heartbeat={state.daemonHeartbeat} settings={state.settings} />;
       case "events":
         return <EventsPage events={state.recentEvents} report={state.report} />;
       case "settings":
@@ -1824,27 +2111,63 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      <header className="hero">
-        <div>
-          <p className="eyebrow">Polymarket AI Agent</p>
-          <h1>Operator Dashboard</h1>
-          <p className="subtitle">Live monitoring for signals, trades, orders, and portfolio state.</p>
-        </div>
-        <div className="hero-meta">
-          <span className={`pill stream-${streamStatus}`}>
-            Stream: {streamStatus}
-          </span>
-          <span className={`pill ${state.auth?.readonly_ready ? "ready" : "blocked"}`}>
-            {state.auth?.readonly_ready ? "Readonly Ready" : "Auth Blocked"}
-          </span>
-          <span className={`pill ${state.status?.live_trading_enabled ? "ready" : "blocked"}`}>
-            {state.status?.live_trading_enabled ? "Live Enabled" : "Live Disabled"}
-          </span>
-          <button type="button" className="refresh-button" onClick={() => void refreshDashboard()}>
-            Refresh
-          </button>
-        </div>
-      </header>
+      {(() => {
+        const mode = state.status?.trading_mode || "paper";
+        const modeLive = mode.toLowerCase() === "live";
+        const dailyPnl = state.portfolioSummary?.daily_realized_pnl ?? 0;
+        const openCount = state.portfolioSummary?.open_positions ?? 0;
+        const exposure = state.portfolioSummary?.open_position_notional ?? 0;
+        const maxDailyLossRaw = state.settings?.values?.max_daily_loss_usd;
+        const maxDailyLoss = typeof maxDailyLossRaw === "number" ? maxDailyLossRaw : 0;
+        const dailyLossUsed = dailyPnl < 0 ? Math.min(1, -dailyPnl / (maxDailyLoss || 1)) : 0;
+        const dailyLossTone = dailyLossUsed >= 0.75 ? "negative" : dailyLossUsed >= 0.5 ? "blocked" : "muted";
+        const safetyStop = state.daemonHeartbeat?.heartbeat?.safety_stop_reason ?? null;
+        return (
+          <>
+            <header className="hero">
+              <div className="hero-left">
+                <div>
+                  <p className="eyebrow">Polymarket AI Agent</p>
+                  <h1>Operator Dashboard</h1>
+                </div>
+                <div className="hero-kpis">
+                  <span className={`pill mode-${modeLive ? "live" : "paper"}`}>
+                    {modeLive ? "LIVE" : "PAPER"}
+                  </span>
+                  <span className={`pill ${dailyPnl >= 0 ? "positive" : "negative"}`}>
+                    <span className="info-bar-label">Daily PnL</span>
+                    {formatMoney(dailyPnl)}
+                  </span>
+                  <span className="pill">
+                    <span className="info-bar-label">Open</span>
+                    {openCount} {openCount > 0 ? `· ${formatMoney(exposure)}` : ""}
+                  </span>
+                  {maxDailyLoss > 0 && (
+                    <span className={`pill ${dailyLossTone}`}>
+                      <span className="info-bar-label">Loss cap</span>
+                      {(dailyLossUsed * 100).toFixed(0)}%
+                    </span>
+                  )}
+                </div>
+              </div>
+              <div className="hero-meta">
+                <span className={`pill stream-${streamStatus}`}>
+                  Stream: {streamStatus}
+                </span>
+                <span className={`pill ${state.auth?.readonly_ready ? "ready" : "blocked"}`}>
+                  {state.auth?.readonly_ready ? "Auth Ready" : "Auth Blocked"}
+                </span>
+                <button type="button" className="refresh-button" onClick={() => void refreshDashboard()}>
+                  Refresh
+                </button>
+              </div>
+            </header>
+            {safetyStop && (
+              <div className="banner error">Safety stop active: {safetyStop}</div>
+            )}
+          </>
+        );
+      })()}
 
       <nav className="nav-strip">
         {VIEWS.map((view) => (

@@ -109,6 +109,17 @@ class EvidencePacket:
     # we haven't observed enough BTC history or the window hasn't started.
     btc_log_return_since_candle_open: float = 0.0
     time_elapsed_in_candle_s: int = 0
+    # Coarse UTC session tag (asia/eu/us/off) derived from the BTC snapshot's
+    # observed_at. Instrumentation-only today — logged in daemon_tick so we can
+    # stratify hit-rate / Brier by session before wiring it into the scorer.
+    btc_session: str = "off"
+    # Higher-timeframe log returns, derived from the BTC 1-minute bar buffer
+    # (backfilled from Binance /klines on startup). Instrumentation-only:
+    # logged in daemon_tick so we can study predictive value before any
+    # scorer change.
+    btc_log_return_1h: float = 0.0
+    btc_log_return_4h: float = 0.0
+    btc_log_return_24h: float = 0.0
     generated_at: datetime = field(default_factory=utc_now)
 
 

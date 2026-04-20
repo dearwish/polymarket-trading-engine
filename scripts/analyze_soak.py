@@ -4,9 +4,15 @@
 Usage:
     python scripts/analyze_soak.py                      # uses default paths
     python scripts/analyze_soak.py --events logs/events.jsonl --min-ticks 5
+    python scripts/analyze_soak.py --shadow             # include retro-shadow comparison
 
 Fetches current Polymarket market state to determine resolution outcome.
 Run after the markets you soaked on have closed.
+
+With --shadow the script re-simulates the htf_tilt shadow scorer offline
+against every logged tick (using the already-stored btc_log_return_1h and
+btc_session fields) and prints a side-by-side base vs shadow Brier / hit-rate
+table so you can gate promotion without deploying the variant live.
 """
 from __future__ import annotations
 
@@ -15,6 +21,7 @@ import json
 import math
 import sys
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -40,6 +47,13 @@ class TickRecord:
     bid_yes: float
     ask_yes: float
     btc_price: float
+    btc_session: str = "off"
+    btc_log_return_1h: float = 0.0
+    # Live shadow fields (present only when QUANT_SHADOW_VARIANT was set during soak)
+    shadow_fair_probability: float | None = None
+    shadow_suggested_side: str | None = None
+    shadow_edge_yes: float | None = None
+    shadow_edge_no: float | None = None
 
 
 @dataclass
@@ -51,9 +65,61 @@ class MarketSummary:
     final_implied: float | None = None
 
 
+@dataclass
+class ClosedPositionRecord:
+    """Subset of a position_closed event used by the hold-to-expiry analysis.
+
+    Produced by the daemon's `_finalize_paper_close` helper; self-contained
+    so analyze_soak can compare actual stop-out P&L against what would have
+    been realized if the position had been held until market resolution.
+    """
+    market_id: str
+    side: str            # "YES" | "NO"
+    size_usd: float
+    entry_price: float
+    exit_price: float
+    realized_pnl: float
+    close_reason: str
+    hold_seconds: float
+
+
 # ---------------------------------------------------------------------------
 # Journal reading
 # ---------------------------------------------------------------------------
+
+def load_closed_positions(events_path: Path) -> list[ClosedPositionRecord]:
+    """Parse position_closed events so --hold-to-expiry can attribute per-trade
+    realized P&L to a side + entry price without a DB join."""
+    out: list[ClosedPositionRecord] = []
+    with events_path.open() as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record.get("event_type") != "position_closed":
+                continue
+            p = record.get("payload", {})
+            try:
+                out.append(
+                    ClosedPositionRecord(
+                        market_id=str(p.get("market_id", "")),
+                        side=str(p.get("side", "")),
+                        size_usd=float(p.get("size_usd") or 0.0),
+                        entry_price=float(p.get("entry_price") or 0.0),
+                        exit_price=float(p.get("exit_price") or 0.0),
+                        realized_pnl=float(p.get("realized_pnl") or 0.0),
+                        close_reason=str(p.get("close_reason", "")),
+                        hold_seconds=float(p.get("hold_seconds") or 0.0),
+                    )
+                )
+            except (TypeError, ValueError):
+                continue
+    return out
+
 
 def load_ticks(events_path: Path) -> dict[str, MarketSummary]:
     summaries: dict[str, MarketSummary] = {}
@@ -77,6 +143,7 @@ def load_ticks(events_path: Path) -> dict[str, MarketSummary]:
                     market_id=market_id,
                     question=str(p.get("question", "")),
                 )
+            shadow_side_raw = p.get("shadow_suggested_side")
             tick = TickRecord(
                 logged_at=record.get("logged_at", ""),
                 market_id=market_id,
@@ -90,6 +157,12 @@ def load_ticks(events_path: Path) -> dict[str, MarketSummary]:
                 bid_yes=float(p.get("bid_yes") or 0.0),
                 ask_yes=float(p.get("ask_yes") or 0.0),
                 btc_price=float(p.get("btc_price") or 0.0),
+                btc_session=str(p.get("btc_session") or "off"),
+                btc_log_return_1h=float(p.get("btc_log_return_1h") or 0.0),
+                shadow_fair_probability=float(p["shadow_fair_probability"]) if p.get("shadow_fair_probability") is not None else None,
+                shadow_suggested_side=str(shadow_side_raw) if shadow_side_raw is not None else None,
+                shadow_edge_yes=float(p["shadow_edge_yes"]) if p.get("shadow_edge_yes") is not None else None,
+                shadow_edge_no=float(p["shadow_edge_no"]) if p.get("shadow_edge_no") is not None else None,
             )
             summaries[market_id].ticks.append(tick)
     return summaries
@@ -150,7 +223,162 @@ def brier_score(predictions: list[float], outcomes: list[float]) -> float:
     return sum((p - o) ** 2 for p, o in zip(predictions, outcomes)) / len(predictions)
 
 
-def analyze(summaries: dict[str, MarketSummary], min_ticks: int) -> None:
+def _retro_shadow_side(
+    tick: TickRecord,
+    htf_tilt_strength: float,
+    session_bias_eu: float,
+    session_bias_us: float,
+) -> tuple[str, float]:
+    """Re-simulate the htf_tilt shadow scorer from logged tick fields.
+
+    Returns (suggested_side, shadow_fair_probability).
+    """
+    base_fair = tick.fair_probability
+    tilt = 0.0
+    if tick.btc_log_return_1h != 0.0:
+        tilt += (1.0 if tick.btc_log_return_1h > 0.0 else -1.0) * htf_tilt_strength
+    biases = {"eu": session_bias_eu, "us": session_bias_us}
+    tilt += biases.get(tick.btc_session, 0.0)
+    fair_yes = max(0.01, min(0.99, base_fair + tilt))
+    # Reproduce edge signs using the same ask prices the live scorer saw.
+    # We don't have slippage/fee here so we use a zero-cost approximation;
+    # the sign of chosen side is what matters for hit-rate comparison.
+    edge_yes = fair_yes - tick.ask_yes
+    edge_no = (1.0 - fair_yes) - (1.0 - tick.bid_yes)  # bid_yes ≈ ask_no complement
+    if edge_yes <= 0.0 and edge_no <= 0.0:
+        return "ABSTAIN", fair_yes
+    if edge_yes >= edge_no:
+        return "YES", fair_yes
+    return "NO", fair_yes
+
+
+def _print_scorer_stats(
+    label: str,
+    resolved: dict[str, "MarketSummary"],
+    get_side: "Callable[[TickRecord], str | None]",
+    get_fair: "Callable[[TickRecord], float]",
+    min_ticks: int,
+) -> None:
+    all_correct: list[bool] = []
+    all_fair: list[float] = []
+    all_outcomes: list[float] = []
+    session_correct: dict[str, list[bool]] = defaultdict(list)
+
+    for ms in resolved.values():
+        ticks = [t for t in ms.ticks if len(ms.ticks) >= min_ticks]
+        if not ticks:
+            continue
+        outcome_bool = 1.0 if ms.outcome == "YES" else 0.0
+        for t in ticks:
+            side = get_side(t)
+            if side is None or side == "ABSTAIN":
+                continue
+            correct = side == ms.outcome
+            all_correct.append(correct)
+            all_fair.append(get_fair(t))
+            all_outcomes.append(outcome_bool)
+            session_correct[t.btc_session].append(correct)
+
+    overall_hit = sum(all_correct) / len(all_correct) if all_correct else float("nan")
+    bs = brier_score(all_fair, all_outcomes)
+    print(f"\n  [{label}]")
+    print(f"    Non-abstain ticks : {len(all_correct)}")
+    hit_str = f"{overall_hit:.1%}" if not math.isnan(overall_hit) else "n/a"
+    print(f"    Hit rate          : {hit_str}")
+    print(f"    Brier score       : {bs:.4f}")
+    for sess in ("asia", "eu", "us", "off"):
+        data = session_correct.get(sess, [])
+        if not data:
+            continue
+        h = sum(data) / len(data)
+        print(f"    Session {sess:6s}    : {h:.1%}  (n={len(data)})")
+
+
+def _hold_to_expiry_pnl(pos: ClosedPositionRecord, outcome: str) -> float:
+    """P&L had the position been held to resolution instead of stopped out.
+
+    YES outcome pays the YES-token holder $1; NO pays the NO-token holder $1.
+    So for a YES position the resolution price is 1 if outcome=YES else 0, and
+    analogously for NO. Uses the same formula as PortfolioEngine._compute_pnl.
+    """
+    if pos.entry_price <= 0 or pos.size_usd <= 0:
+        return 0.0
+    if pos.side == "YES":
+        resolution_price = 1.0 if outcome == "YES" else 0.0
+    elif pos.side == "NO":
+        resolution_price = 1.0 if outcome == "NO" else 0.0
+    else:
+        return 0.0
+    shares = pos.size_usd / pos.entry_price
+    return (resolution_price - pos.entry_price) * shares
+
+
+def analyze_hold_to_expiry(
+    closed: list[ClosedPositionRecord],
+    resolved: dict[str, MarketSummary],
+) -> None:
+    """Print actual (stopped) P&L vs hypothetical hold-to-expiry P&L.
+
+    Only counts positions whose market fetched a resolved YES/NO outcome.
+    The delta is the narrow answer to "are our stops destroying edge?"
+    """
+    matched: list[tuple[ClosedPositionRecord, str]] = []
+    for pos in closed:
+        ms = resolved.get(pos.market_id)
+        if ms is None or ms.outcome is None:
+            continue
+        matched.append((pos, ms.outcome))
+
+    print("\n=== Hold-to-expiry counterfactual ===")
+    if not matched:
+        print("  No resolved closed positions in the event log — try again after markets resolve.")
+        return
+
+    actual_total = 0.0
+    hold_total = 0.0
+    correct_side = 0
+    by_reason: dict[str, list[tuple[float, float]]] = defaultdict(list)
+    for pos, outcome in matched:
+        hold_pnl = _hold_to_expiry_pnl(pos, outcome)
+        actual_total += pos.realized_pnl
+        hold_total += hold_pnl
+        if (pos.side == "YES" and outcome == "YES") or (pos.side == "NO" and outcome == "NO"):
+            correct_side += 1
+        by_reason[pos.close_reason].append((pos.realized_pnl, hold_pnl))
+
+    n = len(matched)
+    win_rate = correct_side / n if n else 0.0
+    print(f"  Matched trades        : {n}")
+    print(f"  Side-correct (to expiry): {correct_side}/{n} ({win_rate:.1%})")
+    print(f"  Actual stopped P&L    : {actual_total:+.4f}")
+    print(f"  Hold-to-expiry P&L    : {hold_total:+.4f}")
+    print(f"  Delta (hold − stop)   : {(hold_total - actual_total):+.4f}")
+
+    print("  By close reason:")
+    for reason in sorted(by_reason):
+        rows = by_reason[reason]
+        a = sum(r[0] for r in rows)
+        h = sum(r[1] for r in rows)
+        print(f"    {reason:25s}  n={len(rows):3d}  stopped={a:+.4f}  hold={h:+.4f}  delta={h - a:+.4f}")
+
+    if hold_total > actual_total + 1e-6:
+        print("\n  ▶ Stops appear to be cutting winners short — widen or switch to time-based exit.")
+    elif hold_total < actual_total - 1e-6:
+        print("\n  ▶ Stops are protecting capital — hold-to-expiry would lose more than current exits.")
+    else:
+        print("\n  ▶ Stops and expiry are roughly equivalent in this sample.")
+
+
+def analyze(
+    summaries: dict[str, MarketSummary],
+    min_ticks: int,
+    shadow: bool = False,
+    htf_tilt_strength: float = 0.10,
+    session_bias_eu: float = 0.0,
+    session_bias_us: float = 0.0,
+    closed_positions: list[ClosedPositionRecord] | None = None,
+    hold_to_expiry: bool = False,
+) -> None:
     client = httpx.Client(timeout=15)
 
     print("\n=== Fetching market resolutions ===")
@@ -232,6 +460,58 @@ def analyze(summaries: dict[str, MarketSummary], min_ticks: int) -> None:
     else:
         print("  ✗  Hit rate ≤ 50% — model needs re-calibration before live trading")
 
+    if hold_to_expiry and closed_positions is not None:
+        analyze_hold_to_expiry(closed_positions, resolved)
+
+    if not shadow:
+        return
+
+    # --- Retro-shadow comparison -------------------------------------------------
+    print("\n=== Retro-shadow A/B (base vs htf_tilt) ===")
+    print(f"    HTF tilt strength : {htf_tilt_strength:+.3f}")
+    print(f"    Session bias EU   : {session_bias_eu:+.3f}")
+    print(f"    Session bias US   : {session_bias_us:+.3f}")
+
+    # Base scorer (using logged fair_probability and suggested_side)
+    _print_scorer_stats(
+        "base",
+        resolved,
+        get_side=lambda t: t.suggested_side,
+        get_fair=lambda t: t.fair_probability,
+        min_ticks=min_ticks,
+    )
+
+    # Live shadow (only ticks where the daemon already logged shadow fields)
+    live_shadow_ticks = sum(
+        1 for ms in resolved.values() for t in ms.ticks if t.shadow_suggested_side is not None
+    )
+    if live_shadow_ticks > 0:
+        _print_scorer_stats(
+            f"shadow-live ({live_shadow_ticks} ticks)",
+            resolved,
+            get_side=lambda t: t.shadow_suggested_side,
+            get_fair=lambda t: t.shadow_fair_probability if t.shadow_fair_probability is not None else t.fair_probability,
+            min_ticks=min_ticks,
+        )
+
+    # Retro-simulated shadow (re-applies tilt offline to all ticks)
+    def retro_side(t: TickRecord) -> str:
+        side, _ = _retro_shadow_side(t, htf_tilt_strength, session_bias_eu, session_bias_us)
+        return side
+
+    def retro_fair(t: TickRecord) -> float:
+        _, fp = _retro_shadow_side(t, htf_tilt_strength, session_bias_eu, session_bias_us)
+        return fp
+
+    _print_scorer_stats(
+        "shadow-retro (all ticks)",
+        resolved,
+        get_side=retro_side,
+        get_fair=retro_fair,
+        min_ticks=min_ticks,
+    )
+    print()
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -250,6 +530,34 @@ def main() -> None:
         default=3,
         help="Minimum daemon_tick count to include a market (default: 3)",
     )
+    parser.add_argument(
+        "--shadow",
+        action="store_true",
+        help="Print retro-shadow A/B comparison (base vs htf_tilt variant)",
+    )
+    parser.add_argument(
+        "--hold-to-expiry",
+        action="store_true",
+        help="Compare actual stopped P&L against hypothetical hold-to-resolution P&L",
+    )
+    parser.add_argument(
+        "--htf-tilt-strength",
+        type=float,
+        default=0.10,
+        help="HTF tilt magnitude for retro-shadow (default: 0.10)",
+    )
+    parser.add_argument(
+        "--session-bias-eu",
+        type=float,
+        default=0.0,
+        help="Additive EU-session bias for retro-shadow (default: 0.0)",
+    )
+    parser.add_argument(
+        "--session-bias-us",
+        type=float,
+        default=0.0,
+        help="Additive US-session bias for retro-shadow (default: 0.0)",
+    )
     args = parser.parse_args()
 
     events_path = Path(args.events)
@@ -260,11 +568,25 @@ def main() -> None:
     summaries = load_ticks(events_path)
     print(f"Loaded {sum(len(ms.ticks) for ms in summaries.values())} daemon_tick events across {len(summaries)} markets")
 
+    closed_positions: list[ClosedPositionRecord] = []
+    if args.hold_to_expiry:
+        closed_positions = load_closed_positions(events_path)
+        print(f"Loaded {len(closed_positions)} position_closed events")
+
     if not summaries:
         print("No daemon_tick events found in journal.")
         sys.exit(0)
 
-    analyze(summaries, min_ticks=args.min_ticks)
+    analyze(
+        summaries,
+        min_ticks=args.min_ticks,
+        shadow=args.shadow,
+        htf_tilt_strength=args.htf_tilt_strength,
+        session_bias_eu=args.session_bias_eu,
+        session_bias_us=args.session_bias_us,
+        closed_positions=closed_positions,
+        hold_to_expiry=args.hold_to_expiry,
+    )
 
 
 if __name__ == "__main__":

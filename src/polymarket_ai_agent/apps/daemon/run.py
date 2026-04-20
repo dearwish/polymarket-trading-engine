@@ -110,6 +110,7 @@ class DecisionContext:
     assessment: MarketAssessment
     metrics: "DaemonMetrics"
     packet: "EvidencePacket | None" = None
+    shadow_assessment: "MarketAssessment | None" = None
 
 
 DecisionCallback = Callable[[DecisionContext], Awaitable[None]]
@@ -334,13 +335,24 @@ class DaemonRunner:
         # Seed from REST so features are usable before the first tick arrives.
         tick = await asyncio.to_thread(feed.rest_price)
         if tick is not None:
-            self.btc_state.record(tick.price, tick.observed_at)
+            self.btc_state.record(tick.price, tick.observed_at, quantity=tick.quantity)
+        # Backfill ~24 h of 1-min klines so HTF log returns (1h/4h/24h) are
+        # usable immediately — otherwise the daemon has to live-accumulate
+        # minute bars, which would leave 24h returns at 0.0 for a full day.
+        # Failure-safe: if the REST call fails we proceed with an empty buffer
+        # and HTF fields emit their defaults until live bars fill in.
+        try:
+            bars = await asyncio.to_thread(feed.rest_klines, "1m", 1440)
+            retained = self.btc_state.backfill_minute_bars(bars)
+            logger.info("BTC klines backfilled: fetched=%d retained=%d", len(bars), retained)
+        except Exception as exc:
+            logger.warning("BTC klines backfill failed, HTF features will cold-start: %s", exc)
         async for tick in self._iter_btc(feed, stop_event):
             if stop_event.is_set():
                 break
             self.metrics.btc_ticks += 1
             self.metrics.last_btc_tick_at = tick.observed_at
-            self.btc_state.record(tick.price, tick.observed_at)
+            self.btc_state.record(tick.price, tick.observed_at, quantity=tick.quantity)
 
     async def _iter_btc(self, feed: BinanceBtcFeed, stop_event: asyncio.Event) -> AsyncIterator[BtcTick]:
         async for tick in feed.run(stop_event=stop_event):
@@ -386,6 +398,7 @@ class DaemonRunner:
             btc_log_return_since_candle_open=candle_open_log_return,
         )
         assessment = self.quant.score_market(packet)
+        shadow_assessment = self.quant.score_shadow(packet)
         context = DecisionContext(
             market_id=state.market_id,
             candidate=candidate,
@@ -394,6 +407,7 @@ class DaemonRunner:
             assessment=assessment,
             metrics=self.metrics,
             packet=packet,
+            shadow_assessment=shadow_assessment,
         )
         try:
             await self._decision_callback(context)
@@ -467,6 +481,11 @@ class DaemonRunner:
             "btc_log_return_5m": btc.log_return_5m if btc else None,
             "btc_log_return_since_candle_open": context.packet.btc_log_return_since_candle_open if context.packet else None,
             "time_elapsed_in_candle_s": context.packet.time_elapsed_in_candle_s if context.packet else None,
+            "btc_session": btc.btc_session if btc else None,
+            "btc_log_return_1h": btc.btc_log_return_1h if btc else None,
+            "btc_log_return_4h": btc.btc_log_return_4h if btc else None,
+            "btc_log_return_24h": btc.btc_log_return_24h if btc else None,
+            "btc_minute_bar_count": btc.minute_bar_count if btc else None,
             "polymarket_events": context.metrics.polymarket_events,
             "btc_ticks": context.metrics.btc_ticks,
             "fair_probability": assessment.fair_probability,
@@ -477,7 +496,19 @@ class DaemonRunner:
             "confidence": assessment.confidence,
             "slippage_bps": assessment.slippage_bps,
             "expiry_risk": assessment.expiry_risk,
+            # Surface the scorer's verbatim reasons so the dashboard no longer
+            # has to guess which gate fired. reasons_to_abstain is the list we
+            # care about for ABSTAIN rendering; reasons_for_trade is kept for
+            # completeness (e.g. tooltip on YES/NO picks).
+            "reasons_to_abstain": list(assessment.reasons_to_abstain or []),
+            "reasons_for_trade": list(assessment.reasons_for_trade or []),
         }
+        shadow = context.shadow_assessment
+        if shadow is not None:
+            payload["shadow_fair_probability"] = shadow.fair_probability
+            payload["shadow_suggested_side"] = shadow.suggested_side.value
+            payload["shadow_edge_yes"] = shadow.edge_yes
+            payload["shadow_edge_no"] = shadow.edge_no
         await asyncio.to_thread(self.service.journal.log_event, "daemon_tick", payload)
 
     async def _paper_execute_decision_callback(self, context: DecisionContext) -> None:
@@ -564,24 +595,23 @@ class DaemonRunner:
                 # --- 2. Trailing stop (full close) ------------------------
                 # Arms only once peak clears entry × (1 + arm_pct); prevents
                 # the trail from locking in a small loss when the peak barely
-                # moved above entry.
+                # moved above entry. Independently, the trigger price is floored
+                # at entry: a freshly-armed trail with arm_pct < trail_pct / (1 -
+                # trail_pct) would otherwise place its floor below entry and
+                # could fire as a realised loss on the first pullback.
                 trail_pct = float(self.settings.paper_trailing_stop_pct)
                 arm_pct = float(self.settings.paper_trail_arm_pct)
                 peak = extras["peak_price"]
                 arm_threshold = entry_price * (1.0 + arm_pct)
                 trail_armed = peak >= arm_threshold
-                if trail_pct > 0.0 and trail_armed and current_price <= peak * (1.0 - trail_pct):
+                trail_floor = max(peak * (1.0 - trail_pct), entry_price)
+                if trail_pct > 0.0 and trail_armed and current_price <= trail_floor:
                     exit_price_walk = self._paper_exit_fill(
                         market_id, open_pos.side, float(open_pos.size_usd), float(current_price)
                     )
-                    await asyncio.to_thread(
-                        self.service.portfolio.close_position,
-                        market_id,
-                        exit_price_walk,
-                        "paper_trailing_stop",
+                    await self._finalize_paper_close(
+                        open_pos, exit_price_walk, "paper_trailing_stop", tte_seconds, context
                     )
-                    self._position_extras.pop(market_id, None)
-                    self._last_close_at[market_id] = _utc_now()
                     return
                 # --- 3 + 4. Fixed TP / SL ---------------------------------
                 # If any ladder tranche has already fired, the remaining slice
@@ -602,29 +632,33 @@ class DaemonRunner:
                     exit_price_walk = self._paper_exit_fill(
                         market_id, open_pos.side, float(open_pos.size_usd), float(current_price)
                     )
-                    await asyncio.to_thread(
-                        self.service.portfolio.close_position,
-                        market_id,
-                        exit_price_walk,
-                        close_reason,
+                    await self._finalize_paper_close(
+                        open_pos, exit_price_walk, close_reason, tte_seconds, context
                     )
-                    self._position_extras.pop(market_id, None)
-                    self._last_close_at[market_id] = _utc_now()
                     return
-            # --- 5. TTE exit buffer ---------------------------------------
+            # --- 5. Force-exit at T-N seconds -----------------------------
+            # Closes unconditionally before the final-seconds noise band where
+            # the trailing stop tends to fire on spread widening rather than
+            # real adverse moves. Kicks in strictly before the exit buffer so
+            # the two don't race; exit buffer is kept as a safety floor.
+            force_tte = int(self.settings.position_force_exit_tte_seconds)
+            if force_tte > 0 and tte_seconds <= force_tte and current_price > 0.0:
+                exit_price_walk = self._paper_exit_fill(
+                    market_id, open_pos.side, float(open_pos.size_usd), float(current_price)
+                )
+                await self._finalize_paper_close(
+                    open_pos, exit_price_walk, "paper_time_based_exit", tte_seconds, context
+                )
+                return
+            # --- 6. TTE exit buffer ---------------------------------------
             exit_buffer = self.service.risk.exit_buffer_seconds_for_tte(tte_seconds)
             if tte_seconds <= exit_buffer and current_price > 0.0:
                 exit_price_walk = self._paper_exit_fill(
                     market_id, open_pos.side, float(open_pos.size_usd), float(current_price)
                 )
-                await asyncio.to_thread(
-                    self.service.portfolio.close_position,
-                    market_id,
-                    exit_price_walk,
-                    "paper_tte_exit",
+                await self._finalize_paper_close(
+                    open_pos, exit_price_walk, "paper_tte_exit", tte_seconds, context
                 )
-                self._position_extras.pop(market_id, None)
-                self._last_close_at[market_id] = _utc_now()
             return  # Do not open a duplicate while a position is live.
         # Clean up extras if no open position exists (e.g., previous TTE close).
         self._position_extras.pop(market_id, None)
@@ -637,6 +671,19 @@ class DaemonRunner:
                 elapsed = (_utc_now() - last_close).total_seconds()
                 if elapsed < cooldown_seconds:
                     return
+
+        # Block entry until enough of the candle has elapsed for the drift
+        # signal (btc_log_return_since_candle_open) to carry real information.
+        # Skipped for threshold markets where time_elapsed_in_candle_s is 0.
+        family_window = _FAMILY_WINDOW_SECONDS.get(self.settings.market_family, 0)
+        if family_window > 0:
+            candle_elapsed = context.packet.time_elapsed_in_candle_s if context.packet else 0
+            min_elapsed = int(self.settings.min_candle_elapsed_seconds)
+            if min_elapsed > 0 and candle_elapsed < min_elapsed:
+                return
+            max_elapsed = int(self.settings.max_candle_elapsed_seconds)
+            if max_elapsed > 0 and candle_elapsed > max_elapsed:
+                return
 
         snapshot = MarketSnapshot(
             candidate=candidate,
@@ -714,6 +761,57 @@ class DaemonRunner:
             "original_size_usd": float(open_pos.size_usd) + closed_size,
         }
 
+    async def _finalize_paper_close(
+        self,
+        open_pos: "Any",
+        exit_price: float,
+        close_reason: str,
+        tte_at_close: int,
+        context: DecisionContext,
+    ) -> None:
+        """Close an open paper position and emit a self-contained
+        ``position_closed`` event so analyze_soak can correlate entries,
+        exits, and outcomes from events.jsonl alone (no DB join).
+        """
+        market_id = open_pos.market_id
+        await asyncio.to_thread(
+            self.service.portfolio.close_position,
+            market_id,
+            exit_price,
+            close_reason,
+        )
+        self._position_extras.pop(market_id, None)
+        self._last_close_at[market_id] = _utc_now()
+        entry_price = float(open_pos.entry_price)
+        size_usd = float(open_pos.size_usd)
+        shares = size_usd / max(entry_price, 1e-6)
+        fee_bps = float(self.settings.fee_bps)
+        pnl_usd = (float(exit_price) - entry_price) * shares - size_usd * (fee_bps / 10_000.0) * 2.0
+        pnl_pct = (float(exit_price) - entry_price) / entry_price if entry_price > 0 else 0.0
+        opened_at = open_pos.opened_at
+        hold_seconds = (_utc_now() - opened_at).total_seconds() if opened_at else 0.0
+        assessment = context.assessment
+        payload: dict[str, Any] = {
+            "market_id": market_id,
+            "question": context.candidate.question,
+            "slug": context.candidate.slug,
+            "end_date_iso": context.candidate.end_date_iso,
+            "side": open_pos.side.value,
+            "size_usd": size_usd,
+            "entry_price": entry_price,
+            "exit_price": float(exit_price),
+            "realized_pnl": round(pnl_usd, 6),
+            "pnl_pct": round(pnl_pct, 6),
+            "close_reason": close_reason,
+            "opened_at": opened_at.isoformat() if opened_at else None,
+            "closed_at": _utc_now().isoformat(),
+            "hold_seconds": round(hold_seconds, 3),
+            "tte_at_close_seconds": int(tte_at_close),
+            "fair_probability_at_close": assessment.fair_probability,
+            "edge_at_close": assessment.edge,
+        }
+        await asyncio.to_thread(self.service.journal.log_event, "position_closed", payload)
+
     def _paper_exit_fill(
         self, market_id: str, side: "SuggestedSide", size_usd: float, fallback_price: float
     ) -> float:
@@ -767,11 +865,18 @@ class DaemonRunner:
             try:
                 auth = self._auth_readonly_ready()
                 self._apply_safety_stop(auth_readonly_ready=auth)
+                btc_snapshot = self.btc_state.snapshot()
                 extra = {
                     "active_market_ids": self.active_market_ids,
+                    "active_market_slugs": {
+                        mid: c.slug
+                        for mid, c in self._candidates.items()
+                        if c.slug
+                    },
                     "active_asset_ids": self.active_asset_ids,
                     "btc_last_price": self.btc_state.last_price,
                     "btc_seconds_since_last_update": self.btc_state.seconds_since_last_update(),
+                    "btc_session": btc_snapshot.btc_session if btc_snapshot else None,
                     "auth_readonly_ready": auth,
                     "safety_stop_reason": self.metrics.safety_stop_reason,
                     "market_family": self.settings.market_family,

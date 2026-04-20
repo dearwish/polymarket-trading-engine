@@ -77,6 +77,10 @@ class ResearchEngine:
         btc_return_5m = btc_snapshot.log_return_5m if btc_snapshot else 0.0
         btc_return_15m = btc_snapshot.log_return_15m if btc_snapshot else 0.0
         realized_vol_30m = btc_snapshot.realized_vol_30m if btc_snapshot else 0.0
+        btc_session = btc_snapshot.btc_session if btc_snapshot else "off"
+        btc_return_1h = btc_snapshot.btc_log_return_1h if btc_snapshot else 0.0
+        btc_return_4h = btc_snapshot.btc_log_return_4h if btc_snapshot else 0.0
+        btc_return_24h = btc_snapshot.btc_log_return_24h if btc_snapshot else 0.0
         context = [
             f"Market question: {candidate.question}",
             f"BTC price: {btc_price:.2f}",
@@ -121,6 +125,10 @@ class ResearchEngine:
             time_elapsed_in_candle_s=time_elapsed_in_candle_s,
             btc_log_return_vs_strike=log_return_vs_strike,
             btc_log_return_since_candle_open=btc_log_return_since_candle_open,
+            btc_session=btc_session,
+            btc_log_return_1h=btc_return_1h,
+            btc_log_return_4h=btc_return_4h,
+            btc_log_return_24h=btc_return_24h,
         )
 
     @staticmethod

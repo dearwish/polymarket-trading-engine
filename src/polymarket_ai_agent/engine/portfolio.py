@@ -188,6 +188,33 @@ class PortfolioEngine:
             ).fetchone()
         return float(row[0] or 0.0)
 
+    def get_consecutive_losses(self, limit: int = 100) -> int:
+        """Count CLOSED positions from the most recent backward until a
+        non-losing close breaks the streak (realized_pnl > 0 → break).
+
+        Losing = realized_pnl <= 0. A zero-PnL scratch still counts as a loss
+        since it means the position did not earn anything to justify the risk.
+        Limit bounds the scan; practical streaks that matter are < 20, so the
+        default is generous. Returns 0 when no closed positions exist.
+        """
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            rows = conn.execute(
+                """
+                select realized_pnl
+                from positions
+                where status = 'CLOSED' and closed_at is not null
+                order by closed_at desc
+                limit ?
+                """,
+                (int(max(1, limit)),),
+            ).fetchall()
+        streak = 0
+        for (pnl,) in rows:
+            if float(pnl or 0.0) > 0.0:
+                break
+            streak += 1
+        return streak
+
     def get_daily_realized_pnl(self, now: datetime | None = None) -> float:
         current = now or _utc_now()
         with closing(sqlite3.connect(self.db_path)) as conn, conn:

@@ -78,14 +78,52 @@ body {
 
 .hero h1 {
   margin: 0;
-  font-size: clamp(32px, 5vw, 56px);
-  line-height: 0.96;
+  font-size: clamp(24px, 3.2vw, 40px);
+  line-height: 0.98;
 }
 
 .subtitle {
   max-width: 700px;
   margin: 12px 0 0;
   color: var(--muted);
+}
+
+.hero-left {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.hero-kpis {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.hero-kpis .pill {
+  padding: 8px 12px;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.hero-kpis .pill.positive { color: var(--accent); }
+.hero-kpis .pill.negative { color: var(--danger); }
+.hero-kpis .pill.blocked { color: var(--warning); }
+.hero-kpis .pill.muted { color: var(--muted); }
+
+.pill.mode-paper {
+  color: var(--muted);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+}
+
+.pill.mode-live {
+  background: rgba(239, 85, 85, 0.12);
+  border-color: rgba(239, 85, 85, 0.45);
+  color: var(--danger);
+  font-weight: 700;
+  letter-spacing: 0.08em;
 }
 
 .hero-meta {
@@ -101,6 +139,38 @@ body {
   padding: 10px 14px;
   background: var(--panel);
   border: 1px solid var(--border);
+}
+
+.has-tooltip {
+  position: relative;
+  cursor: help;
+}
+
+.has-tooltip::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(8, 17, 31, 0.98);
+  color: var(--text);
+  border: 1px solid var(--border);
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.35;
+  white-space: nowrap;
+  z-index: 100;
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+}
+
+.has-tooltip:hover::after,
+.has-tooltip:focus-visible::after {
+  opacity: 1;
+  visibility: visible;
 }
 
 .pill.ready {
