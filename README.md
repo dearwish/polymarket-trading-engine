@@ -8,7 +8,7 @@ Event-driven BTC trading agent for Polymarket's short-horizon markets (`btc_5m`,
 
 ## Current Status
 
-Production paper-trading system with 246 tests. Works end-to-end: WebSocket discovery → quant scoring → risk gating → paper execution → position tracking → dashboard.
+Production paper-trading system with 311 tests. Works end-to-end: WebSocket discovery → quant scoring → risk gating → paper execution → position tracking → dashboard.
 
 - Python package under `src/polymarket_ai_agent`
 - operator CLI via `polymarket-ai-agent`
@@ -28,10 +28,10 @@ Production paper-trading system with 246 tests. Works end-to-end: WebSocket disc
 - **SQLite hygiene** — WAL mode, `synchronous=NORMAL`, explicit indexes on every hot lookup column, bounded `events.jsonl` tail reads, and an auto-prune loop (Phase 4; see the SQLite & Log-Growth Risk section in `docs/ROADMAP.md`)
 - **operational readiness** — daemon heartbeat file, `/api/healthz` + `/api/metrics` (JSON + Prometheus), background retention / WAL-checkpoint / size-gauge maintenance loop, VACUUM INTO backups, kill-switch on auth failure + stale heartbeat, systemd units + nightly backup timer + logrotate in `docs/DEPLOYMENT.md` (Phase 5)
 - **paper soak hardening** — `WS_SSL_VERIFY` setting for proxy/VPN environments; 300-second minimum TTE guard in market discovery (Polymarket's `closed=false` lags behind resolution); `btc_log_return_vs_strike` field in `EvidencePacket` so the quant scorer uses `ln(S/K)` (Black-Scholes distance-to-strike) for threshold markets instead of short-term momentum
-- **soak analysis** — `scripts/analyze_soak.py` correlates `daemon_tick` journal entries against resolved market outcomes and reports hit rate, mean edge captured, abstain rate, and Brier score
+- **soak analysis** — `scripts/analyze_soak.py` correlates `daemon_tick` journal entries against resolved market outcomes and reports hit rate, mean edge captured, abstain rate, and Brier score. `--shadow` prints a base-vs-shadow (htf_tilt) A/B table of the same metrics; `--hold-to-expiry` loads `position_closed` events and compares realized stopped P&L against the P&L the position would have earned if held until resolution, broken down by close reason
 - **slug-prediction discovery** (Phase 7) — rolling `btc-updown-5m`, `btc-updown-15m`, and `bitcoin-up-or-down-<date>-<hr>{am,pm}-et` markets do **not** appear in Polymarket's bulk `/markets` or `/events` listings. For `btc_5m` / `btc_15m` / `btc_1h` the connector now predicts the next 3 window-start slugs and fetches `/events/slug/<slug>` directly. Per-family `min_tte` floor in `discover_markets` so a 5-minute market with ~30s left still gets picked up. Match scores also require the canonical slug prefix so daily "Up or Down" decoys can't sneak into the short-horizon families.
-- **daemon auto paper execution** (opt-in) — set `DAEMON_AUTO_PAPER_EXECUTE=true` in `.env` and the daemon's decision callback routes every APPROVED signal through the real risk → execute → portfolio pipeline, so simulated trades accumulate in the Portfolio tab and `positions` DB table without a separate CLI runner. Positions are force-closed at the per-family exit buffer (mid price). Safe by default: disabled unless explicitly set.
-- test suite covering connectors, scoring, risk, execution, service, CLI, state/daemon/feed modules, the execution router and VWAP fills, live fill bridging, the live close flow, per-family risk profiles, btc_15m discovery, journal retention, heartbeats, `/api/metrics`/`/api/healthz`, daemon kill-switch gating, slug-prediction discovery for 5m/15m/1h families, and daemon paper-execute lifecycle — **246 tests**
+- **daemon auto paper execution** (opt-in) — set `DAEMON_AUTO_PAPER_EXECUTE=true` in `.env` and the daemon's decision callback routes every APPROVED signal through the real risk → execute → portfolio pipeline, so simulated trades accumulate in the Portfolio tab and `positions` DB table without a separate CLI runner. Open positions run through the full TP-ladder / trailing-stop / fixed-SL / force-exit / TTE-buffer ladder described in [Position Lifecycle (Paper)](#position-lifecycle-paper). Safe by default: disabled unless explicitly set.
+- test suite covering connectors, scoring, risk, execution, service, CLI, state/daemon/feed modules, the execution router and VWAP fills, live fill bridging, the live close flow, per-family risk profiles, btc_15m discovery, journal retention, heartbeats, `/api/metrics`/`/api/healthz`, daemon kill-switch gating, slug-prediction discovery for 5m/15m/1h families, and daemon paper-execute lifecycle — **311 tests**
 
 Important:
 
@@ -159,15 +159,14 @@ LIVE_TRADING_ENABLED=false
   - `status`
   - `report`
 
-## Strategy Scope For V1
+## Strategy Scope
 
-The first version is intentionally narrow:
+The current live focus is **BTC "Up or Down" candle markets** — 15-minute and 5-minute repeating binary markets that resolve on close-vs-open direction. `btc_daily_threshold` (above-$K) and `btc_1h` markets are supported by the same code path but aren't the primary soak target.
 
-- target one repetitive market family only
-- current implemented focus: BTC daily threshold markets
-- use OpenRouter as the default model gateway
-- keep execution deterministic and mostly non-agentic
-- require structured LLM output and local risk approval before any order can be placed
+- Deterministic quant scoring (Black-Scholes GBM + microstructure imbalance) is the default decision path; the OpenRouter LLM path stays wired as an optional advisor but does not gate trades today.
+- Entries are screened through a candle-window filter (`MIN_CANDLE_ELAPSED_SECONDS` / `MAX_CANDLE_ELAPSED_SECONDS`) so the daemon skips the noisy opening and closing seconds of each candle.
+- Exits are paper-only today, running through a configurable ladder (TP tranches → trailing stop → fixed TP/SL → pre-expiry force-exit → TTE buffer) detailed in [Position Lifecycle (Paper)](#position-lifecycle-paper).
+- Live order posting is still behind the hard gates described in [Live Trading Safety Model](#live-trading-safety-model); nothing on the candle-market path is enabled for live by default.
 
 ## Files
 
@@ -211,6 +210,46 @@ WS_SSL_VERIFY=true  # set false if a proxy/VPN presents a self-signed cert
 - confidence scales with edge magnitude and degrades when slippage is high
 - expiry-risk tiers configurable via `QUANT_HIGH_EXPIRY_RISK_SECONDS` / `QUANT_MEDIUM_EXPIRY_RISK_SECONDS`
 - the `ScoringEngine.OpenRouter` path is preserved but now returns the same per-side edge fields
+- every tick exposes `reasons_to_abstain` / `reasons_for_trade` so the dashboard can show the exact gate that fired instead of inferring it
+
+### Regime gates
+
+Before picking a side, `QuantScoringEngine._regime_gate` runs four independent vetoes. The primary-cause reason is inserted at the head of `reasons_to_abstain` so downstream consumers (dashboard, `analyze_soak.py`) see the binding constraint first.
+
+| gate | env flag | effect |
+|---|---|---|
+| Minimum entry price | `QUANT_MIN_ENTRY_PRICE` | Blocks trades whose side's ask is below the floor — at distressed prices the bid-ask spread alone exceeds the stop-loss width. |
+| Trend-based min edge | `QUANT_TREND_FILTER_ENABLED` + `QUANT_TREND_FILTER_MIN_ABS_RETURN` | Counter-trend trades need a higher edge (`QUANT_TREND_OPPOSED_STRONG_MIN_EDGE` vs 4h, `QUANT_TREND_OPPOSED_WEAK_MIN_EDGE` vs 1h). With-trend and ranging trades are unaffected. |
+| Distressed market | `QUANT_TREND_DISTRESSED_MAX_ASK` | Even with sufficient edge, blocks counter-trend buys when our side's ask is below the floor — the market has already priced in the move. |
+| OFI gate | `QUANT_OFI_GATE_ENABLED` + `QUANT_OFI_GATE_MIN_ABS_FLOW` | Vetoes trades that oppose strong informed order flow (`signed_flow_5s`). |
+| Volatility regime | `QUANT_VOL_REGIME_ENABLED` + `QUANT_VOL_REGIME_HIGH_THRESHOLD` / `EXTREME_THRESHOLD` | Raises the edge bar in high vol, abstains outright in extreme vol. |
+| `|edge|` ceiling | `QUANT_MAX_ABS_EDGE` | Forces ABSTAIN when the chosen edge is implausibly large — empirically the worst-performing bucket on previous soaks. |
+
+### Shadow scorer (A/B)
+
+`QUANT_SHADOW_VARIANT=htf_tilt` runs a parallel scorer on every tick without affecting live trading. Output appears on `daemon_tick` as `shadow_fair_probability` / `shadow_suggested_side` / `shadow_edge_yes` / `shadow_edge_no`. The htf_tilt variant nudges `fair_yes` by `sign(btc_log_return_1h) × QUANT_SHADOW_HTF_TILT_STRENGTH` plus an optional session bias (`QUANT_SHADOW_SESSION_BIAS_EU` / `QUANT_SHADOW_SESSION_BIAS_US`). Compare offline with `scripts/analyze_soak.py --shadow`.
+
+## Position Lifecycle (Paper)
+
+With `DAEMON_AUTO_PAPER_EXECUTE=true`, every APPROVED decision opens a paper position that runs through a fixed exit priority (first match wins, re-evaluated on every tick):
+
+1. **TP ladder** — `PAPER_TP_LADDER="0.15:0.5,0.30:0.25"` closes 50% at +15% PnL and another 25% at +30% (as a fraction of the original size).
+2. **Trailing stop** — tracks the peak token price and closes when price drops `PAPER_TRAILING_STOP_PCT` below peak. Only arms once peak clears `entry × (1 + PAPER_TRAIL_ARM_PCT)`, and the trigger is floored at entry so a freshly armed trail can't fire as a realized loss. Set to `0.0` to disable.
+3. **Fixed take-profit** — `PAPER_TAKE_PROFIT_PCT` (skipped after any ladder tranche fires, so it doesn't eat the runner).
+4. **Fixed stop-loss** — `PAPER_STOP_LOSS_PCT` (unconditional backstop).
+5. **Time-based force-exit** — `POSITION_FORCE_EXIT_TTE_SECONDS` closes the position at this TTE regardless of PnL, above the final-seconds noise band.
+6. **TTE exit buffer** — the per-family dynamic buffer, last-resort close just before expiry.
+
+Triggers evaluate against the bid price (the level we'd actually sell into), not mid, so the threshold and the realized exit live in the same frame. Closes walk the live bid book for a VWAP fill instead of nudging mid.
+
+Safety throttles layered on top of the ladder:
+
+- `MIN_ENTRY_TTE_SECONDS` — rejects entries too close to resolution.
+- `MIN_CANDLE_ELAPSED_SECONDS` / `MAX_CANDLE_ELAPSED_SECONDS` — blocks entries in the noisy opening or closing seconds of each candle (candle-style families only).
+- `PAPER_ENTRY_COOLDOWN_SECONDS` — after any close on a market, blocks re-entry on the same market for this many seconds.
+- `MAX_CONSECUTIVE_LOSSES` — daemon-wide kill-switch (`consecutive_loss_limit`) after N losing closes in a row.
+
+Every full close emits a self-contained `position_closed` journal event (market, side, size, entry, exit, pnl, hold_seconds, tte_at_close, fair_prob_at_close, edge_at_close) so downstream analysis needs no DB join.
 
 ## Per-Family Risk Profiles (Phase 4)
 
@@ -242,7 +281,7 @@ See **SQLite & Log-Growth Risk Analysis** in [`docs/ROADMAP.md`](./docs/ROADMAP.
 The agent ships with the pieces needed to run unattended on a single VPS:
 
 - **Daemon heartbeat** — every `DAEMON_HEARTBEAT_INTERVAL_SECONDS` the daemon writes `data/daemon_heartbeat.json` with its full `DaemonMetrics` (counters, latency, active markets, safety-stop reason). The operator API reads the same file to surface it in `/api/metrics` and `/api/healthz` without needing a shared process.
-- **Kill-switch** — `safety_stop_reason` covers `daily_loss_limit`, `rejected_order_limit`, `auth_not_ready` (live mode only), and `daemon_heartbeat_stale`. When a stop fires the daemon journals a `safety_stop` event and stops firing decision callbacks until the condition clears.
+- **Kill-switch** — `safety_stop_reason` covers `daily_loss_limit`, `rejected_order_limit`, `consecutive_loss_limit` (N losing closes in a row, configured via `MAX_CONSECUTIVE_LOSSES`), `auth_not_ready` (live mode only), and `daemon_heartbeat_stale`. When a stop fires the daemon journals a `safety_stop` event and stops firing decision callbacks until the condition clears.
 - **Maintenance loop** — separate from the decision loop, runs every `DAEMON_MAINTENANCE_INTERVAL_SECONDS` (default 1 hour). Prunes history older than `DAEMON_PRUNE_HISTORY_DAYS`, auto-prunes `events.jsonl`, runs `pragma wal_checkpoint(TRUNCATE)`, and refreshes DB / events size gauges.
 - **Backups via VACUUM INTO** — `polymarket-ai-agent backup data/backups/` (or `make backup DEST=...`) produces a consistent, compacted snapshot while the daemon is still writing.
 - **Metrics & health endpoints** — `GET /api/metrics` (or `?format=prometheus`) and `GET /api/healthz` return the signals an uptime monitor + Prometheus scraper need.
