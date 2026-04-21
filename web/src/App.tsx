@@ -1355,7 +1355,11 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
                           {preMarket ? (
                             <span className="side-abstain" style={{ fontStyle: "italic", opacity: 0.6 }}>pre-market</span>
                           ) : (
-                            <span className={sideClass} style={{ fontWeight: 600, letterSpacing: "0.02em" }}>
+                            <span
+                              className={sideClass}
+                              style={{ fontWeight: 600, letterSpacing: "0.02em" }}
+                              data-tooltip={reason}
+                            >
                               {icon} {side}
                             </span>
                           )}
