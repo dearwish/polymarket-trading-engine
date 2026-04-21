@@ -8,7 +8,7 @@ Event-driven BTC trading agent for Polymarket's short-horizon markets (`btc_5m`,
 
 ## Current Status
 
-Production paper-trading system with 311 tests. Works end-to-end: WebSocket discovery → quant scoring → risk gating → paper execution → position tracking → dashboard.
+Production paper-trading system with 328 tests. Works end-to-end: WebSocket discovery → quant scoring → risk gating → paper execution → position tracking → dashboard.
 
 - Python package under `src/polymarket_ai_agent`
 - operator CLI via `polymarket-ai-agent`
@@ -28,10 +28,12 @@ Production paper-trading system with 311 tests. Works end-to-end: WebSocket disc
 - **SQLite hygiene** — WAL mode, `synchronous=NORMAL`, explicit indexes on every hot lookup column, bounded `events.jsonl` tail reads, and an auto-prune loop (Phase 4; see the SQLite & Log-Growth Risk section in `docs/ROADMAP.md`)
 - **operational readiness** — daemon heartbeat file, `/api/healthz` + `/api/metrics` (JSON + Prometheus), background retention / WAL-checkpoint / size-gauge maintenance loop, VACUUM INTO backups, kill-switch on auth failure + stale heartbeat, systemd units + nightly backup timer + logrotate in `docs/DEPLOYMENT.md` (Phase 5)
 - **paper soak hardening** — `WS_SSL_VERIFY` setting for proxy/VPN environments; 300-second minimum TTE guard in market discovery (Polymarket's `closed=false` lags behind resolution); `btc_log_return_vs_strike` field in `EvidencePacket` so the quant scorer uses `ln(S/K)` (Black-Scholes distance-to-strike) for threshold markets instead of short-term momentum
-- **soak analysis** — `scripts/analyze_soak.py` correlates `daemon_tick` journal entries against resolved market outcomes and reports hit rate, mean edge captured, abstain rate, and Brier score. `--shadow` prints a base-vs-shadow (htf_tilt) A/B table of the same metrics; `--hold-to-expiry` loads `position_closed` events and compares realized stopped P&L against the P&L the position would have earned if held until resolution, broken down by close reason
+- **soak analysis** — `scripts/analyze_soak.py` correlates `daemon_tick` journal entries against resolved market outcomes and reports hit rate, mean edge captured, abstain rate, and Brier score. `--shadow` prints a base-vs-shadow (htf_tilt) A/B table of the same metrics; `--hold-to-expiry` loads `position_closed` events and compares realized stopped P&L against the P&L the position would have earned if held until resolution, broken down by close reason; `--settings-timeline --db <path>` prints the chronological `settings_changes` audit trail from any agent DB (incl. backups, so A/B soaks compare cleanly)
 - **slug-prediction discovery** (Phase 7) — rolling `btc-updown-5m`, `btc-updown-15m`, and `bitcoin-up-or-down-<date>-<hr>{am,pm}-et` markets do **not** appear in Polymarket's bulk `/markets` or `/events` listings. For `btc_5m` / `btc_15m` / `btc_1h` the connector now predicts the next 3 window-start slugs and fetches `/events/slug/<slug>` directly. Per-family `min_tte` floor in `discover_markets` so a 5-minute market with ~30s left still gets picked up. Match scores also require the canonical slug prefix so daily "Up or Down" decoys can't sneak into the short-horizon families.
 - **daemon auto paper execution** (opt-in) — set `DAEMON_AUTO_PAPER_EXECUTE=true` in `.env` and the daemon's decision callback routes every APPROVED signal through the real risk → execute → portfolio pipeline, so simulated trades accumulate in the Portfolio tab and `positions` DB table without a separate CLI runner. Open positions run through the full TP-ladder / trailing-stop / fixed-SL / force-exit / TTE-buffer ladder described in [Position Lifecycle (Paper)](#position-lifecycle-paper). Safe by default: disabled unless explicitly set.
-- test suite covering connectors, scoring, risk, execution, service, CLI, state/daemon/feed modules, the execution router and VWAP fills, live fill bridging, the live close flow, per-family risk profiles, btc_15m discovery, journal retention, heartbeats, `/api/metrics`/`/api/healthz`, daemon kill-switch gating, slug-prediction discovery for 5m/15m/1h families, and daemon paper-execute lifecycle — **311 tests**
+- **DB-owned runtime settings + live reload** — every operator-tunable parameter lives in SQLite (`settings_changes` table) with an append-only audit log; the daemon picks up edits within ~2 s with no restart. Seeded on first boot from a code-defined baseline; `.env` is now deploy-time only. See [Runtime Settings & Migrations](#runtime-settings--migrations).
+- **Python schema migrations framework** — Knex-style `migrations/` folder of `YYYYMMDDTHHMMSS-<slug>.py` files; every service boot applies anything not yet in the `migrations` table. Owns all DB schema (positions, order_attempts, live_orders, reports, settings_changes).
+- test suite covering connectors, scoring, risk, execution, service, CLI, state/daemon/feed modules, the execution router and VWAP fills, live fill bridging, the live close flow, per-family risk profiles, btc_15m discovery, journal retention, heartbeats, `/api/metrics`/`/api/healthz`, daemon kill-switch gating, slug-prediction discovery for 5m/15m/1h families, daemon paper-execute lifecycle, and the migrations / settings-store / live-reload paths — **328 tests**
 
 Important:
 
@@ -252,6 +254,68 @@ Safety throttles layered on top of the ladder:
 
 Every full close emits a self-contained `position_closed` journal event (market, side, size, entry, exit, pnl, hold_seconds, tte_at_close, fair_prob_at_close, edge_at_close) so downstream analysis needs no DB join.
 
+## Runtime Settings & Migrations
+
+Operator-tunable settings (`MIN_EDGE`, `PAPER_STOP_LOSS_PCT`, every `QUANT_*` gate, exit ladder knobs, etc.) live in the SQLite DB as an append-only audit log — not in `.env`. The daemon picks up edits within ~2 s without a restart. Starting a clean A/B soak is as simple as backing up `data/agent.db`, deleting it, and restarting: the baseline re-seeds from a code-defined constant.
+
+### `.env` vs. DB ownership
+
+- `.env` keeps only **deploy-time** concerns: secrets (`OPENROUTER_API_KEY`, `POLYMARKET_PRIVATE_KEY`), network (URLs, chain id), WS lifecycle, paths, retention cadence, and the reload-loop interval `DAEMON_SETTINGS_RELOAD_INTERVAL_SECONDS`.
+- Every other runtime tunable is **DB-owned**. See the canonical list in [src/polymarket_ai_agent/initial_settings.py](./src/polymarket_ai_agent/initial_settings.py) — 50+ fields spanning thresholds, paper exit ladder, quant gates, and shadow scorer.
+
+### Editing settings
+
+Three write paths, all of which land as rows in `settings_changes`:
+
+```bash
+# Dashboard Settings tab → PUT /api/settings (source='api')
+# CLI
+polymarket-ai-agent settings set min_edge 0.08 --reason "EU session"
+polymarket-ai-agent settings get min_edge
+polymarket-ai-agent settings list
+polymarket-ai-agent settings history --field min_edge
+```
+
+The daemon's `_settings_reload_loop` polls `MAX(id)` on `settings_changes` every `DAEMON_SETTINGS_RELOAD_INTERVAL_SECONDS` (default 2 s). On advance it re-reads effective settings, rebinds every engine that caches a reference (`QuantScoringEngine`, `RiskEngine.refresh_profile()`, `ExecutionEngine.refresh()`, the parsed TP ladder), and mirrors a `settings_changed` event to `events.jsonl` with the before/after diff.
+
+Fields marked `requires_restart: true` in `EDITABLE_SETTINGS_METADATA` (currently `trading_mode`, `market_family`, `daemon_auto_paper_execute`, `paper_starting_balance_usd`) still get recorded for audit but the daemon surfaces the flag rather than hot-swapping — operator does a manual restart.
+
+### Events emitted
+
+```json
+{"event_type": "migrations_applied",   "payload": {"applied": ["…", "…"]}}
+{"event_type": "settings_snapshot",    "payload": {"source": "startup", "values": {…54 fields…}}}
+{"event_type": "api_settings_write",   "payload": {"source": "api", "received": {…}, "row_ids": […]}}
+{"event_type": "settings_changed",     "payload": {"source": "api", "changed": {"min_edge": {"before": 0.10, "after": 0.08}}, "row_ids": […], "requires_restart": []}}
+{"event_type": "settings_reload_failed", "payload": {"error": "…", "last_seen_id": 41}}
+```
+
+### Schema migrations
+
+Knex-style framework in [src/polymarket_ai_agent/engine/migrations.py](./src/polymarket_ai_agent/engine/migrations.py):
+
+- Files in `src/polymarket_ai_agent/migrations/` named `YYYYMMDDTHHMMSS-<dashed-description>.py`. Each exports `upgrade(conn: sqlite3.Connection) -> None`.
+- Every service boot runs `MigrationRunner.run()` first (inside `AgentService.__init__`). Applied files are recorded in a `migrations` table with `status`, `applied_at`, `duration_ms`, and `error` on failure.
+- Failed migration halts boot and persists the traceback so the operator can see what blew up. Fix the file, restart, and the runner UPSERTs a successful re-run over the failed row.
+- All DB schema goes through migrations — the legacy `PortfolioEngine._init_db()` and `Journal._init_db()` DDL was absorbed by `20260421T130000-create-baseline-schema.py` (idempotent on upgrades). Engines now assert their tables exist and raise a clear error if migrations didn't run.
+
+### A/B soak workflow
+
+```bash
+# End of scenario A:
+make backup DEST=data/backups/soak-A-$(date +%Y%m%d).db
+
+# Start scenario B: tweak initial_settings.py baseline if desired, then:
+rm data/agent.db
+polymarket-ai-agent daemon   # re-seeds from baseline
+
+# Compare later:
+python scripts/analyze_soak.py --settings-timeline --db data/backups/soak-A-....db
+python scripts/analyze_soak.py --settings-timeline --db data/backups/soak-B-....db
+```
+
+The `--db` flag on `analyze_soak.py` lets timeline inspection target any backup DB even after `events.jsonl` has rolled over.
+
 ## Per-Family Risk Profiles (Phase 4)
 
 Risk gates now resolve per family instead of operating off a single global scalar. The active profile is derived from `settings.market_family` at `RiskEngine` construction; explicit `Settings` overrides always win, so env-tuned deployments stay backward-compatible.
@@ -270,8 +334,9 @@ Risk gates now resolve per family instead of operating off a single global scala
 
 The daemon is an append-heavy writer; both `data/agent.db` and `logs/events.jsonl` will grow without bound on a busy deployment. Phase 4 adds the following defaults:
 
-- `PRAGMA journal_mode=WAL` + `synchronous=NORMAL` + `temp_store=MEMORY` on both database files
-- explicit indexes on every hot lookup column (positions.status, positions.market_id+status, positions.closed_at, order_attempts.recorded_at, order_attempts.market_id, live_orders.status, live_orders.updated_at, reports.created_at)
+- Schema is owned by the [migrations framework](#schema-migrations) — no more inline `CREATE TABLE IF NOT EXISTS` in engine constructors. Per-connection pragmas are applied via a shared `configure_connection(conn)` helper at [src/polymarket_ai_agent/engine/db.py](./src/polymarket_ai_agent/engine/db.py).
+- `PRAGMA journal_mode=WAL` + `synchronous=NORMAL` + `temp_store=MEMORY` on every connection
+- explicit indexes on every hot lookup column (positions.status, positions.market_id+status, positions.closed_at, order_attempts.recorded_at, order_attempts.market_id, live_orders.status, live_orders.updated_at, reports.created_at, settings_changes.field, settings_changes.changed_at)
 - `Journal.read_recent_events` uses a 64KB backwards-chunk tail-read, so peeking at the last N lines of a multi-GB JSONL no longer OOMs
 - `Journal.prune_events_jsonl(max_bytes, keep_tail_bytes)` + `log_event` auto-prune every `prune_check_every` writes once the file exceeds `events_jsonl_max_bytes` (default 200 MB, keeping the last 50 MB)
 
