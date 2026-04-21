@@ -12,6 +12,28 @@
   --shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
 }
 
+@font-face {
+  font-family: "Glyphicons Halflings";
+  src: url("/fonts/glyphicons-halflings-regular.woff2") format("woff2"),
+       url("/fonts/glyphicons-halflings-regular.woff") format("woff");
+  font-weight: normal;
+  font-style: normal;
+  font-display: swap;
+}
+
+.glyphicon {
+  position: relative;
+  top: 1px;
+  display: inline-block;
+  font-family: "Glyphicons Halflings";
+  font-style: normal;
+  font-weight: normal;
+  line-height: 1;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+.glyphicon-refresh:before { content: "\e031"; }
+
 * {
   box-sizing: border-box;
 }

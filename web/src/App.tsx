@@ -1287,6 +1287,10 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
   // label YES/NO ticks on those markets as "Position already open" instead
   // of pretending the entry could have fired.
   const openMarketIds = new Set(openPositions.map((p) => p.market_id));
+  // Bump to force Polymarket iframes to remount with a fresh src. The embed
+  // is a 3rd-party page we can't message, so a URL-level cache-bust is the
+  // only reliable way to refresh it on demand.
+  const [embedReloadKey, setEmbedReloadKey] = useState(0);
   return (
     <section className="grid detail-grid">
       <article className="panel">
@@ -1399,7 +1403,32 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
         return (
           <article className="panel full-span">
             <div className="panel-header">
-              <h2>Live Markets</h2>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <h2 style={{ margin: 0 }}>Live Markets</h2>
+                <button
+                  type="button"
+                  onClick={() => setEmbedReloadKey((k) => k + 1)}
+                  title="Refresh Polymarket embeds"
+                  aria-label="Refresh Polymarket embeds"
+                  style={{
+                    border: "1px solid var(--border)",
+                    background: "rgba(8, 17, 31, 0.6)",
+                    color: "var(--text)",
+                    borderRadius: 999,
+                    width: 28,
+                    height: 28,
+                    display: "inline-flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    cursor: "pointer",
+                    padding: 0,
+                    lineHeight: 1,
+                    fontSize: 12,
+                  }}
+                >
+                  <span className="glyphicon glyphicon-refresh" aria-hidden="true" />
+                </button>
+              </div>
               <span>{allIds.length} active</span>
             </div>
             <div className="polymarket-embed-grid">
@@ -1414,7 +1443,7 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
                     </div>
                   );
                 }
-                const src = `https://embed.polymarket.com/market?market=${encodeURIComponent(slug)}&theme=dark&liveactivity=true&border=true&creator=0x43424Ed47ec4e4aC737534bea1DFd5d992B34732-1756591618869&height=300`;
+                const src = `https://embed.polymarket.com/market?market=${encodeURIComponent(slug)}&theme=dark&liveactivity=true&border=true&creator=0x43424Ed47ec4e4aC737534bea1DFd5d992B34732-1756591618869&height=300${embedReloadKey ? `&_r=${embedReloadKey}` : ""}`;
                 const question = tick?.question ?? market_id;
                 return (
                   <figure
@@ -1427,6 +1456,7 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
                     style={{ position: "relative", display: "inline-block", margin: 0 }}
                   >
                     <iframe
+                      key={embedReloadKey}
                       title={`${question} — Polymarket Prediction Market`}
                       src={src}
                       width={400}
