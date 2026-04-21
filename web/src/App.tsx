@@ -309,7 +309,75 @@ function formatBackendReason(raw: string): string {
   return trimmed.length > 72 ? `${trimmed.slice(0, 72)}…` : trimmed;
 }
 
-function deriveDecisionReason(tick: DaemonTickPayload, values?: SettingsValues): string {
+type DecisionReasonOptions = {
+  /** Market IDs with an open paper position. When the scorer says YES/NO on
+   *  one of these markets, the daemon skips entry (one-position-per-market
+   *  policy) — surface that to the operator as the entry-block reason. */
+  openMarketIds?: Set<string>;
+};
+
+/** Reason that would block a YES/NO entry BEFORE the scorer's regime gate
+ *  runs — i.e. daemon-level filters in _paper_execute_decision_callback.
+ *  Returns null when no pre-risk filter would fire. Checks run in the same
+ *  order the daemon applies them so the returned reason matches what the
+ *  operator would see in the next trade_decision rejection.
+ */
+function deriveEntryBlockReason(
+  tick: DaemonTickPayload,
+  values: SettingsValues | undefined,
+  options: DecisionReasonOptions | undefined,
+): string | null {
+  const side = tick.suggested_side;
+  if (side !== "YES" && side !== "NO") return null;
+
+  // 1. Position already open on this market → one-at-a-time policy.
+  const marketId = tick.market_id;
+  if (marketId && options?.openMarketIds?.has(marketId)) {
+    return "Position already open";
+  }
+
+  // 2. Candle window (candle-style families only — threshold markets keep
+  // elapsed at 0 and are gated differently upstream).
+  const elapsed = tick.time_elapsed_in_candle_s ?? null;
+  const minCandle = settingNumber(values, "min_candle_elapsed_seconds", 0);
+  const maxCandle = settingNumber(values, "max_candle_elapsed_seconds", 0);
+  if (minCandle > 0 && elapsed !== null && elapsed > 0 && elapsed < minCandle) {
+    return `Blocked · candle too young (${Math.round(elapsed)}/${minCandle}s)`;
+  }
+  if (maxCandle > 0 && elapsed !== null && elapsed > maxCandle) {
+    return `Blocked · candle too old (${Math.round(elapsed)}/${maxCandle}s)`;
+  }
+
+  // 3. Minimum TTE floor.
+  const minTte = settingNumber(values, "min_entry_tte_seconds", 0);
+  const tte = tick.seconds_to_expiry ?? 0;
+  if (minTte > 0 && tte > 0 && tte < minTte) {
+    return `Blocked · TTE ${tte}s < ${minTte}s floor`;
+  }
+
+  // 4. Risk engine floors. Chosen edge is on the picked side; daemon gates on
+  //    abs(edge) < min_edge AND confidence < min_confidence.
+  const ey = tick.edge_yes ?? 0;
+  const en = tick.edge_no ?? 0;
+  const chosenEdge = side === "YES" ? ey : en;
+  const minEdge = settingNumber(values, "min_edge", 0);
+  if (minEdge > 0 && Math.abs(chosenEdge) < minEdge) {
+    return `Blocked · edge ${(chosenEdge * 100).toFixed(1)}% < ${(minEdge * 100).toFixed(0)}% floor`;
+  }
+  const minConf = settingNumber(values, "min_confidence", 0);
+  const conf = tick.confidence ?? 0;
+  if (minConf > 0 && conf < minConf) {
+    return `Blocked · confidence ${(conf * 100).toFixed(0)}% < ${(minConf * 100).toFixed(0)}% floor`;
+  }
+
+  return null;
+}
+
+function deriveDecisionReason(
+  tick: DaemonTickPayload,
+  values?: SettingsValues,
+  options?: DecisionReasonOptions,
+): string {
   const side = tick.suggested_side;
   const elapsed = tick.time_elapsed_in_candle_s ?? null;
   const ey = tick.edge_yes ?? 0;
@@ -327,7 +395,12 @@ function deriveDecisionReason(tick: DaemonTickPayload, values?: SettingsValues):
     const trend = r1h > 0.003 ? "↑ 1h" : r1h < -0.003 ? "↓ 1h" : "ranging";
     const flowGate = settingNumber(values, "quant_ofi_gate_min_abs_flow", 60);
     const flowNote = Math.abs(flow) > flowGate ? ` · flow ${flow > 0 ? "+" : ""}${flow.toFixed(0)}` : "";
-    return `${trend} · ask ${(ask * 100).toFixed(0)}¢ · edge ${(edge * 100).toFixed(1)}%${flowNote}`;
+    const summary = `${trend} · ask ${(ask * 100).toFixed(0)}¢ · edge ${(edge * 100).toFixed(1)}%${flowNote}`;
+    // If a daemon-level filter would block entry despite the YES/NO signal,
+    // lead with that so the operator knows WHY no position opened. Keep the
+    // summary after so the scorer's view still shows.
+    const blocker = deriveEntryBlockReason(tick, values, options);
+    return blocker ? `${blocker} · ${summary}` : summary;
   }
 
   // Prefer the scorer's verbatim reason when the daemon emitted one — no
@@ -859,8 +932,12 @@ function OverviewPage({ state }: { state: DashboardState }) {
   );
 }
 
-function DecisionsPage({ decisions, settings }: { decisions: DecisionItem[]; settings: SettingsPayload | null }) {
+function DecisionsPage({ decisions, settings, openPositions }: { decisions: DecisionItem[]; settings: SettingsPayload | null; openPositions: OpenPosition[] }) {
   const { timezone, timeFormat } = useDisplayPrefs();
+  // Same "Position already open" surfacing the Portfolio tab does — keeps
+  // the Side tooltip honest when the scorer picks YES/NO on a market we're
+  // already in.
+  const openMarketIds = new Set(openPositions.map((p) => p.market_id));
   return (
     <section className="panel">
       <div className="panel-header">
@@ -902,6 +979,7 @@ function DecisionsPage({ decisions, settings }: { decisions: DecisionItem[]; set
                 const reasonTooltip = deriveDecisionReason(
                   p as unknown as DaemonTickPayload,
                   settings?.values,
+                  { openMarketIds },
                 );
                 return (
                   <tr key={`${item.logged_at}-${index}`}>
@@ -1205,6 +1283,10 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
   const positionExtras = hb?.position_extras ?? {};
   const trailPct = hb?.paper_trailing_stop_pct ?? 0;
   const trailArmPct = hb?.paper_trail_arm_pct ?? 0;
+  // Markets with an existing open position — used by deriveDecisionReason to
+  // label YES/NO ticks on those markets as "Position already open" instead
+  // of pretending the entry could have fired.
+  const openMarketIds = new Set(openPositions.map((p) => p.market_id));
   return (
     <section className="grid detail-grid">
       <article className="panel">
@@ -1260,7 +1342,7 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
                     const sideClass = side === "YES" ? "side-yes" : side === "NO" ? "side-no" : "side-abstain";
                     const icon = side === "YES" ? "▲" : side === "NO" ? "▼" : "—";
                     const edge = side === "YES" ? tick.edge_yes : side === "NO" ? tick.edge_no : null;
-                    const reason = deriveDecisionReason(tick, settings?.values);
+                    const reason = deriveDecisionReason(tick, settings?.values, { openMarketIds });
                     const question = tick.question ?? tick.market_id;
                     const label = question.length > 36 ? `${question.slice(0, 36)}…` : question;
                     // BTC 15m candle window = 900s. If TTE > 900 the candle
@@ -2138,7 +2220,7 @@ export default function App() {
   const currentView = useMemo(() => {
     switch (activeView) {
       case "decisions":
-        return <DecisionsPage decisions={state.recentDecisions} settings={state.settings} />;
+        return <DecisionsPage decisions={state.recentDecisions} settings={state.settings} openPositions={state.openPositions?.positions ?? []} />;
       case "orders":
         return <OrdersPage liveOrders={state.liveOrders} liveTrades={state.liveTrades} liveActivity={state.liveActivity} paperActivity={state.paperActivity} tradingMode={state.status?.trading_mode ?? "paper"} daemonTicks={state.daemonTicks} />;
       case "portfolio":
