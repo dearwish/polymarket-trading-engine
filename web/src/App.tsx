@@ -910,8 +910,7 @@ function DecisionsPage({ decisions, settings }: { decisions: DecisionItem[]; set
                     <td>
                       <span
                         className={sideClass}
-                        title={reasonTooltip}
-                        style={{ cursor: "help" }}
+                        data-tooltip={reasonTooltip}
                       >
                         {side || "n/a"}
                       </span>

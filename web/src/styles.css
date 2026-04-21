@@ -959,3 +959,51 @@ th {
     gap: 18px;
   }
 }
+
+/* ---------------------------------------------------------------------------
+ * data-tooltip — zero-delay custom tooltip. Browser's native `title` attribute
+ * waits ~500ms before showing; this fires on :hover with CSS and appears above
+ * the element with a small offset. Used on the Signal History → Side cell so
+ * the decision reason surfaces instantly.
+ * ------------------------------------------------------------------------- */
+[data-tooltip] {
+  position: relative;
+  cursor: help;
+}
+
+[data-tooltip]:hover::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: 340px;
+  width: max-content;
+  white-space: normal;
+  word-break: break-word;
+  background: rgba(10, 15, 25, 0.97);
+  color: var(--text, #e6eef7);
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.12));
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  line-height: 1.4;
+  font-weight: normal;
+  letter-spacing: 0.01em;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+  z-index: 50;
+  pointer-events: none;
+}
+
+[data-tooltip]:hover::before {
+  /* Small arrow pointing down at the anchored element. */
+  content: "";
+  position: absolute;
+  bottom: calc(100% + 1px);
+  left: 50%;
+  transform: translateX(-50%);
+  border: 5px solid transparent;
+  border-top-color: rgba(10, 15, 25, 0.97);
+  z-index: 50;
+  pointer-events: none;
+}
