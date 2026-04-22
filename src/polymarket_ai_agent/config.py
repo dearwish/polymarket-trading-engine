@@ -376,6 +376,7 @@ EDITABLE_SETTINGS_METADATA: dict[str, dict[str, Any]] = {
     },
     # Quant scorer gates
     "quant_invert_drift": {"label": "Invert Drift", "type": "boolean", "group": "thresholds"},
+    "quant_drift_damping": {"label": "Drift Damping", "type": "number", "min": 0, "max": 5, "step": 0.05, "group": "thresholds"},
     "quant_max_abs_edge": {"label": "Max |Edge| Ceiling", "type": "number", "min": 0, "max": 1, "step": 0.01, "group": "thresholds"},
     "quant_trend_filter_enabled": {"label": "Trend Filter Enabled", "type": "boolean", "group": "thresholds"},
     "quant_trend_filter_min_abs_return": {"label": "Trend Filter Min |Return|", "type": "number", "min": 0, "max": 0.1, "step": 0.0005, "group": "thresholds"},
