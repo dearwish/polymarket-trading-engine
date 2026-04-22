@@ -17,6 +17,7 @@ from polymarket_ai_agent.config import (
 )
 from polymarket_ai_agent.connectors.binance_ws import BinanceBtcFeed, BtcTick
 from polymarket_ai_agent.connectors.polymarket_ws import MarketStreamEvent, PolymarketMarketStream
+from polymarket_ai_agent.engine.adaptive_scoring import AdaptiveScorer
 from polymarket_ai_agent.engine.btc_state import BtcSnapshot, BtcState
 from polymarket_ai_agent.engine.market_state import MarketFeatures, MarketState
 from polymarket_ai_agent.engine.quant_scoring import QuantScoringEngine
@@ -127,6 +128,28 @@ class DecisionContext:
     shadow_assessment: "MarketAssessment | None" = None
 
 
+# Minimal protocol satisfied by both QuantScoringEngine and AdaptiveScorer —
+# per-tick scoring is the only hook the daemon needs for strategy routing.
+# Kept structural (not an ABC) so plugin-style scorers don't need a base
+# class import just to register.
+class _ScorerProtocol(Protocol):
+    def score_market(self, packet: "EvidencePacket") -> MarketAssessment: ...
+
+
+@dataclass(slots=True, frozen=True)
+class StrategyConfig:
+    """A scorer registered in the daemon's side-by-side loop.
+
+    Each StrategyConfig owns an independent slice of the portfolio keyed
+    on ``strategy_id``; multiple configs can run concurrently against the
+    same market feed without interfering with each other's open-position
+    state or paper PnL.
+    """
+
+    strategy_id: str
+    scorer: _ScorerProtocol
+
+
 DecisionCallback = Callable[[DecisionContext], Awaitable[None]]
 
 
@@ -187,6 +210,15 @@ class DaemonRunner:
         self.btc_state = BtcState()
         self.research = ResearchEngine()
         self.quant = QuantScoringEngine(settings)
+        # Adaptive scorer wraps the fade scorer and gates it on the regime
+        # classifier. Phase 2 runs both side-by-side; each gets its own
+        # paper portfolio slice via the strategy_id dimension added in
+        # phase 1.
+        self.adaptive = AdaptiveScorer(self.quant)
+        self._strategies: list[StrategyConfig] = [
+            StrategyConfig(strategy_id=_DEFAULT_STRATEGY_ID, scorer=self.quant),
+            StrategyConfig(strategy_id="adaptive", scorer=self.adaptive),
+        ]
         self.heartbeat = HeartbeatWriter(settings.heartbeat_path)
         self._market_states: dict[str, MarketState] = {}
         self._candidates: dict[str, MarketCandidate] = {}
@@ -508,7 +540,21 @@ class DaemonRunner:
         reference = now or _utc_now()
         return max(0, int((expiry - reference).total_seconds()))
 
-    async def _default_decision_callback(self, context: DecisionContext) -> None:
+    async def _default_decision_callback(
+        self,
+        context: DecisionContext,
+        strategy_id: str = _DEFAULT_STRATEGY_ID,
+    ) -> None:
+        """Emit a ``daemon_tick`` tagged with ``strategy_id``.
+
+        Phase 2 runs multiple scorers per tick; each calls this helper
+        with its own context (containing its own assessment) and its own
+        ``strategy_id`` so analyze_soak can stratify by strategy.
+
+        Shadow-assessment fields are only emitted on the default strategy's
+        tick to avoid duplicate shadow rows when multiple strategies fire
+        for the same market tick.
+        """
         features = context.features
         btc = context.btc_snapshot
         assessment = context.assessment
@@ -516,6 +562,7 @@ class DaemonRunner:
             classify_regime(context.packet).value if context.packet is not None else Regime.UNKNOWN.value
         )
         payload: dict[str, Any] = {
+            "strategy_id": strategy_id,
             "market_id": features.market_id,
             "question": context.candidate.question,
             "slug": context.candidate.slug,
@@ -563,7 +610,7 @@ class DaemonRunner:
             "reasons_for_trade": list(assessment.reasons_for_trade or []),
         }
         shadow = context.shadow_assessment
-        if shadow is not None:
+        if shadow is not None and strategy_id == _DEFAULT_STRATEGY_ID:
             payload["shadow_fair_probability"] = shadow.fair_probability
             payload["shadow_suggested_side"] = shadow.suggested_side.value
             payload["shadow_edge_yes"] = shadow.edge_yes
@@ -571,18 +618,67 @@ class DaemonRunner:
         await asyncio.to_thread(self.service.journal.log_event, "daemon_tick", payload)
 
     async def _paper_execute_decision_callback(self, context: DecisionContext) -> None:
-        """Log the tick AND run the full paper pipeline: risk → execute → position.
+        """Run every registered strategy side-by-side for this tick.
 
-        Skips entry if the market already has an open paper position. Closes an
-        existing position when TTE drops inside the per-family exit buffer, so
-        the portfolio realises PnL rather than leaving stale open positions.
+        Each strategy re-scores the packet with its own scorer, emits a
+        ``daemon_tick`` tagged with its ``strategy_id``, and executes its
+        own paper pipeline against its own portfolio slice. Strategies
+        don't share open-position state, cooldowns, or PnL — the
+        ``strategy_id`` dimension on positions/order_attempts keeps them
+        fully isolated.
 
-        Phase 1 threads a single strategy_id (`_DEFAULT_STRATEGY_ID`) through
-        the execution pipeline; phase 2 will wrap this in an outer loop over
-        registered strategies so multiple scorers run side-by-side.
+        The incoming ``context.assessment`` (produced by the decision
+        engine with the fade scorer) is only used as a fallback when the
+        packet is missing; under normal operation each strategy scores
+        from ``context.packet`` directly.
         """
-        await self._default_decision_callback(context)
+        for strategy in self._strategies:
+            await self._run_strategy_tick(context, strategy)
 
+    async def _run_strategy_tick(
+        self,
+        context: DecisionContext,
+        strategy: StrategyConfig,
+    ) -> None:
+        """Score the packet with ``strategy.scorer`` and run the paper
+        pipeline under ``strategy.strategy_id``.
+
+        Splitting this out of ``_paper_execute_decision_callback`` keeps
+        the outer loop small and lets the per-strategy pipeline be tested
+        in isolation (with a fake single-strategy daemon) without the
+        multi-strategy iteration overhead.
+        """
+        if strategy.strategy_id == _DEFAULT_STRATEGY_ID:
+            # The decision engine already scored this packet with the fade
+            # scorer into ``context.assessment``; reuse it rather than
+            # re-scoring. Tests also rely on this so they can inject a
+            # hand-built APPROVED assessment under the default strategy.
+            assessment = context.assessment
+        elif context.packet is not None:
+            assessment = strategy.scorer.score_market(context.packet)
+        else:
+            # Non-default strategy without a packet — regime classification
+            # requires HTF features from the packet, so we can't honestly run.
+            # Only reached by tests that hand-build a DecisionContext with no
+            # packet; production always supplies one.
+            return
+        per_ctx = replace(context, assessment=assessment)
+        await self._default_decision_callback(per_ctx, strategy.strategy_id)
+        await self._paper_execute_for_strategy(per_ctx, strategy.strategy_id)
+
+    async def _paper_execute_for_strategy(
+        self,
+        context: DecisionContext,
+        strategy_id: str,
+    ) -> None:
+        """Run the full paper pipeline (risk → execute → position mgmt)
+        for a single ``strategy_id``.
+
+        Skips entry if this strategy already has an open position in the
+        market. Manages existing positions through the TP-ladder /
+        trailing-stop / TP / SL / force-exit / TTE-buffer priority chain,
+        each scoped to ``(strategy_id, market_id)``.
+        """
         # Pin a single Settings snapshot for this callback — the reload loop
         # can swap self.settings at any moment, and we want every field read
         # below (ladder / trail / TP / SL / force-exit / cooldown / candle
@@ -590,7 +686,6 @@ class DaemonRunner:
         # reload between line 608 and 609 could mix old trail_pct with new
         # arm_pct for one tick.
         settings = self.settings
-        strategy_id = _DEFAULT_STRATEGY_ID
 
         market_id = context.market_id
         candidate = context.candidate

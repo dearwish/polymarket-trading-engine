@@ -1179,3 +1179,204 @@ def test_settings_reload_loop_survives_db_errors(tmp_path: Path) -> None:
     failed = [e for e in events if e["event_type"] == "settings_reload_failed"]
     assert failed, "loop should have emitted a settings_reload_failed event"
     assert "simulated DB failure" in failed[-1]["payload"]["error"]
+
+
+def test_daemon_multi_strategy_opens_per_strategy_positions(tmp_path: Path) -> None:
+    """When both strategies pass their gates, each opens its own paper
+    position on the same market. The strategy_id dimension from phase 1
+    keeps them isolated — independent open-position state, independent
+    cooldown, independent PnL.
+
+    Setup: RANGING regime (small HTF returns, low vol) so the adaptive
+    scorer delegates to fade unchanged. Both strategies score the same
+    packet and both decide to trade.
+    """
+    from polymarket_ai_agent.apps.daemon.run import DecisionContext
+    from polymarket_ai_agent.engine.btc_state import BtcSnapshot
+    from polymarket_ai_agent.engine.market_state import MarketState
+    from polymarket_ai_agent.types import EvidencePacket
+
+    settings = _settings(tmp_path).model_copy(update={
+        "daemon_auto_paper_execute": True,
+        "max_position_usd": 10.0,
+        "min_confidence": 0.0,
+        "min_edge": 0.0,
+        "max_spread": 0.10,
+        "min_depth_usd": 0.0,
+        "stale_data_seconds": 3600,
+        "max_concurrent_positions": 5,
+        "quant_trend_filter_enabled": False,
+        "quant_ofi_gate_enabled": False,
+        "quant_vol_regime_enabled": False,
+        "quant_min_entry_price": 0.0,
+        "min_candle_elapsed_seconds": 0,
+        "paper_entry_cooldown_seconds": 0,
+    })
+    service = AgentService(settings)
+    candidate = _candidate("m-multi", "yes-tok", "no-tok")
+
+    runner = DaemonRunner(
+        settings=settings,
+        service=service,
+        config=DaemonConfig(market_family=settings.market_family),
+        market_stream_factory=lambda url: FakeMarketStream([]),  # type: ignore[arg-type]
+        btc_feed_factory=lambda: FakeBtcFeed([]),  # type: ignore[arg-type]
+    )
+    state = MarketState(market_id=candidate.market_id, yes_token_id="yes-tok", no_token_id="no-tok")
+    state.apply_book_snapshot({
+        "asset_id": "yes-tok",
+        "bids": [{"price": "0.40", "size": "500"}],
+        "asks": [{"price": "0.42", "size": "500"}],
+    })
+    runner._market_states[candidate.market_id] = state
+    runner._candidates[candidate.market_id] = candidate
+
+    btc = BtcSnapshot(
+        price=70000.0,
+        observed_at=datetime.now(timezone.utc),
+        log_return_10s=0.0, log_return_1m=0.0, log_return_5m=0.0,
+        log_return_15m=0.0, realized_vol_30m=0.002, sample_count=50,
+    )
+    # RANGING packet: real drift in one direction, HTF returns small, vol low.
+    packet = EvidencePacket(
+        market_id=candidate.market_id,
+        question="test",
+        resolution_criteria="-",
+        market_probability=0.5,
+        orderbook_midpoint=0.41,
+        spread=0.02,
+        depth_usd=500.0,
+        seconds_to_expiry=600,
+        external_price=70000.0,
+        recent_price_change_bps=0.0,
+        recent_trade_count=0,
+        reasons_context=[],
+        citations=[],
+        bid_yes=0.40,
+        ask_yes=0.42,
+        bid_no=0.58,
+        ask_no=0.60,
+        btc_log_return_since_candle_open=0.003,
+        realized_vol_30m=0.002,
+        btc_log_return_1h=0.0005,
+        btc_log_return_4h=0.0005,
+        time_elapsed_in_candle_s=300,
+    )
+    # Decision engine would populate this from the fade scorer — the callback
+    # reuses it under the fade strategy_id and re-scores for the adaptive one.
+    assessment = runner.quant.score_market(packet)
+    context = DecisionContext(
+        market_id=candidate.market_id,
+        candidate=candidate,
+        features=state.features(),
+        btc_snapshot=btc,
+        assessment=assessment,
+        metrics=runner.metrics,
+        packet=packet,
+    )
+
+    asyncio.run(runner._paper_execute_decision_callback(context))
+
+    positions = service.portfolio.list_open_positions()
+    strategies = {p.strategy_id for p in positions}
+    assert "fade" in strategies
+    assert "adaptive" in strategies
+    assert len(positions) == 2
+
+
+def test_daemon_multi_strategy_adaptive_abstains_in_trend(tmp_path: Path) -> None:
+    """Adaptive scorer must stay out of a trending regime while fade
+    continues to trade. This is the phase-2 value prop: fewer trades
+    during the regimes the fade scorer historically loses in.
+    """
+    from polymarket_ai_agent.apps.daemon.run import DecisionContext
+    from polymarket_ai_agent.engine.btc_state import BtcSnapshot
+    from polymarket_ai_agent.engine.market_state import MarketState
+    from polymarket_ai_agent.types import EvidencePacket
+
+    settings = _settings(tmp_path).model_copy(update={
+        "daemon_auto_paper_execute": True,
+        "max_position_usd": 10.0,
+        "min_confidence": 0.0,
+        "min_edge": 0.0,
+        "max_spread": 0.10,
+        "min_depth_usd": 0.0,
+        "stale_data_seconds": 3600,
+        "max_concurrent_positions": 5,
+        "quant_trend_filter_enabled": False,
+        "quant_ofi_gate_enabled": False,
+        "quant_vol_regime_enabled": False,
+        "quant_min_entry_price": 0.0,
+        "min_candle_elapsed_seconds": 0,
+        "paper_entry_cooldown_seconds": 0,
+    })
+    service = AgentService(settings)
+    candidate = _candidate("m-trend", "yes-tok", "no-tok")
+
+    runner = DaemonRunner(
+        settings=settings,
+        service=service,
+        config=DaemonConfig(market_family=settings.market_family),
+        market_stream_factory=lambda url: FakeMarketStream([]),  # type: ignore[arg-type]
+        btc_feed_factory=lambda: FakeBtcFeed([]),  # type: ignore[arg-type]
+    )
+    state = MarketState(market_id=candidate.market_id, yes_token_id="yes-tok", no_token_id="no-tok")
+    state.apply_book_snapshot({
+        "asset_id": "yes-tok",
+        "bids": [{"price": "0.40", "size": "500"}],
+        "asks": [{"price": "0.42", "size": "500"}],
+    })
+    runner._market_states[candidate.market_id] = state
+    runner._candidates[candidate.market_id] = candidate
+
+    btc = BtcSnapshot(
+        price=70000.0,
+        observed_at=datetime.now(timezone.utc),
+        log_return_10s=0.0, log_return_1m=0.0, log_return_5m=0.0,
+        log_return_15m=0.0, realized_vol_30m=0.002, sample_count=50,
+    )
+    # TRENDING_UP packet: both 1h and 4h returns positive and above the
+    # regime threshold → adaptive must abstain.
+    packet = EvidencePacket(
+        market_id=candidate.market_id,
+        question="test",
+        resolution_criteria="-",
+        market_probability=0.5,
+        orderbook_midpoint=0.41,
+        spread=0.02,
+        depth_usd=500.0,
+        seconds_to_expiry=600,
+        external_price=70000.0,
+        recent_price_change_bps=0.0,
+        recent_trade_count=0,
+        reasons_context=[],
+        citations=[],
+        bid_yes=0.40,
+        ask_yes=0.42,
+        bid_no=0.58,
+        ask_no=0.60,
+        btc_log_return_since_candle_open=0.003,
+        realized_vol_30m=0.002,
+        btc_log_return_1h=0.005,
+        btc_log_return_4h=0.008,
+        time_elapsed_in_candle_s=300,
+    )
+    assessment = runner.quant.score_market(packet)
+    context = DecisionContext(
+        market_id=candidate.market_id,
+        candidate=candidate,
+        features=state.features(),
+        btc_snapshot=btc,
+        assessment=assessment,
+        metrics=runner.metrics,
+        packet=packet,
+    )
+
+    asyncio.run(runner._paper_execute_decision_callback(context))
+
+    positions = service.portfolio.list_open_positions()
+    strategies = {p.strategy_id for p in positions}
+    # Fade still trades in trending (its behaviour is unchanged from main);
+    # adaptive refuses.
+    assert "fade" in strategies
+    assert "adaptive" not in strategies
