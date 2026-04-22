@@ -50,6 +50,7 @@ class TickRecord:
     btc_price: float
     btc_session: str = "off"
     btc_log_return_1h: float = 0.0
+    strategy_id: str = "fade"
     # Live shadow fields (present only when QUANT_SHADOW_VARIANT was set during soak)
     shadow_fair_probability: float | None = None
     shadow_suggested_side: str | None = None
@@ -154,6 +155,7 @@ def load_ticks(
     events_path: Path,
     since: datetime | None = None,
     until: datetime | None = None,
+    strategy_id: str | None = None,
 ) -> dict[str, MarketSummary]:
     summaries: dict[str, MarketSummary] = {}
     with events_path.open() as fh:
@@ -172,6 +174,9 @@ def load_ticks(
             p = record.get("payload", {})
             market_id = str(p.get("market_id", ""))
             if not market_id:
+                continue
+            tick_strategy = str(p.get("strategy_id") or "fade")
+            if strategy_id is not None and tick_strategy != strategy_id:
                 continue
             if market_id not in summaries:
                 summaries[market_id] = MarketSummary(
@@ -194,6 +199,7 @@ def load_ticks(
                 btc_price=float(p.get("btc_price") or 0.0),
                 btc_session=str(p.get("btc_session") or "off"),
                 btc_log_return_1h=float(p.get("btc_log_return_1h") or 0.0),
+                strategy_id=tick_strategy,
                 shadow_fair_probability=float(p["shadow_fair_probability"]) if p.get("shadow_fair_probability") is not None else None,
                 shadow_suggested_side=str(shadow_side_raw) if shadow_side_raw is not None else None,
                 shadow_edge_yes=float(p["shadow_edge_yes"]) if p.get("shadow_edge_yes") is not None else None,
@@ -629,6 +635,15 @@ def main() -> None:
         help="Additive US-session bias for retro-shadow (default: 0.0)",
     )
     parser.add_argument(
+        "--strategy",
+        default=None,
+        help=(
+            "Only include ticks whose payload strategy_id matches. "
+            "Use to drill into one scorer when multiple run side-by-side "
+            "(e.g. --strategy adaptive). Leave unset to load all strategies."
+        ),
+    )
+    parser.add_argument(
         "--since",
         default=None,
         help="Only include ticks logged at or after this ISO timestamp (e.g. 2026-04-21T05:52Z)",
@@ -670,10 +685,27 @@ def main() -> None:
     if since or until:
         window_note = f"  window: {since.isoformat() if since else '—'} → {until.isoformat() if until else '—'}\n"
 
-    summaries = load_ticks(events_path, since=since, until=until)
-    print(f"Loaded {sum(len(ms.ticks) for ms in summaries.values())} daemon_tick events across {len(summaries)} markets")
+    summaries = load_ticks(events_path, since=since, until=until, strategy_id=args.strategy)
+    tick_strategies = {
+        tick.strategy_id for ms in summaries.values() for tick in ms.ticks
+    }
+    total_ticks = sum(len(ms.ticks) for ms in summaries.values())
+    strategy_note = ""
+    if args.strategy:
+        strategy_note = f" [strategy={args.strategy}]"
+    elif len(tick_strategies) > 1:
+        strategy_note = f" [strategies={','.join(sorted(tick_strategies))}]"
+    print(
+        f"Loaded {total_ticks} daemon_tick events across {len(summaries)} markets{strategy_note}"
+    )
     if window_note:
         print(window_note, end="")
+    if not args.strategy and len(tick_strategies) > 1:
+        print(
+            "  [warn] ticks span multiple strategies — scorer stats blend them. "
+            "Pass --strategy <id> to isolate one.",
+            file=sys.stderr,
+        )
 
     # Always load closed positions — the per-strategy breakdown runs
     # whenever multiple strategies emitted closes, not only on --hold-to-expiry.

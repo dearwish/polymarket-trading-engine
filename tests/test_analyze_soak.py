@@ -87,3 +87,91 @@ def test_strategy_breakdown_prints_per_strategy_rows(capsys) -> None:
     # adaptive: 1 trade, +2.00, 1 win → 100%
     assert "50.0%" in out
     assert "100.0%" in out
+
+
+def test_load_ticks_filters_by_strategy(tmp_path) -> None:
+    """``--strategy`` must partition the tick stream so per-strategy
+    aggregate stats don't blend fade and adaptive.
+    """
+    import json
+    mod = _load_analyze_soak()
+    events = tmp_path / "events.jsonl"
+
+    def _tick(strategy_id: str, market: str = "m-1") -> dict:
+        return {
+            "event_type": "daemon_tick",
+            "logged_at": "2026-04-22T18:00:00+00:00",
+            "payload": {
+                "market_id": market,
+                "question": "q",
+                "strategy_id": strategy_id,
+                "suggested_side": "YES",
+                "fair_probability": 0.6,
+                "edge_yes": 0.05,
+                "edge_no": -0.05,
+                "confidence": 0.7,
+                "bid_yes": 0.58,
+                "ask_yes": 0.60,
+                "btc_price": 70000.0,
+                "btc_session": "us",
+                "btc_log_return_1h": 0.0,
+            },
+        }
+
+    events.write_text(
+        "\n".join(
+            json.dumps(t) for t in [
+                _tick("fade"),
+                _tick("adaptive"),
+                _tick("fade", "m-2"),
+                _tick("adaptive", "m-2"),
+            ]
+        )
+    )
+    all_summaries = mod.load_ticks(events)
+    assert sum(len(ms.ticks) for ms in all_summaries.values()) == 4
+
+    fade_only = mod.load_ticks(events, strategy_id="fade")
+    assert sum(len(ms.ticks) for ms in fade_only.values()) == 2
+    assert all(
+        t.strategy_id == "fade"
+        for ms in fade_only.values() for t in ms.ticks
+    )
+
+    adaptive_only = mod.load_ticks(events, strategy_id="adaptive")
+    assert sum(len(ms.ticks) for ms in adaptive_only.values()) == 2
+    assert all(
+        t.strategy_id == "adaptive"
+        for ms in adaptive_only.values() for t in ms.ticks
+    )
+
+
+def test_load_ticks_defaults_missing_strategy_to_fade(tmp_path) -> None:
+    """Pre-phase-1 events.jsonl entries don't carry strategy_id. The
+    loader must tag them 'fade' so legacy soak data stays analyzable
+    and shows up under the fade strategy without a migration.
+    """
+    import json
+    mod = _load_analyze_soak()
+    events = tmp_path / "events.jsonl"
+    events.write_text(json.dumps({
+        "event_type": "daemon_tick",
+        "logged_at": "2026-04-22T18:00:00+00:00",
+        "payload": {
+            "market_id": "legacy",
+            "question": "q",
+            # no strategy_id — legacy tick
+            "suggested_side": "YES",
+            "fair_probability": 0.6,
+            "edge_yes": 0.05,
+            "edge_no": -0.05,
+            "confidence": 0.7,
+            "bid_yes": 0.58,
+            "ask_yes": 0.60,
+            "btc_price": 70000.0,
+            "btc_session": "us",
+            "btc_log_return_1h": 0.0,
+        },
+    }))
+    summaries = mod.load_ticks(events, strategy_id="fade")
+    assert sum(len(ms.ticks) for ms in summaries.values()) == 1
