@@ -189,6 +189,9 @@ def test_daemon_processes_ws_events_and_updates_state(tmp_path: Path) -> None:
     assert "edge_yes" in latest
     assert "edge_no" in latest
     assert latest["suggested_side"] in {"YES", "NO", "ABSTAIN"}
+    # Phase 1 adaptive-regime: classifier output is attached to every
+    # daemon_tick so analyze_soak can stratify without re-classifying.
+    assert latest["regime"] in {"TRENDING_UP", "TRENDING_DOWN", "HIGH_VOL", "RANGING", "UNKNOWN"}
     assert market_stream.run_calls, "market stream run() should be invoked"
     assert btc_feed.rest_calls == 1, "BTC seed REST call expected"
 
@@ -548,7 +551,7 @@ def test_paper_trailing_stop_rides_up_then_exits_on_reversal(tmp_path) -> None:
     # Still open — peak now tracks the BID (0.79) since exit triggers use the
     # sellable price. Trail level = 0.79 × 0.90 = 0.711, current bid = 0.79.
     assert len(service.portfolio.list_open_positions()) == 1
-    assert runner._position_extras[candidate.market_id]["peak_price"] >= 0.79
+    assert runner._position_extras[("fade", candidate.market_id)]["peak_price"] >= 0.79
 
     # Reverse: bid drops to 0.60, well below the 0.711 trail level → exit.
     state_down = MarketState(market_id=candidate.market_id, yes_token_id="yes-tok", no_token_id="no-tok")
@@ -937,7 +940,7 @@ def test_paper_entry_cooldown_blocks_immediate_reentry(tmp_path) -> None:
     )
     asyncio.run(runner._paper_execute_decision_callback(ctx_close))
     assert service.portfolio.list_open_positions() == []
-    assert candidate.market_id in runner._last_close_at
+    assert ("fade", candidate.market_id) in runner._last_close_at
 
     # Now price pops back up and the scorer wants to re-enter on the same
     # market — but we're still within the 120s cooldown window.

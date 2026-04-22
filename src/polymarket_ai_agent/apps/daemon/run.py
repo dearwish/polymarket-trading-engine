@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator, Iterable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Protocol
 
@@ -20,6 +20,7 @@ from polymarket_ai_agent.connectors.polymarket_ws import MarketStreamEvent, Poly
 from polymarket_ai_agent.engine.btc_state import BtcSnapshot, BtcState
 from polymarket_ai_agent.engine.market_state import MarketFeatures, MarketState
 from polymarket_ai_agent.engine.quant_scoring import QuantScoringEngine
+from polymarket_ai_agent.engine.regime import Regime, classify_regime
 from polymarket_ai_agent.engine.research import ResearchEngine
 from polymarket_ai_agent.service import AgentService
 from polymarket_ai_agent.types import (
@@ -45,6 +46,13 @@ _FAMILY_WINDOW_SECONDS: dict[str, int] = {
     "btc_15m": 15 * 60,
     "btc_1h": 60 * 60,
 }
+
+# Name of the legacy GBM-fade strategy that used to be the only scorer.
+# Phase 1 of the adaptive-regime branch keeps this as the sole active
+# strategy so behaviour on branch merge matches main; phase 2 will append
+# an adaptive strategy to run alongside it. Keep this in sync with the
+# default on ``TradeDecision.strategy_id`` and the schema default.
+_DEFAULT_STRATEGY_ID = "fade"
 
 
 def _utc_now() -> datetime:
@@ -189,11 +197,15 @@ class DaemonRunner:
         self._last_decision_at: datetime | None = None
         # Per-open-position state used by trailing stop / tranche ladder logic.
         # Paper-mode only: lives in memory, reset if the daemon restarts.
-        self._position_extras: dict[str, dict[str, float]] = {}
+        # Per-(strategy_id, market_id) extras. Keyed on a tuple so multiple
+        # scorers running side-by-side (phase 2+) keep independent TP-ladder
+        # and trailing-stop state on the same market.
+        self._position_extras: dict[tuple[str, str], dict[str, float]] = {}
         self._tp_ladder: list[tuple[float, float]] = self._parse_tp_ladder(settings.paper_tp_ladder)
-        # Last close timestamp per market, used to enforce an entry cooldown
-        # that blocks whipsaw re-entries on the same market. In-memory only.
-        self._last_close_at: dict[str, datetime] = {}
+        # Last close timestamp per (strategy_id, market_id), used to enforce
+        # an entry cooldown that blocks whipsaw re-entries on the same
+        # (strategy, market) pair. In-memory only.
+        self._last_close_at: dict[tuple[str, str], datetime] = {}
         # Cursor into settings_changes for the reload loop. Set to the table's
         # MAX(id) at startup so the loop only reacts to *subsequent* changes;
         # the baseline seed that landed during migration isn't replayed as a
@@ -500,6 +512,9 @@ class DaemonRunner:
         features = context.features
         btc = context.btc_snapshot
         assessment = context.assessment
+        regime = (
+            classify_regime(context.packet).value if context.packet is not None else Regime.UNKNOWN.value
+        )
         payload: dict[str, Any] = {
             "market_id": features.market_id,
             "question": context.candidate.question,
@@ -529,6 +544,7 @@ class DaemonRunner:
             "btc_log_return_4h": btc.btc_log_return_4h if btc else None,
             "btc_log_return_24h": btc.btc_log_return_24h if btc else None,
             "btc_minute_bar_count": btc.minute_bar_count if btc else None,
+            "regime": regime,
             "polymarket_events": context.metrics.polymarket_events,
             "btc_ticks": context.metrics.btc_ticks,
             "fair_probability": assessment.fair_probability,
@@ -560,6 +576,10 @@ class DaemonRunner:
         Skips entry if the market already has an open paper position. Closes an
         existing position when TTE drops inside the per-family exit buffer, so
         the portfolio realises PnL rather than leaving stale open positions.
+
+        Phase 1 threads a single strategy_id (`_DEFAULT_STRATEGY_ID`) through
+        the execution pipeline; phase 2 will wrap this in an outer loop over
+        registered strategies so multiple scorers run side-by-side.
         """
         await self._default_decision_callback(context)
 
@@ -570,6 +590,7 @@ class DaemonRunner:
         # reload between line 608 and 609 could mix old trail_pct with new
         # arm_pct for one tick.
         settings = self.settings
+        strategy_id = _DEFAULT_STRATEGY_ID
 
         market_id = context.market_id
         candidate = context.candidate
@@ -581,6 +602,8 @@ class DaemonRunner:
         if orderbook is None:
             return  # No usable book yet — skip this tick.
 
+        extras_key = (strategy_id, market_id)
+
         # Manage an already-open position.
         # Exit priority (first match wins, checked every tick):
         #   1. TP ladder (partial closes at +X% PnL)
@@ -588,7 +611,9 @@ class DaemonRunner:
         #   3. Fixed take-profit (full close at +X% PnL)
         #   4. Fixed stop-loss (full close at -Y% PnL)
         #   5. TTE exit buffer (full close near expiry at current mid)
-        open_pos = await asyncio.to_thread(self.service.portfolio.get_open_position, market_id)
+        open_pos = await asyncio.to_thread(
+            self.service.portfolio.get_open_position, market_id, strategy_id
+        )
         if open_pos is not None:
             # Use the BID we could actually sell into (YES bid for YES, NO bid
             # for NO) as the exit-trigger price, not the mid. Mid-based triggers
@@ -610,9 +635,9 @@ class DaemonRunner:
                 # ladder doesn't re-fire step 1 on the shrunken remainder.
                 # peak_price can't be recovered — restart the trail fresh from
                 # whatever the current price is (safer than guessing).
-                if market_id not in self._position_extras:
-                    self._position_extras[market_id] = self._hydrate_position_extras(open_pos)
-                extras = self._position_extras[market_id]
+                if extras_key not in self._position_extras:
+                    self._position_extras[extras_key] = self._hydrate_position_extras(open_pos)
+                extras = self._position_extras[extras_key]
                 if current_price > extras["peak_price"]:
                     extras["peak_price"] = current_price
                 # --- 1. TP ladder (partial close) -------------------------
@@ -632,11 +657,13 @@ class DaemonRunner:
                             market_id, open_pos.side, tranche_size_usd, float(current_price)
                         )
                         await asyncio.to_thread(
-                            self.service.portfolio.partial_close_position,
-                            market_id,
-                            effective_fraction,
-                            exit_price_walk,
-                            f"paper_tp_ladder_{tranches_closed + 1}",
+                            lambda: self.service.portfolio.partial_close_position(
+                                market_id,
+                                effective_fraction,
+                                exit_price_walk,
+                                f"paper_tp_ladder_{tranches_closed + 1}",
+                                strategy_id=strategy_id,
+                            )
                         )
                         extras["tranches_closed"] = tranches_closed + 1
                         # Partial closes don't start a cooldown — position is
@@ -661,7 +688,8 @@ class DaemonRunner:
                         market_id, open_pos.side, float(open_pos.size_usd), float(current_price)
                     )
                     await self._finalize_paper_close(
-                        open_pos, exit_price_walk, "paper_trailing_stop", tte_seconds, context
+                        open_pos, exit_price_walk, "paper_trailing_stop", tte_seconds, context,
+                        strategy_id=strategy_id,
                     )
                     return
                 # --- 3 + 4. Fixed TP / SL ---------------------------------
@@ -684,7 +712,8 @@ class DaemonRunner:
                         market_id, open_pos.side, float(open_pos.size_usd), float(current_price)
                     )
                     await self._finalize_paper_close(
-                        open_pos, exit_price_walk, close_reason, tte_seconds, context
+                        open_pos, exit_price_walk, close_reason, tte_seconds, context,
+                        strategy_id=strategy_id,
                     )
                     return
             # --- 5. Force-exit at T-N seconds -----------------------------
@@ -698,7 +727,8 @@ class DaemonRunner:
                     market_id, open_pos.side, float(open_pos.size_usd), float(current_price)
                 )
                 await self._finalize_paper_close(
-                    open_pos, exit_price_walk, "paper_time_based_exit", tte_seconds, context
+                    open_pos, exit_price_walk, "paper_time_based_exit", tte_seconds, context,
+                    strategy_id=strategy_id,
                 )
                 return
             # --- 6. TTE exit buffer ---------------------------------------
@@ -708,16 +738,17 @@ class DaemonRunner:
                     market_id, open_pos.side, float(open_pos.size_usd), float(current_price)
                 )
                 await self._finalize_paper_close(
-                    open_pos, exit_price_walk, "paper_tte_exit", tte_seconds, context
+                    open_pos, exit_price_walk, "paper_tte_exit", tte_seconds, context,
+                    strategy_id=strategy_id,
                 )
             return  # Do not open a duplicate while a position is live.
         # Clean up extras if no open position exists (e.g., previous TTE close).
-        self._position_extras.pop(market_id, None)
+        self._position_extras.pop(extras_key, None)
 
-        # Enforce entry cooldown after a recent close on this market.
+        # Enforce entry cooldown after a recent close on this (strategy, market).
         cooldown_seconds = int(settings.paper_entry_cooldown_seconds)
         if cooldown_seconds > 0:
-            last_close = self._last_close_at.get(market_id)
+            last_close = self._last_close_at.get(extras_key)
             if last_close is not None:
                 elapsed = (_utc_now() - last_close).total_seconds()
                 if elapsed < cooldown_seconds:
@@ -745,9 +776,14 @@ class DaemonRunner:
             external_price=context.btc_snapshot.price if context.btc_snapshot else 0.0,
         )
         account_state = await asyncio.to_thread(
-            self.service.portfolio.get_account_state, ExecutionMode.PAPER
+            lambda: self.service.portfolio.get_account_state(
+                ExecutionMode.PAPER, strategy_id=strategy_id
+            )
         )
         decision = self.service.risk.decide_trade(snapshot, assessment, account_state)
+        # Stamp the decision with the executing strategy so the portfolio
+        # INSERT and downstream analyze_soak can attribute fills correctly.
+        decision = replace(decision, strategy_id=strategy_id)
         await asyncio.to_thread(self.service.journal.log_event, "trade_decision", decision)
         if decision.status != DecisionStatus.APPROVED:
             return
@@ -837,14 +873,23 @@ class DaemonRunner:
             else old_candidate.implied_probability
         )
         exit_price = self._paper_exit_fill(market_id, side, float(open_pos.size_usd), fallback_price)
+        # Each open position carries its own strategy_id on the DB row, so
+        # routing the close and the in-memory state cleanup to the right
+        # slice is trivial — we just read it off the record.
+        strategy_id = getattr(open_pos, "strategy_id", _DEFAULT_STRATEGY_ID)
 
         await asyncio.to_thread(
             lambda: self.service.portfolio.close_position(
-                market_id, exit_price, "paper_orphan_close", now=close_time
+                market_id,
+                exit_price,
+                "paper_orphan_close",
+                now=close_time,
+                strategy_id=strategy_id,
             )
         )
-        self._position_extras.pop(market_id, None)
-        self._last_close_at[market_id] = _utc_now()
+        extras_key = (strategy_id, market_id)
+        self._position_extras.pop(extras_key, None)
+        self._last_close_at[extras_key] = _utc_now()
 
         entry_price = float(open_pos.entry_price)
         size_usd = float(open_pos.size_usd)
@@ -870,6 +915,7 @@ class DaemonRunner:
             "closed_at": close_time.isoformat(),
             "hold_seconds": round(hold_seconds, 3),
             "tte_at_close_seconds": 45,
+            "strategy_id": strategy_id,
             "fair_probability_at_close": None,
             "edge_at_close": None,
         }
@@ -889,6 +935,7 @@ class DaemonRunner:
         close_reason: str,
         tte_at_close: int,
         context: DecisionContext,
+        strategy_id: str = _DEFAULT_STRATEGY_ID,
     ) -> None:
         """Close an open paper position and emit a self-contained
         ``position_closed`` event so analyze_soak can correlate entries,
@@ -896,13 +943,16 @@ class DaemonRunner:
         """
         market_id = open_pos.market_id
         await asyncio.to_thread(
-            self.service.portfolio.close_position,
-            market_id,
-            exit_price,
-            close_reason,
+            lambda: self.service.portfolio.close_position(
+                market_id,
+                exit_price,
+                close_reason,
+                strategy_id=strategy_id,
+            )
         )
-        self._position_extras.pop(market_id, None)
-        self._last_close_at[market_id] = _utc_now()
+        extras_key = (strategy_id, market_id)
+        self._position_extras.pop(extras_key, None)
+        self._last_close_at[extras_key] = _utc_now()
         entry_price = float(open_pos.entry_price)
         size_usd = float(open_pos.size_usd)
         shares = size_usd / max(entry_price, 1e-6)
@@ -930,6 +980,7 @@ class DaemonRunner:
             "tte_at_close_seconds": int(tte_at_close),
             "fair_probability_at_close": assessment.fair_probability,
             "edge_at_close": assessment.edge,
+            "strategy_id": strategy_id,
         }
         await asyncio.to_thread(self.service.journal.log_event, "position_closed", payload)
 
@@ -1003,7 +1054,15 @@ class DaemonRunner:
                     "market_family": self.settings.market_family,
                     # Per-open-position trail state. Lets the dashboard render the
                     # live trailing-stop level alongside the Mark column.
-                    "position_extras": {mid: dict(extras) for mid, extras in self._position_extras.items()},
+                    # Phase 1 emits only the default-strategy slice (flat shape)
+                    # so the web UI's ``positionExtras[market_id]`` indexing
+                    # keeps working. Phase 2 will switch to a nested shape when
+                    # multiple strategies run concurrently.
+                    "position_extras": {
+                        market_id: dict(extras)
+                        for (strategy_id, market_id), extras in self._position_extras.items()
+                        if strategy_id == _DEFAULT_STRATEGY_ID
+                    },
                     "paper_trailing_stop_pct": float(self.settings.paper_trailing_stop_pct),
                     "paper_trail_arm_pct": float(self.settings.paper_trail_arm_pct),
                 }
