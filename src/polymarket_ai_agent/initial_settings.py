@@ -58,9 +58,14 @@ INITIAL_SETTINGS_BASELINE: dict[str, Any] = {
     "paper_exit_slippage_bps": 10.0,
     "paper_follow_limit_discount_bps": 50.0,
     "paper_follow_maker_ttl_seconds": 300,
-    "paper_follow_cancel_price_threshold": 0.0,
-    "paper_follow_cancel_size_threshold_pct": 0.0,
-    "paper_follow_min_level_size_shares": 0.0,
+    # Tier 2a/2b enabled for the 2026-04-23 maker-yield soak. Price threshold
+    # is half a cent; size threshold is 10% (matches the gamma-trade-lab
+    # reference gates). Depth filter skips sub-10-share ghost levels when
+    # anchoring the maker mid. All three can be tuned live via the dashboard
+    # without restart.
+    "paper_follow_cancel_price_threshold": 0.005,
+    "paper_follow_cancel_size_threshold_pct": 10.0,
+    "paper_follow_min_level_size_shares": 10.0,
     "fee_bps": 0.0,
     # --- Quant scorer gates ---
     "quant_invert_drift": False,
