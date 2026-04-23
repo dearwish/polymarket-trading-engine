@@ -96,21 +96,18 @@ class AdaptiveScorer:
             return base
 
         if regime in _FOLLOW_REGIMES:
-            follow_side = (
-                SuggestedSide.YES if regime is Regime.TRENDING_UP else SuggestedSide.NO
-            )
-            reason = (
-                f"Regime {regime.value}: follow with maker at mid − configured discount."
-            )
-            return replace(
-                base,
-                suggested_side=follow_side,
-                edge=0.0,
-                confidence=0.0,
-                reasons_for_trade=[reason],
-                reasons_to_abstain=[],
-                raw_model_output=ADAPTIVE_FOLLOW_MAKER_TAG,
-            )
+            # Empirical finding (2026-04-23 soak, 303 closes): "follow the
+            # trend" inverted on 15-min BTC candles. 233 TRENDING_DOWN
+            # entries taking NO hit 16.7% (−$67 total); 17 TRENDING_UP
+            # entries taking YES hit 5.9% (−$6). Meanwhile the fade
+            # scorer's taker path won 50% in the same TRENDING_DOWN
+            # bucket with +$3.48. Short-horizon BTC candles mean-revert —
+            # they don't continue — so the old "follow" branch was a
+            # systematic anti-signal. Delegate to fade here; the follow
+            # hook stays in place (see ADAPTIVE_FOLLOW_MAKER_TAG) for
+            # when we re-architect with an inverted or maker-rest-only
+            # strategy that can actually capture trend mean-reversion.
+            return base
 
         gate_reason = f"Regime {regime.value}: adaptive scorer holds fire outside RANGING."
         return replace(

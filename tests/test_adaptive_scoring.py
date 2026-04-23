@@ -94,13 +94,13 @@ def test_adaptive_abstains_on_high_vol(tmp_path: Path) -> None:
     assert any("Regime HIGH_VOL" in r for r in result.reasons_to_abstain)
 
 
-def test_adaptive_follows_trend_up_with_maker_tag(tmp_path: Path) -> None:
-    """TRENDING_UP regime now routes to follow-with-maker: side=YES,
-    raw_model_output flagged so the daemon's maker branch picks it up.
-    Edge and confidence are zeroed so the normal risk-engine taker
-    gates (min_edge) block accidental taker execution.
+def test_adaptive_delegates_to_fade_in_trending_up(tmp_path: Path) -> None:
+    """TRENDING_UP used to route to follow-with-maker (take YES), but the
+    2026-04-23 soak showed 15-min BTC candles mean-revert — 5.9% hit on
+    17 TRENDING_UP entries taking YES, net −$6. Adaptive now delegates
+    to fade in trending regimes so its taker path handles the entry
+    (fade had 50% hit in the same trending bucket).
     """
-    from polymarket_ai_agent.engine.adaptive_scoring import ADAPTIVE_FOLLOW_MAKER_TAG
     fade = QuantScoringEngine(_settings(tmp_path))
     adaptive = AdaptiveScorer(fade)
     packet = _ranging_packet(
@@ -108,17 +108,22 @@ def test_adaptive_follows_trend_up_with_maker_tag(tmp_path: Path) -> None:
         btc_log_return_4h=0.008,
         realized_vol_30m=0.002,
     )
-    result = adaptive.score_market(packet)
-    assert result.suggested_side == SuggestedSide.YES
-    assert result.raw_model_output == ADAPTIVE_FOLLOW_MAKER_TAG
-    assert result.edge == 0.0
-    assert result.confidence == 0.0
-    assert any("TRENDING_UP" in r for r in result.reasons_for_trade)
-
-
-def test_adaptive_follows_trend_down_with_maker_tag(tmp_path: Path) -> None:
-    """Mirror: TRENDING_DOWN picks NO."""
+    fade_result = fade.score_market(packet)
+    adaptive_result = adaptive.score_market(packet)
+    assert adaptive_result.suggested_side == fade_result.suggested_side
+    assert adaptive_result.edge == fade_result.edge
+    assert adaptive_result.raw_model_output == fade_result.raw_model_output
+    # Must NOT use the maker-routing tag anymore — the daemon's
+    # paper-maker lifecycle should never fire from adaptive until we
+    # re-architect the follow branch.
     from polymarket_ai_agent.engine.adaptive_scoring import ADAPTIVE_FOLLOW_MAKER_TAG
+    assert adaptive_result.raw_model_output != ADAPTIVE_FOLLOW_MAKER_TAG
+
+
+def test_adaptive_delegates_to_fade_in_trending_down(tmp_path: Path) -> None:
+    """Mirror of the TRENDING_UP case: 233 TRENDING_DOWN entries taking
+    NO hit 16.7% (−$67). Delegate to fade instead.
+    """
     fade = QuantScoringEngine(_settings(tmp_path))
     adaptive = AdaptiveScorer(fade)
     packet = _ranging_packet(
@@ -126,10 +131,12 @@ def test_adaptive_follows_trend_down_with_maker_tag(tmp_path: Path) -> None:
         btc_log_return_4h=-0.008,
         realized_vol_30m=0.002,
     )
-    result = adaptive.score_market(packet)
-    assert result.suggested_side == SuggestedSide.NO
-    assert result.raw_model_output == ADAPTIVE_FOLLOW_MAKER_TAG
-    assert any("TRENDING_DOWN" in r for r in result.reasons_for_trade)
+    fade_result = fade.score_market(packet)
+    adaptive_result = adaptive.score_market(packet)
+    assert adaptive_result.suggested_side == fade_result.suggested_side
+    assert adaptive_result.edge == fade_result.edge
+    from polymarket_ai_agent.engine.adaptive_scoring import ADAPTIVE_FOLLOW_MAKER_TAG
+    assert adaptive_result.raw_model_output != ADAPTIVE_FOLLOW_MAKER_TAG
 
 
 def test_adaptive_abstains_on_unknown(tmp_path: Path) -> None:
@@ -161,17 +168,16 @@ def test_adaptive_preserves_fair_probability_across_regimes(tmp_path: Path) -> N
 
 
 def test_adaptive_raw_model_output_identifies_branch(tmp_path: Path) -> None:
-    """raw_model_output is rewritten so analyze_soak / journals can tell
-    which branch of the adaptive scorer fired. Three labels: the follow
-    tag in trending, the gated tag in hold-fire regimes, and the fade
-    scorer's own label when RANGING passes through unchanged.
+    """raw_model_output lets analyze_soak / journals tell which branch
+    of the adaptive scorer fired. Two labels: the gated tag in hold-fire
+    regimes, and the fade scorer's own label when passing through (both
+    RANGING and now trending, since trending delegates to fade).
     """
-    from polymarket_ai_agent.engine.adaptive_scoring import ADAPTIVE_FOLLOW_MAKER_TAG
     fade = QuantScoringEngine(_settings(tmp_path))
     adaptive = AdaptiveScorer(fade)
-    # Trending → follow-with-maker tag.
+    # Trending → delegates to fade → passes fade's own tag.
     trend = _ranging_packet(btc_log_return_1h=0.005, btc_log_return_4h=0.008)
-    assert adaptive.score_market(trend).raw_model_output == ADAPTIVE_FOLLOW_MAKER_TAG
+    assert adaptive.score_market(trend).raw_model_output == "quant-scoring"
     # HIGH_VOL → gated tag (still abstains).
     chop = _ranging_packet(realized_vol_30m=0.010)
     assert adaptive.score_market(chop).raw_model_output == "adaptive-regime-gated"

@@ -1289,13 +1289,12 @@ def test_daemon_multi_strategy_opens_per_strategy_positions(tmp_path: Path) -> N
     assert len(positions) == 2
 
 
-def test_daemon_multi_strategy_adaptive_blocks_taker_in_trend(tmp_path: Path) -> None:
-    """Phase 3: adaptive flips from ABSTAIN to "follow with maker" in a
-    trending regime. It picks a side but zeros ``edge`` so the risk
-    engine's ``min_edge`` gate blocks any accidental taker entry. Until
-    the daemon's maker-order branch lands in P3.3, adaptive should still
-    result in zero open positions in a trend because the follow
-    assessment can't clear the taker gates.
+def test_daemon_multi_strategy_adaptive_delegates_in_trend(tmp_path: Path) -> None:
+    """Post-2026-04-23 soak: adaptive no longer follows the trend (the
+    follow-maker path lost 83% of TRENDING_DOWN entries). It now
+    delegates to the fade scorer in trending regimes, so both strategies
+    should open positions on the same trending setup — fade via its own
+    taker path and adaptive via the delegated fade assessment.
     """
     from polymarket_ai_agent.apps.daemon.run import DecisionContext
     from polymarket_ai_agent.engine.btc_state import BtcSnapshot
@@ -1387,10 +1386,11 @@ def test_daemon_multi_strategy_adaptive_blocks_taker_in_trend(tmp_path: Path) ->
 
     positions = service.portfolio.list_open_positions()
     strategies = {p.strategy_id for p in positions}
-    # Fade still trades in trending (its behaviour is unchanged from main);
-    # adaptive refuses.
+    # Both strategies open positions: fade via its own taker path, and
+    # adaptive by delegating to the fade scorer's assessment for this
+    # trending regime.
     assert "fade" in strategies
-    assert "adaptive" not in strategies
+    assert "adaptive" in strategies
 
 
 def _follow_packet(market_id: str, bid_yes: float = 0.66, ask_yes: float = 0.68) -> "EvidencePacket":
