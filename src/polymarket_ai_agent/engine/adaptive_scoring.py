@@ -73,6 +73,24 @@ class AdaptiveScorer:
         get rewritten.
         """
         base = self.fade.score_market(packet)
+        # Pre-market: the candle hasn't opened yet, so the market's ASK
+        # hasn't settled into a steady state and our maker TTL could
+        # straddle the candle open. The follow-maker thesis relies on
+        # catching pullbacks INSIDE a live candle's trend — neither
+        # applies here. Abstain regardless of HTF regime.
+        if packet.is_pre_market:
+            return replace(
+                base,
+                suggested_side=SuggestedSide.ABSTAIN,
+                edge=0.0,
+                confidence=0.0,
+                reasons_for_trade=[],
+                reasons_to_abstain=[
+                    "Pre-market: candle hasn't opened; adaptive scorer holds fire.",
+                    *base.reasons_to_abstain,
+                ],
+                raw_model_output="adaptive-regime-gated",
+            )
         regime = classify_regime(packet, thresholds=self.thresholds)
         if regime in _TRADEABLE_REGIMES:
             return base

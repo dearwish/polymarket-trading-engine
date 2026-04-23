@@ -178,3 +178,22 @@ def test_adaptive_raw_model_output_identifies_branch(tmp_path: Path) -> None:
     # RANGING → fade scorer's output passes through unchanged.
     ranging = _ranging_packet()
     assert adaptive.score_market(ranging).raw_model_output == "quant-scoring"
+
+
+def test_adaptive_abstains_on_pre_market_even_in_trending(tmp_path: Path) -> None:
+    """Bug fix: a pre-market candle's ASK hasn't settled and our maker
+    TTL could straddle the candle open, so follow-maker is meaningless
+    there. The scorer must abstain regardless of HTF regime.
+    """
+    fade = QuantScoringEngine(_settings(tmp_path))
+    adaptive = AdaptiveScorer(fade)
+    # TRENDING_UP would normally fire follow-maker, but is_pre_market wins.
+    packet = _ranging_packet(
+        btc_log_return_1h=0.005,
+        btc_log_return_4h=0.008,
+        is_pre_market=True,
+    )
+    result = adaptive.score_market(packet)
+    assert result.suggested_side == SuggestedSide.ABSTAIN
+    assert result.raw_model_output == "adaptive-regime-gated"
+    assert any("Pre-market" in r for r in result.reasons_to_abstain)
