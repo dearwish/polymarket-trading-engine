@@ -24,6 +24,7 @@ from polymarket_ai_agent.types import (
     PositionAction,
     PositionRecord,
     Report,
+    SuggestedSide,
     utc_now,
 )
 
@@ -133,7 +134,60 @@ class AgentService:
         self.journal.log_event("market_assessment", assessment)
         return snapshot, assessment
 
-    def _prepare_trade(self, market_id: str, mode: ExecutionMode):
+    def _latest_tick_assessment(self, market_id: str) -> MarketAssessment | None:
+        """Build a ``MarketAssessment`` from the most recent ``daemon_tick``
+        payload for ``market_id``, or ``None`` when no tick is available.
+
+        Lets read-only surfaces (dashboard panels) avoid re-running the
+        scoring engine — which would round-trip to OpenRouter when the key
+        is set — on every refresh. The daemon writes one tick per decision
+        so this is always the freshest assessment we can offer.
+        """
+        events = self.journal.read_recent_events(limit=2000)
+        for event in reversed(events):
+            if event.get("event_type") != "daemon_tick":
+                continue
+            payload = event.get("payload", {})
+            if str(payload.get("market_id", "")) != str(market_id):
+                continue
+            side_raw = str(payload.get("suggested_side") or "ABSTAIN")
+            try:
+                side = SuggestedSide(side_raw)
+            except ValueError:
+                side = SuggestedSide.ABSTAIN
+            fair = float(payload.get("fair_probability") or 0.5)
+            return MarketAssessment(
+                market_id=str(market_id),
+                fair_probability=fair,
+                fair_probability_no=round(1.0 - fair, 6),
+                confidence=float(payload.get("confidence") or 0.0),
+                suggested_side=side,
+                expiry_risk=str(payload.get("expiry_risk") or "UNKNOWN"),
+                reasons_for_trade=list(payload.get("reasons_for_trade") or []),
+                reasons_to_abstain=list(payload.get("reasons_to_abstain") or []),
+                edge=float(payload.get("edge_yes" if side is SuggestedSide.YES else "edge_no") or 0.0),
+                edge_yes=float(payload.get("edge_yes") or 0.0),
+                edge_no=float(payload.get("edge_no") or 0.0),
+                raw_model_output="daemon-tick",
+                slippage_bps=float(payload.get("slippage_bps") or 0.0),
+            )
+        return None
+
+    def _prepare_trade(self, market_id: str, mode: ExecutionMode, skip_scoring: bool = False):
+        """Build snapshot + assessment + decision for ``market_id``.
+
+        ``skip_scoring`` short-circuits the LLM-capable scoring engine in
+        favour of the most recent ``daemon_tick``-derived assessment. Used by
+        read-only dashboard paths so they don't trigger an OpenRouter call on
+        every poll.
+        """
+        if skip_scoring:
+            cached = self._latest_tick_assessment(market_id)
+            if cached is not None:
+                snapshot = self.build_market_snapshot(market_id)
+                account_state = self.portfolio.get_account_state(mode)
+                decision = self.risk.decide_trade(snapshot, cached, account_state)
+                return snapshot, cached, decision, account_state
         snapshot, assessment = self.analyze_market(market_id)
         account_state = self.portfolio.get_account_state(mode)
         decision = self.risk.decide_trade(snapshot, assessment, account_state)
@@ -157,10 +211,12 @@ class AgentService:
         self.journal.log_event("simulation_decision", decision)
         return snapshot, assessment, decision
 
-    def live_preflight(self, market_id: str | None = None) -> dict:
+    def live_preflight(self, market_id: str | None = None, skip_scoring: bool = False) -> dict:
         resolved_market_id = market_id or self.get_active_market_id()
         auth = self._auth_status_dict(self.polymarket.probe_live_readiness())
-        snapshot, assessment, decision, account_state = self._prepare_trade(resolved_market_id, ExecutionMode.LIVE)
+        snapshot, assessment, decision, account_state = self._prepare_trade(
+            resolved_market_id, ExecutionMode.LIVE, skip_scoring=skip_scoring
+        )
         blockers: list[str] = []
         if self.settings.trading_mode != ExecutionMode.LIVE.value:
             blockers.append("trading_mode_not_live")
@@ -613,11 +669,16 @@ class AgentService:
             "trade": trade,
         }
 
-    def live_activity(self, market_id: str | None = None, trade_limit: int = 20) -> dict:
+    def live_activity(
+        self,
+        market_id: str | None = None,
+        trade_limit: int = 20,
+        skip_scoring: bool = False,
+    ) -> dict:
         auth = self._auth_status_dict(self.polymarket.probe_live_readiness())
         if not auth["readonly_ready"]:
             raise RuntimeError("Authenticated live activity inspection requires readonly_ready auth.")
-        preflight = self.live_preflight(market_id)
+        preflight = self.live_preflight(market_id, skip_scoring=skip_scoring)
         orders = self.polymarket.list_live_orders()
         trades = self.polymarket.list_live_trades(market_id=preflight["market_id"], limit=trade_limit)
         market_trades = self.polymarket.list_market_trades(

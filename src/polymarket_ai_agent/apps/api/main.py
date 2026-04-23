@@ -215,7 +215,11 @@ def create_app(
 
     def safe_live_activity(service: AgentService) -> dict:
         try:
-            return service.live_activity()
+            # ``skip_scoring=True`` pulls the preflight assessment from the
+            # most recent ``daemon_tick`` instead of re-invoking the scoring
+            # engine — which would round-trip to OpenRouter when the key is
+            # set — on every dashboard poll.
+            return service.live_activity(skip_scoring=True)
         except Exception as exc:
             return {
                 "readonly": True,
@@ -286,7 +290,7 @@ def create_app(
             "equity_curve": equity_curve(limit=200, service=service),
             "report": _cached("report", 60.0, lambda: report(session_id=None, service=service)),
             "recent_events": recent_events(limit=12, service=service),
-            "recent_decisions": recent_decisions(limit=50, service=service),
+            "recent_decisions": recent_decisions(limit=500, window_seconds=600, service=service),
             "live_orders": _cached("live_orders", 30.0, lambda: live_orders(service=service)),
             "live_trades": _cached("live_trades", 30.0, lambda: live_trades(limit=20, service=service)),
             "daemon_heartbeat": _daemon_heartbeat_payload(service.settings),
@@ -414,13 +418,55 @@ def create_app(
         }
 
     @app.get("/api/decisions/recent")
-    def recent_decisions(limit: int = Query(50, ge=1, le=200), service: AgentService = Depends(service_factory)) -> dict:
+    def recent_decisions(
+        limit: int = Query(50, ge=1, le=5000),
+        window_seconds: int | None = Query(None, ge=1, le=3600),
+        service: AgentService = Depends(service_factory),
+    ) -> dict:
+        """Return ``daemon_tick`` events for the Signal History panel.
+
+        When ``window_seconds`` is set, filter to events logged within that
+        many seconds of now and cap at ``limit`` entries. Without the window
+        we keep the legacy "last ``limit`` ticks" behaviour so unqualified
+        callers see the same shape.
+
+        Multi-strategy runs emit ~2× the tick volume (one tick per scorer),
+        so ``window_seconds=600`` can return 2-3k ticks on a busy feed; scan
+        a wide journal slice so nothing inside the window is missed.
+        """
         # read_recent_events returns oldest→newest; take the TAIL so the top
         # of Signal History reflects the latest tick, not the newest-of-oldest.
-        events = [e for e in service.journal.read_recent_events(limit=limit * 6) if e["event_type"] == "daemon_tick"]
+        if window_seconds is None:
+            events = [e for e in service.journal.read_recent_events(limit=limit * 6) if e["event_type"] == "daemon_tick"]
+            return {
+                "count": len(events[-limit:]),
+                "decisions": events[-limit:],
+            }
+
+        # Time-windowed path: scan a generously wide journal slice and filter
+        # by logged_at ≥ cutoff. At ~10 ticks/second on a 3-market soak this
+        # is 6k ticks for a 10-minute window; 20k scan gives headroom.
+        from datetime import datetime, timedelta, timezone
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=window_seconds)
+        scan_limit = max(limit * 20, 20000)
+        window_events: list[dict] = []
+        for event in service.journal.read_recent_events(limit=scan_limit):
+            if event.get("event_type") != "daemon_tick":
+                continue
+            ts_raw = str(event.get("logged_at") or "")
+            try:
+                ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if ts < cutoff:
+                continue
+            window_events.append(event)
+        # Keep the newest ``limit`` entries; oldest-first already; take TAIL.
+        trimmed = window_events[-limit:]
         return {
-            "count": len(events[-limit:]),
-            "decisions": events[-limit:],
+            "count": len(trimmed),
+            "decisions": trimmed,
+            "window_seconds": window_seconds,
         }
 
     @app.get("/api/paper/activity")
@@ -482,12 +528,46 @@ def create_app(
     def portfolio_summary(service: AgentService = Depends(service_factory)) -> dict:
         open_positions = service.portfolio.list_open_positions()
         closed_positions = service.portfolio.list_closed_positions(limit=200)
+        # Group by strategy_id so the UI can render side-by-side stats for
+        # fade vs adaptive. We iterate the already-loaded row lists rather
+        # than re-querying — keeps this endpoint a single-pass aggregation.
+        per_strategy: dict[str, dict] = {}
+        for pos in open_positions:
+            sid = getattr(pos, "strategy_id", "fade") or "fade"
+            bucket = per_strategy.setdefault(sid, {
+                "strategy_id": sid,
+                "open_positions": 0, "closed_positions": 0,
+                "total_realized_pnl": 0.0, "open_notional": 0.0,
+                "wins": 0, "losses": 0,
+            })
+            bucket["open_positions"] += 1
+            bucket["open_notional"] += pos.size_usd
+        for pos in closed_positions:
+            sid = getattr(pos, "strategy_id", "fade") or "fade"
+            bucket = per_strategy.setdefault(sid, {
+                "strategy_id": sid,
+                "open_positions": 0, "closed_positions": 0,
+                "total_realized_pnl": 0.0, "open_notional": 0.0,
+                "wins": 0, "losses": 0,
+            })
+            bucket["closed_positions"] += 1
+            bucket["total_realized_pnl"] += pos.realized_pnl
+            if pos.realized_pnl > 0:
+                bucket["wins"] += 1
+            elif pos.realized_pnl < 0:
+                bucket["losses"] += 1
+        for bucket in per_strategy.values():
+            decided = bucket["wins"] + bucket["losses"]
+            bucket["win_rate"] = (bucket["wins"] / decided) if decided else None
+            bucket["total_realized_pnl"] = round(bucket["total_realized_pnl"], 6)
+            bucket["open_notional"] = round(bucket["open_notional"], 4)
         return {
             "open_positions": len(open_positions),
             "closed_positions": len(closed_positions),
             "total_realized_pnl": service.portfolio.get_total_realized_pnl(),
             "daily_realized_pnl": service.portfolio.get_daily_realized_pnl(),
             "open_position_notional": round(sum(position.size_usd for position in open_positions), 4),
+            "per_strategy": sorted(per_strategy.values(), key=lambda b: b["strategy_id"]),
         }
 
     @app.get("/api/portfolio/open-positions")
@@ -501,6 +581,7 @@ def create_app(
                 "entry_price": p.entry_price,
                 "opened_at": p.opened_at.isoformat(),
                 "order_id": p.order_id,
+                "strategy_id": p.strategy_id,
             }
             for p in positions
         ]
@@ -532,6 +613,7 @@ def create_app(
                     "realized_pnl": position.realized_pnl,
                     "fees_paid": fees_paid,
                     "cumulative_pnl": round(cumulative, 6),
+                    "strategy_id": position.strategy_id,
                 }
             )
         return {"count": len(items), "positions": items}

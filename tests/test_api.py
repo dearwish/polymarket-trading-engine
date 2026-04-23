@@ -35,7 +35,7 @@ class StubService:
     def doctor(self, market_id=None):
         return {"readonly": True, "market_id": market_id or "active-123"}
 
-    def live_activity(self, market_id=None, trade_limit=20):
+    def live_activity(self, market_id=None, trade_limit=20, skip_scoring=False):
         return {
             "readonly": True,
             "market_id": market_id or "active-123",
@@ -73,7 +73,7 @@ class StubService:
             "recent_trades": {"count": 0},
         }
 
-    def live_preflight(self, market_id=None):
+    def live_preflight(self, market_id=None, skip_scoring=False):
         return {"readonly": True, "market_id": market_id or "active-123", "blockers": []}
 
     def live_orders(self):
@@ -129,6 +129,7 @@ class StubService:
                         "entry_price": 0.52,
                         "opened_at": datetime(2026, 4, 18, 22, 0, 0, tzinfo=timezone.utc),
                         "order_id": "paper-order-000001",
+                        "strategy_id": "fade",
                     },
                 )()
             ]
@@ -149,6 +150,7 @@ class StubService:
                         "closed_at": type("Now", (), {"isoformat": lambda self: "2026-04-17T01:00:00+00:00"})(),
                         "close_reason": "manual_close",
                         "realized_pnl": 3.75,
+                        "strategy_id": "fade",
                     },
                 )()
             ]
@@ -332,7 +334,7 @@ def test_api_dashboard_handles_missing_active_market() -> None:
         def get_active_market_id(self):
             raise RuntimeError("No active market matched the configured market family.")
 
-        def live_activity(self, market_id=None, trade_limit=20):
+        def live_activity(self, market_id=None, trade_limit=20, skip_scoring=False):
             raise RuntimeError("No active market matched the configured market family.")
 
     client = TestClient(create_app(lambda: ServiceWithoutActiveMarket()))

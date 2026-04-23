@@ -100,7 +100,7 @@ class StubService:
             "simulation": {"decision_status": "APPROVED", "decision_side": "YES"},
         }
 
-    def live_preflight(self, market_id=None):
+    def live_preflight(self, market_id=None, skip_scoring=False):
         return {
             "readonly": True,
             "market_id": market_id or "active-123",
@@ -142,7 +142,7 @@ class StubService:
             "trade": {"trade_id": trade_id, "order_id": "live-1"},
         }
 
-    def live_activity(self, market_id=None, trade_limit=20):
+    def live_activity(self, market_id=None, trade_limit=20, skip_scoring=False):
         return {
             "readonly": True,
             "market_id": market_id or "active-123",

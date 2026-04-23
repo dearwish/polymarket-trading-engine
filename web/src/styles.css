@@ -685,6 +685,32 @@ th {
   border: 1px solid var(--border);
 }
 
+.strategy-badge {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: lowercase;
+  border: 1px solid var(--border);
+  background: rgba(157, 179, 206, 0.08);
+  color: var(--muted);
+}
+
+.strategy-fade {
+  background: rgba(96, 165, 250, 0.14);
+  color: #60a5fa;
+  border-color: rgba(96, 165, 250, 0.32);
+}
+
+.strategy-adaptive {
+  background: rgba(251, 191, 36, 0.14);
+  color: #fbbf24;
+  border-color: rgba(251, 191, 36, 0.32);
+}
+
 .risk-table th,
 .risk-table td {
   font-size: 13px;

@@ -433,7 +433,7 @@ def test_agent_service_live_preflight_blocked(settings, market_snapshot, market_
             "errors": [],
         },
     )()
-    service._prepare_trade = lambda market_id, mode: (
+    service._prepare_trade = lambda market_id, mode, skip_scoring=False: (
         market_snapshot,
         market_assessment,
         TradeDecision(
@@ -463,8 +463,8 @@ def test_agent_service_live_preflight_blocked(settings, market_snapshot, market_
 def test_agent_service_live_trade_executes_when_preflight_ready(settings, market_snapshot, market_assessment) -> None:
     configured = settings.model_copy(update={"trading_mode": "live", "live_trading_enabled": True})
     service = AgentService(configured)
-    service.live_preflight = lambda market_id: {"blockers": []}
-    service._prepare_trade = lambda market_id, mode: (
+    service.live_preflight = lambda market_id, skip_scoring=False: {"blockers": []}
+    service._prepare_trade = lambda market_id, mode, skip_scoring=False: (
         market_snapshot,
         market_assessment,
         TradeDecision(
@@ -680,7 +680,7 @@ def test_agent_service_live_activity(settings) -> None:
             "errors": [],
         },
     )()
-    service.live_preflight = lambda market_id=None: {
+    service.live_preflight = lambda market_id=None, skip_scoring=False: {
         "market_id": market_id or "123",
         "ready": False,
         "blockers": ["edge_limit"],
@@ -783,7 +783,7 @@ def test_agent_service_live_reconcile(settings) -> None:
             "errors": [],
         },
     )()
-    service.live_preflight = lambda market_id=None: {"market_id": market_id or "123", "ready": False, "blockers": ["edge_limit"]}
+    service.live_preflight = lambda market_id=None, skip_scoring=False: {"market_id": market_id or "123", "ready": False, "blockers": ["edge_limit"]}
     service.refresh_live_order_tracking = lambda limit=50: {
         "readonly": True,
         "count": 1,
@@ -800,3 +800,43 @@ def test_agent_service_live_reconcile(settings) -> None:
     assert payload["tracked_orders"]["summary"] == {"active": 0, "terminal": 1, "errors": 0}
     assert payload["recent_trades"]["count"] == 1
     assert payload["preflight"]["blockers"] == ["edge_limit"]
+
+
+def test_live_preflight_skip_scoring_reuses_daemon_tick(settings) -> None:
+    """With ``skip_scoring=True`` the preflight path must not call the
+    scoring engine — it should reuse the most recent ``daemon_tick``
+    payload for the active market. This is what the dashboard snapshot
+    relies on to avoid OpenRouter round-trips on every poll.
+    """
+    from unittest.mock import MagicMock
+
+    service = AgentService(settings)
+    # Journal gets a fake daemon_tick for "active-123" so the lookup succeeds.
+    service.journal.read_recent_events = lambda limit=2000: [  # type: ignore[assignment]
+        {
+            "event_type": "daemon_tick",
+            "logged_at": "2026-04-23T06:00:00+00:00",
+            "payload": {
+                "market_id": "active-123",
+                "suggested_side": "YES",
+                "fair_probability": 0.62,
+                "edge_yes": 0.05,
+                "edge_no": -0.07,
+                "confidence": 0.7,
+            },
+        }
+    ]
+    # Skip the snapshot-building path (requires market data on disk) by
+    # short-circuiting _prepare_trade's surrounding helpers.
+    service.build_market_snapshot = MagicMock(side_effect=RuntimeError("should not build"))  # type: ignore[assignment]
+    service.analyze_market = MagicMock(side_effect=RuntimeError("should not analyze"))  # type: ignore[assignment]
+    # We can't easily invoke the real live_preflight without the rest of the
+    # snapshot/auth stack, so test the helper directly.
+    assessment = service._latest_tick_assessment("active-123")
+    assert assessment is not None
+    assert assessment.suggested_side == SuggestedSide.YES
+    assert assessment.fair_probability == 0.62
+    assert assessment.edge == 0.05
+    assert assessment.raw_model_output == "daemon-tick"
+    # No matching tick → None (dashboard will fall back to the error shape).
+    assert service._latest_tick_assessment("unknown-mkt") is None

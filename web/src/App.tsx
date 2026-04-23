@@ -61,12 +61,24 @@ type LiveActivityPayload = {
   };
 };
 
+type PerStrategyStats = {
+  strategy_id: string;
+  open_positions: number;
+  closed_positions: number;
+  total_realized_pnl: number;
+  open_notional: number;
+  wins: number;
+  losses: number;
+  win_rate: number | null;
+};
+
 type PortfolioSummaryPayload = {
   open_positions: number;
   closed_positions: number;
   total_realized_pnl: number;
   daily_realized_pnl: number;
   open_position_notional: number;
+  per_strategy?: PerStrategyStats[];
 };
 
 type ClosedPosition = {
@@ -82,6 +94,7 @@ type ClosedPosition = {
   cumulative_pnl: number;
   opened_at: string;
   closed_at: string | null;
+  strategy_id?: string;
 };
 
 type ClosedPositionsPayload = {
@@ -96,6 +109,7 @@ type OpenPosition = {
   entry_price: number;
   opened_at: string;
   order_id: string;
+  strategy_id?: string;
 };
 
 type OpenPositionsPayload = {
@@ -967,6 +981,7 @@ function DecisionsPage({ decisions, settings, openPositions }: { decisions: Deci
             <thead>
               <tr>
                 <th>Time</th>
+                <th>Strategy</th>
                 <th>Market</th>
                 <th>Side</th>
                 <th>Fair</th>
@@ -987,6 +1002,7 @@ function DecisionsPage({ decisions, settings, openPositions }: { decisions: Deci
                 const conf = typeof p.confidence === "number" ? p.confidence : null;
                 const tte = typeof p.seconds_to_expiry === "number" ? p.seconds_to_expiry : null;
                 const question = typeof p.question === "string" ? p.question : String(p.market_id ?? "");
+                const strategyId = typeof p.strategy_id === "string" ? p.strategy_id : "fade";
                 // Reason tooltip: same text the Portfolio → Last Signal table
                 // shows. deriveDecisionReason prefers the scorer's verbatim
                 // reasons_to_abstain/reasons_for_trade when present, falling
@@ -999,6 +1015,7 @@ function DecisionsPage({ decisions, settings, openPositions }: { decisions: Deci
                 return (
                   <tr key={`${item.logged_at}-${index}`}>
                     <td style={{ whiteSpace: "nowrap", color: "var(--muted)", fontSize: "12px" }}>{formatInstant(item.logged_at, timezone, timeFormat, "time")}</td>
+                    <td><span className={`strategy-badge strategy-${strategyId}`}>{strategyId}</span></td>
                     <td title={question}>{question.length > 42 ? `${question.slice(0, 42)}…` : question}</td>
                     <td>
                       <span
@@ -1333,6 +1350,49 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
         </dl>
       </article>
 
+      {summary?.per_strategy && summary.per_strategy.length > 0 && (
+        <article className="panel full-span">
+          <div className="panel-header">
+            <h2>Per-Strategy Stats</h2>
+            <span>Realised performance by scorer</span>
+          </div>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Strategy</th>
+                  <th>Open</th>
+                  <th>Closed</th>
+                  <th>Total PnL</th>
+                  <th>Wins</th>
+                  <th>Losses</th>
+                  <th>Win Rate</th>
+                  <th>Exposure</th>
+                </tr>
+              </thead>
+              <tbody>
+                {summary.per_strategy.map((row) => {
+                  const pnlCls = row.total_realized_pnl >= 0 ? "positive" : "negative";
+                  const sign = row.total_realized_pnl >= 0 ? "+" : "";
+                  return (
+                    <tr key={row.strategy_id}>
+                      <td><span className={`strategy-badge strategy-${row.strategy_id}`}>{row.strategy_id}</span></td>
+                      <td>{row.open_positions}</td>
+                      <td>{row.closed_positions}</td>
+                      <td className={pnlCls}>{sign}{formatMoney(row.total_realized_pnl)}</td>
+                      <td>{row.wins}</td>
+                      <td>{row.losses}</td>
+                      <td>{row.win_rate !== null ? `${(row.win_rate * 100).toFixed(1)}%` : "—"}</td>
+                      <td>{formatMoney(row.open_notional)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </article>
+      )}
+
       {(() => {
         const activeIds: string[] = hb?.active_market_ids ?? [];
         const activeTicks = activeIds.map((id) => marketLookup[id]).filter((t): t is DaemonTickPayload => Boolean(t));
@@ -1525,6 +1585,7 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
             <table>
               <thead>
                 <tr>
+                  <th>Strategy</th>
                   <th>Market</th>
                   <th>Side</th>
                   <th>Size</th>
@@ -1582,8 +1643,10 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
                       );
                     }
                   }
+                  const strategyId = position.strategy_id ?? "fade";
                   return (
                     <tr key={position.order_id || `${position.market_id}-${position.opened_at}`}>
+                      <td><span className={`strategy-badge strategy-${strategyId}`}>{strategyId}</span></td>
                       <td><MarketCell marketId={position.market_id} lookup={marketLookup} timezone={timezone} timeFormat={timeFormat} /></td>
                       <td className={position.side === "YES" ? "positive" : position.side === "NO" ? "negative" : ""}>{position.side}</td>
                       <td>{formatMoney(position.size_usd)}</td>
@@ -1612,6 +1675,7 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
             <thead>
               <tr>
                 <th>Trade ID</th>
+                <th>Strategy</th>
                 <th>Market</th>
                 <th>Side</th>
                 <th>Size</th>
@@ -1634,11 +1698,13 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
                   const pnlCls = position.realized_pnl >= 0 ? "positive" : "negative";
                   const sign = position.realized_pnl >= 0 ? "+" : "";
                   const compactId = tradeIdMap[position.order_id] || position.order_id || "n/a";
+                  const strategyId = position.strategy_id ?? "fade";
                   return (
                     <tr key={position.order_id || `${position.market_id}-${position.closed_at}`}>
                       <td style={{ fontSize: "12px", color: "var(--muted)" }} title={position.order_id}>
                         {compactId}
                       </td>
+                      <td><span className={`strategy-badge strategy-${strategyId}`}>{strategyId}</span></td>
                       <td><MarketCell marketId={position.market_id} lookup={marketLookup} timezone={timezone} timeFormat={timeFormat} /></td>
                       <td>{position.side}</td>
                       <td>{formatMoney(position.size_usd)}</td>
