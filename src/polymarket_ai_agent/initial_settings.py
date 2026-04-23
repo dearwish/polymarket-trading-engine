@@ -66,6 +66,15 @@ INITIAL_SETTINGS_BASELINE: dict[str, Any] = {
     "paper_follow_cancel_price_threshold": 0.005,
     "paper_follow_cancel_size_threshold_pct": 10.0,
     "paper_follow_min_level_size_shares": 10.0,
+    # Penny-buy strategy defaults (from 8h backtest sweep, 2026-04-23):
+    # entry_thresh=0.03 + TTE≥300s + TP=2x produced 63.6% hit, +46% ROI
+    # on n=11 trades. Paper mode, parallel to fade + adaptive.
+    "penny_enabled": True,
+    "penny_entry_thresh": 0.03,
+    "penny_min_entry_tte_seconds": 300,
+    "penny_force_exit_tte_seconds": 120,
+    "penny_tp_multiple": 2.0,
+    "penny_size_usd": 1.0,
     "fee_bps": 0.0,
     # --- Quant scorer gates ---
     "quant_invert_drift": False,

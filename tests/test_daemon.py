@@ -1991,3 +1991,233 @@ def test_daemon_tick_reward_estimate_is_zero_for_unrewarded_market(
     assert ticks
     payload = ticks[-1]["payload"]
     assert payload["estimated_reward_per_100_yes_bid"] == 0.0
+
+
+# --- Penny strategy integration --------------------------------------------
+
+def _penny_runner(tmp_path: Path, ask_yes: float = 0.98, ask_no: float = 0.02):
+    """Build a daemon with penny enabled and a market whose NO ask is
+    already at 2¢ so the next tick is a candidate for entry.
+
+    The YES and NO books are constructed so the NO frame satisfies
+    ``1 - YES_bid = NO_ask`` and ``1 - YES_ask = NO_bid``. The paper
+    execution engine simulates NO-side fills by reflecting YES bids, so
+    the two books must agree on that invariant for the test's entry
+    price to land where we expect.
+    """
+    from polymarket_ai_agent.engine.market_state import MarketState
+
+    settings = _settings(tmp_path).model_copy(update={
+        "daemon_auto_paper_execute": True,
+        "penny_enabled": True,
+        "penny_entry_thresh": 0.03,
+        "penny_min_entry_tte_seconds": 300,
+        "penny_force_exit_tte_seconds": 120,
+        "penny_tp_multiple": 2.0,
+        "penny_size_usd": 1.0,
+        "max_concurrent_positions": 5,
+        "paper_entry_slippage_bps": 0.0,
+        "paper_exit_slippage_bps": 0.0,
+    })
+    service = AgentService(settings)
+    candidate = _candidate("m-penny", "yes-tok", "no-tok")
+    runner = DaemonRunner(
+        settings=settings,
+        service=service,
+        config=DaemonConfig(market_family=settings.market_family),
+        market_stream_factory=lambda url: FakeMarketStream([]),  # type: ignore[arg-type]
+        btc_feed_factory=lambda: FakeBtcFeed([]),  # type: ignore[arg-type]
+    )
+    state = MarketState(market_id=candidate.market_id, yes_token_id="yes-tok", no_token_id="no-tok")
+    # NO ask = 1 - YES bid  →  YES bid must be (1 - ask_no). Similarly for
+    # the other two corners. Keeps the paper execution engine's
+    # "NO = 1 − YES" inversion consistent with the book the scorer reads.
+    yes_bid = 1.0 - ask_no
+    yes_ask = 1.0 - (ask_no - 0.01) if ask_no > 0.01 else 1.0 - 0.001
+    state.apply_book_snapshot({
+        "asset_id": "yes-tok",
+        "bids": [{"price": f"{yes_bid:.4f}", "size": "500"}],
+        "asks": [{"price": f"{yes_ask:.4f}", "size": "500"}],
+    })
+    state.apply_book_snapshot({
+        "asset_id": "no-tok",
+        "bids": [{"price": f"{max(ask_no - 0.01, 0.001):.4f}", "size": "500"}],
+        "asks": [{"price": f"{ask_no:.4f}", "size": "500"}],
+    })
+    runner._market_states[candidate.market_id] = state
+    runner._candidates[candidate.market_id] = candidate
+    return runner, service, candidate, state
+
+
+def _penny_context(runner, candidate, state, ask_yes: float, ask_no: float, seconds_to_expiry: int):
+    from dataclasses import replace as _replace
+    from polymarket_ai_agent.apps.daemon.run import DecisionContext
+    from polymarket_ai_agent.engine.btc_state import BtcSnapshot
+    from polymarket_ai_agent.types import EvidencePacket
+    btc = BtcSnapshot(
+        price=70000.0, observed_at=datetime.now(timezone.utc),
+        log_return_10s=0.0, log_return_1m=0.0, log_return_5m=0.0, log_return_15m=0.0,
+        realized_vol_30m=0.002, sample_count=50,
+    )
+    # Daemon's _seconds_to_expiry reads candidate.end_date_iso, not the
+    # packet's seconds_to_expiry — so the force-exit gate only fires when
+    # the candidate itself is close to expiry. Rebuild the candidate with
+    # an end_date N seconds from now to match the intended TTE.
+    end_at = datetime.now(timezone.utc) + timedelta(seconds=seconds_to_expiry)
+    candidate = _replace(candidate, end_date_iso=end_at.isoformat())
+    packet = EvidencePacket(
+        market_id=candidate.market_id,
+        question=candidate.question,
+        resolution_criteria="-",
+        market_probability=0.95,
+        orderbook_midpoint=0.5,
+        spread=0.02,
+        depth_usd=500.0,
+        seconds_to_expiry=seconds_to_expiry,
+        external_price=70000.0,
+        recent_price_change_bps=0.0,
+        recent_trade_count=0,
+        reasons_context=[],
+        citations=[],
+        bid_yes=max(ask_yes - 0.01, 0.001),
+        ask_yes=ask_yes,
+        bid_no=max(ask_no - 0.01, 0.001),
+        ask_no=ask_no,
+        realized_vol_30m=0.002,
+        time_elapsed_in_candle_s=60,
+    )
+    # Score it via the penny scorer the runner was built with so the
+    # assessment carries the PENNY_STRATEGY_TAG we route on.
+    assessment = runner.penny.score_market(packet)
+    # The daemon also reads the candidate from its _candidates map, so
+    # make sure that map's copy has the matching end_date too.
+    runner._candidates[candidate.market_id] = candidate
+    return DecisionContext(
+        market_id=candidate.market_id,
+        candidate=candidate,
+        features=state.features(),
+        btc_snapshot=btc,
+        assessment=assessment,
+        metrics=runner.metrics,
+        packet=packet,
+    )
+
+
+def test_penny_enters_on_cheap_side_with_sufficient_tte(tmp_path: Path) -> None:
+    """Penny ask ≤ threshold + TTE above min → open paper position on
+    the cheap side under strategy_id='penny'.
+    """
+    from polymarket_ai_agent.types import SuggestedSide
+    runner, service, candidate, state = _penny_runner(tmp_path, ask_no=0.02)
+    ctx = _penny_context(runner, candidate, state, ask_yes=0.98, ask_no=0.02, seconds_to_expiry=500)
+
+    asyncio.run(runner._handle_penny_strategy(ctx))
+
+    positions = service.portfolio.list_open_positions(strategy_id="penny")
+    assert len(positions) == 1
+    assert positions[0].side == SuggestedSide.NO
+    # Entry at the 2¢ ask; allow some float fuzz.
+    assert abs(positions[0].entry_price - 0.02) < 1e-4
+
+
+def test_penny_skips_entry_when_tte_below_gate(tmp_path: Path) -> None:
+    """A penny setup 30 seconds before expiry is the terminal-cliff trap
+    — the backtest showed these lose ~100%. Scorer abstains; daemon
+    must not open a position.
+    """
+    runner, service, candidate, state = _penny_runner(tmp_path, ask_no=0.02)
+    ctx = _penny_context(runner, candidate, state, ask_yes=0.98, ask_no=0.02, seconds_to_expiry=30)
+
+    asyncio.run(runner._handle_penny_strategy(ctx))
+
+    assert service.portfolio.list_open_positions(strategy_id="penny") == []
+
+
+def test_penny_skips_entry_when_no_cheap_side(tmp_path: Path) -> None:
+    """Mid-price market (both asks near 0.50) produces no penny signal."""
+    runner, service, candidate, state = _penny_runner(tmp_path, ask_yes=0.50, ask_no=0.52)
+    ctx = _penny_context(runner, candidate, state, ask_yes=0.50, ask_no=0.52, seconds_to_expiry=500)
+
+    asyncio.run(runner._handle_penny_strategy(ctx))
+
+    assert service.portfolio.list_open_positions(strategy_id="penny") == []
+
+
+def test_penny_take_profit_closes_at_tp_multiple(tmp_path: Path) -> None:
+    """Tick 1 opens penny on NO at 2¢. Tick 2 has bid_no = 4¢ (2x entry).
+    Must close with ``penny_take_profit`` reason.
+    """
+    from polymarket_ai_agent.engine.market_state import MarketState
+
+    runner, service, candidate, state = _penny_runner(tmp_path, ask_no=0.02)
+    ctx_open = _penny_context(runner, candidate, state, ask_yes=0.98, ask_no=0.02, seconds_to_expiry=500)
+    asyncio.run(runner._handle_penny_strategy(ctx_open))
+    assert service.portfolio.list_open_positions(strategy_id="penny"), "setup"
+
+    # Bid on NO has bounced to 4c → at 2x entry → TP fires.
+    state.apply_book_snapshot({
+        "asset_id": "no-tok",
+        "bids": [{"price": "0.04", "size": "500"}],
+        "asks": [{"price": "0.05", "size": "500"}],
+    })
+    ctx_tp = _penny_context(runner, candidate, state, ask_yes=0.95, ask_no=0.05, seconds_to_expiry=400)
+    asyncio.run(runner._handle_penny_strategy(ctx_tp))
+
+    closed = service.portfolio.list_closed_positions(limit=10)
+    assert len(closed) == 1
+    assert closed[0].close_reason == "penny_take_profit"
+    # Entry ~0.02, exit ~0.04 → ~100% pnl on ~$1 notional.
+    assert closed[0].realized_pnl > 0.5
+
+
+def test_penny_force_exit_triggers_when_tte_expires(tmp_path: Path) -> None:
+    """Open penny position + TTE drops to 90s (< force_exit_tte=120s) →
+    close at current bid regardless of TP, reason = penny_force_exit.
+    """
+    from polymarket_ai_agent.engine.market_state import MarketState
+
+    runner, service, candidate, state = _penny_runner(tmp_path, ask_no=0.02)
+    ctx_open = _penny_context(runner, candidate, state, ask_yes=0.98, ask_no=0.02, seconds_to_expiry=500)
+    asyncio.run(runner._handle_penny_strategy(ctx_open))
+    assert service.portfolio.list_open_positions(strategy_id="penny")
+
+    # TTE shrinks below the gate; bid still around entry → partial loss.
+    state.apply_book_snapshot({
+        "asset_id": "no-tok",
+        "bids": [{"price": "0.015", "size": "500"}],
+        "asks": [{"price": "0.025", "size": "500"}],
+    })
+    ctx_fx = _penny_context(runner, candidate, state, ask_yes=0.975, ask_no=0.025, seconds_to_expiry=90)
+    asyncio.run(runner._handle_penny_strategy(ctx_fx))
+
+    closed = service.portfolio.list_closed_positions(limit=10)
+    assert len(closed) == 1
+    assert closed[0].close_reason == "penny_force_exit"
+
+
+def test_penny_is_registered_when_enabled(tmp_path: Path) -> None:
+    """Startup wiring: penny_enabled=True must place a 'penny' strategy
+    in the daemon's strategy list alongside fade + adaptive.
+    """
+    runner, *_ = _penny_runner(tmp_path)
+    strategy_ids = [s.strategy_id for s in runner._strategies]
+    assert "penny" in strategy_ids
+    assert "fade" in strategy_ids
+    assert "adaptive" in strategy_ids
+
+
+def test_penny_not_registered_when_disabled(tmp_path: Path) -> None:
+    """penny_enabled=False → strategy is not registered, so no penny
+    ticks are emitted and no penny positions can open.
+    """
+    settings = _settings(tmp_path).model_copy(update={"penny_enabled": False})
+    service = AgentService(settings)
+    runner = DaemonRunner(
+        settings=settings,
+        service=service,
+        config=DaemonConfig(market_family=settings.market_family),
+        market_stream_factory=lambda url: FakeMarketStream([]),  # type: ignore[arg-type]
+        btc_feed_factory=lambda: FakeBtcFeed([]),  # type: ignore[arg-type]
+    )
+    strategy_ids = [s.strategy_id for s in runner._strategies]
+    assert "penny" not in strategy_ids

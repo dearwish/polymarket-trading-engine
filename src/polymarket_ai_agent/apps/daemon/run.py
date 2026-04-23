@@ -30,6 +30,7 @@ from polymarket_ai_agent.engine.execution.paper_maker import (
     maker_limit_price,
 )
 from polymarket_ai_agent.engine.maker_rewards import estimate_reward_per_100
+from polymarket_ai_agent.engine.penny_scoring import PENNY_STRATEGY_TAG, PennyScorer
 from polymarket_ai_agent.engine.market_state import MarketFeatures, MarketState
 from polymarket_ai_agent.engine.quant_scoring import QuantScoringEngine
 from polymarket_ai_agent.engine.regime import Regime, classify_regime
@@ -45,6 +46,7 @@ from polymarket_ai_agent.types import (
     MarketCandidate,
     MarketSnapshot,
     OrderBookSnapshot,
+    OrderSide,
     SuggestedSide,
     TradeDecision,
 )
@@ -229,10 +231,19 @@ class DaemonRunner:
         # paper portfolio slice via the strategy_id dimension added in
         # phase 1.
         self.adaptive = AdaptiveScorer(self.quant)
+        # PennyScorer is constructed from current settings so parameter
+        # changes via the reload loop take effect on the next
+        # ``_refresh_penny_scorer`` call rather than requiring a restart.
+        self.penny = PennyScorer(
+            entry_thresh=float(settings.penny_entry_thresh),
+            min_entry_tte_seconds=int(settings.penny_min_entry_tte_seconds),
+        )
         self._strategies: list[StrategyConfig] = [
             StrategyConfig(strategy_id=_DEFAULT_STRATEGY_ID, scorer=self.quant),
             StrategyConfig(strategy_id="adaptive", scorer=self.adaptive),
         ]
+        if settings.penny_enabled:
+            self._strategies.append(StrategyConfig(strategy_id="penny", scorer=self.penny))
         self.heartbeat = HeartbeatWriter(settings.heartbeat_path)
         self._market_states: dict[str, MarketState] = {}
         self._candidates: dict[str, MarketCandidate] = {}
@@ -708,6 +719,13 @@ class DaemonRunner:
         trailing-stop / TP / SL / force-exit / TTE-buffer priority chain,
         each scoped to ``(strategy_id, market_id)``.
         """
+        if strategy_id == "penny":
+            # Penny-strategy has a different exit surface (fixed TP
+            # multiple + TTE-based force exit) and deliberately skips the
+            # fade/adaptive cooldown / candle-elapsed gates, so it runs
+            # through its own pipeline.
+            await self._handle_penny_strategy(context)
+            return
         # Pin a single Settings snapshot for this callback — the reload loop
         # can swap self.settings at any moment, and we want every field read
         # below (ladder / trail / TP / SL / force-exit / cooldown / candle
@@ -1144,6 +1162,123 @@ class DaemonRunner:
             "strategy_id": strategy_id,
         }
         await asyncio.to_thread(self.service.journal.log_event, "position_closed", payload)
+
+    async def _handle_penny_strategy(self, context: DecisionContext) -> None:
+        """Full penny-strategy lifecycle for one tick of one market.
+
+        State machine per (strategy_id='penny', market_id):
+        - Open position + bid ≥ entry × tp_multiple → close (penny_take_profit)
+        - Open position + TTE ≤ force_exit_tte       → close (penny_force_exit)
+        - Open position otherwise                    → hold
+        - No open position + assessment APPROVED     → enter via taker
+        - No open position + assessment ABSTAIN      → no-op
+
+        Deliberately bypasses the fade/adaptive gates (cooldown, candle
+        elapsed, trend filter, OFI, vol regime) — penny entries are
+        microstructure-driven, not BTC-drift driven, so those gates would
+        just veto the setups the strategy is designed to catch. Also
+        uses a fixed TP multiple instead of the shared TP ladder, which
+        assumes mid-price entries not 1-5¢ tail trades.
+        """
+        settings = self.settings
+        strategy_id = "penny"
+        market_id = context.market_id
+        candidate = context.candidate
+        features = context.features
+        assessment = context.assessment
+        tte_seconds = self._seconds_to_expiry(candidate.end_date_iso)
+
+        orderbook = self._build_orderbook_from_state(market_id, features)
+        if orderbook is None:
+            return
+
+        open_pos = await asyncio.to_thread(
+            self.service.portfolio.get_open_position, market_id, strategy_id
+        )
+        if open_pos is not None:
+            # Current realisable bid on the side we hold. Fall back to mid
+            # if the book is cold-booted, so we at least have a proxy for
+            # the TTE-based force-exit to fire on.
+            if open_pos.side == SuggestedSide.YES:
+                bid = features.bid_yes or features.mid_yes or 0.0
+            else:
+                bid = features.bid_no or features.mid_no or 0.0
+            entry_price = float(open_pos.entry_price)
+            tp_multiple = float(settings.penny_tp_multiple)
+            force_exit_tte = int(settings.penny_force_exit_tte_seconds)
+            tp_target = entry_price * tp_multiple
+            close_reason: str | None = None
+            if bid > 0.0 and bid >= tp_target:
+                close_reason = "penny_take_profit"
+            elif force_exit_tte > 0 and tte_seconds <= force_exit_tte:
+                close_reason = "penny_force_exit"
+            if close_reason is not None:
+                exit_price = self._paper_exit_fill(
+                    market_id,
+                    open_pos.side,
+                    float(open_pos.size_usd),
+                    entry_price,
+                    float(bid or entry_price),
+                )
+                await self._finalize_paper_close(
+                    open_pos, exit_price, close_reason, tte_seconds, context,
+                    strategy_id=strategy_id,
+                )
+            return
+
+        # No open position: only enter on an APPROVED penny assessment.
+        if assessment.suggested_side == SuggestedSide.ABSTAIN:
+            return
+        # Respect per-strategy max concurrent open positions so a burst of
+        # penny setups across many markets doesn't overwhelm the book.
+        account_state = await asyncio.to_thread(
+            lambda: self.service.portfolio.get_account_state(
+                ExecutionMode.PAPER, strategy_id=strategy_id
+            )
+        )
+        max_concurrent = int(settings.max_concurrent_positions)
+        if max_concurrent > 0 and account_state.open_positions >= max_concurrent:
+            return
+
+        size_usd = float(settings.penny_size_usd)
+        if size_usd <= 0.0:
+            return
+        asset_id = (
+            candidate.yes_token_id
+            if assessment.suggested_side == SuggestedSide.YES
+            else candidate.no_token_id
+        )
+        # Build a hand-rolled APPROVED decision — we skip the risk engine's
+        # fade-oriented gates (min_edge, trend filter, OFI, vol regime) by
+        # not calling service.risk.decide_trade here. The scorer's own
+        # gates (entry_thresh + min_entry_tte) are authoritative for penny.
+        limit_price = (
+            features.ask_yes if assessment.suggested_side == SuggestedSide.YES else features.ask_no
+        )
+        decision = TradeDecision(
+            market_id=market_id,
+            status=DecisionStatus.APPROVED,
+            side=assessment.suggested_side,
+            size_usd=size_usd,
+            limit_price=float(limit_price or 0.0),
+            rationale=list(assessment.reasons_for_trade),
+            rejected_by=[],
+            asset_id=str(asset_id),
+            order_side=OrderSide.BUY,
+            intent="OPEN",
+            execution_style=ExecutionStyle.FOK_TAKER,
+            post_only=False,
+            strategy_id=strategy_id,
+        )
+        await asyncio.to_thread(self.service.journal.log_event, "trade_decision", decision)
+        result = self.service.execution.execute_trade(
+            decision,
+            orderbook,
+            seconds_to_expiry=tte_seconds,
+            edge=assessment.edge,
+        )
+        await asyncio.to_thread(self.service.portfolio.record_execution, decision, result)
+        await asyncio.to_thread(self.service.journal.log_event, "execution_result", result)
 
     async def _handle_follow_maker(
         self,
@@ -1624,6 +1759,17 @@ class DaemonRunner:
             self.service.execution.refresh()
         except Exception as exc:  # noqa: BLE001
             logger.warning("execution.refresh failed: %s", exc)
+        # Rebuild the penny scorer so parameter changes (entry_thresh,
+        # min_entry_tte_seconds) take effect without a restart.
+        self.penny = PennyScorer(
+            entry_thresh=float(new_settings.penny_entry_thresh),
+            min_entry_tte_seconds=int(new_settings.penny_min_entry_tte_seconds),
+        )
+        # Toggle penny in/out of the strategy list in place — preserves
+        # fade + adaptive at indexes 0/1 so nothing else reshuffles.
+        self._strategies = [s for s in self._strategies if s.strategy_id != "penny"]
+        if new_settings.penny_enabled:
+            self._strategies.append(StrategyConfig(strategy_id="penny", scorer=self.penny))
 
     async def _maintenance_loop(self, stop_event: asyncio.Event) -> None:
         """Periodic retention + WAL checkpoint + VACUUM-lite upkeep.

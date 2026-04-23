@@ -139,6 +139,16 @@ class Settings(BaseSettings):
     # 1-lot levels when computing best-bid/best-ask — prevents the paper
     # maker from posting behind a phantom order. 0.0 disables (raw mid).
     paper_follow_min_level_size_shares: float = 0.0
+    # Penny-buy strategy (extreme-tail dip). Runs as a third strategy
+    # alongside fade + adaptive. See ``engine/penny_scoring.py`` for the
+    # thesis and ``scripts/backtest_penny.py`` for the parameter sweep
+    # that chose these defaults. All four settings hot-reload.
+    penny_enabled: bool = True
+    penny_entry_thresh: float = 0.03
+    penny_min_entry_tte_seconds: int = 300
+    penny_force_exit_tte_seconds: int = 120
+    penny_tp_multiple: float = 2.0
+    penny_size_usd: float = 1.0
 
     fee_bps: float = 0.0
     execution_maker_min_edge: float = 0.04
@@ -340,6 +350,51 @@ EDITABLE_SETTINGS_METADATA: dict[str, dict[str, Any]] = {
         "min": 0,
         "max": 100000,
         "step": 1,
+        "group": "paper",
+    },
+    "penny_enabled": {
+        "label": "Penny Strategy Enabled",
+        "type": "boolean",
+        "group": "paper",
+    },
+    "penny_entry_thresh": {
+        "label": "Penny Entry Threshold (ask ≤)",
+        "type": "number",
+        "min": 0,
+        "max": 0.2,
+        "step": 0.005,
+        "group": "paper",
+    },
+    "penny_min_entry_tte_seconds": {
+        "label": "Penny Min Entry TTE (seconds)",
+        "type": "number",
+        "min": 0,
+        "max": 3600,
+        "step": 10,
+        "group": "paper",
+    },
+    "penny_force_exit_tte_seconds": {
+        "label": "Penny Force-Exit TTE (seconds)",
+        "type": "number",
+        "min": 0,
+        "max": 3600,
+        "step": 10,
+        "group": "paper",
+    },
+    "penny_tp_multiple": {
+        "label": "Penny TP Multiple (× entry)",
+        "type": "number",
+        "min": 1,
+        "max": 100,
+        "step": 0.25,
+        "group": "paper",
+    },
+    "penny_size_usd": {
+        "label": "Penny Position Size (USD)",
+        "type": "number",
+        "min": 0.1,
+        "max": 100,
+        "step": 0.1,
         "group": "paper",
     },
     "paper_take_profit_pct": {
