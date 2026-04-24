@@ -325,11 +325,23 @@ function formatBackendReason(raw: string): string {
 }
 
 type DecisionReasonOptions = {
-  /** Market IDs with an open paper position. When the scorer says YES/NO on
-   *  one of these markets, the daemon skips entry (one-position-per-market
-   *  policy) — surface that to the operator as the entry-block reason. */
-  openMarketIds?: Set<string>;
+  /** ``(strategy_id, market_id)`` pairs with an open paper position.
+   *  Strategies don't share their entry block — each runs its own
+   *  portfolio slice — so "Position already open" should only fire when
+   *  the SAME strategy already has a position on this market, not
+   *  whenever any other strategy does. Encoded as ``"strategy|market"``
+   *  strings for cheap Set membership checks. */
+  openStrategyMarkets?: Set<string>;
 };
+
+/** Helper: build the ``"strategy|market"`` key used by
+ *  ``openStrategyMarkets`` lookups. Keeping the format in one place so
+ *  the producer (PortfolioPage) and consumer (deriveEntryBlockReason)
+ *  can't drift apart.
+ */
+function strategyMarketKey(strategyId: string | undefined, marketId: string | undefined): string {
+  return `${strategyId || "fade"}|${marketId || ""}`;
+}
 
 /** Reason that would block a YES/NO entry BEFORE the scorer's regime gate
  *  runs — i.e. daemon-level filters in _paper_execute_decision_callback.
@@ -345,9 +357,13 @@ function deriveEntryBlockReason(
   const side = tick.suggested_side;
   if (side !== "YES" && side !== "NO") return null;
 
-  // 1. Position already open on this market → one-at-a-time policy.
+  // 1. Position already open on this (strategy, market) → one-at-a-time
+  // policy. Each strategy has its own portfolio slice, so this only
+  // fires when the SAME scorer that produced this tick is already long
+  // on this market, not when any other strategy is.
   const marketId = tick.market_id;
-  if (marketId && options?.openMarketIds?.has(marketId)) {
+  const strategyId = tick.strategy_id;
+  if (marketId && options?.openStrategyMarkets?.has(strategyMarketKey(strategyId, marketId))) {
     return "Position already open";
   }
 
@@ -964,10 +980,12 @@ function OverviewPage({ state }: { state: DashboardState }) {
 
 function DecisionsPage({ decisions, settings, openPositions }: { decisions: DecisionItem[]; settings: SettingsPayload | null; openPositions: OpenPosition[] }) {
   const { timezone, timeFormat } = useDisplayPrefs();
-  // Same "Position already open" surfacing the Portfolio tab does — keeps
-  // the Side tooltip honest when the scorer picks YES/NO on a market we're
-  // already in.
-  const openMarketIds = new Set(openPositions.map((p) => p.market_id));
+  // Same "Position already open" surfacing the Portfolio tab does —
+  // keyed by (strategy_id, market_id) so e.g. adaptive_v2's position
+  // doesn't suppress fade's tick label.
+  const openStrategyMarkets = new Set(
+    openPositions.map((p) => strategyMarketKey(p.strategy_id, p.market_id)),
+  );
   return (
     <section className="panel">
       <div className="panel-header">
@@ -1011,7 +1029,7 @@ function DecisionsPage({ decisions, settings, openPositions }: { decisions: Deci
                 const reasonTooltip = deriveDecisionReason(
                   p as unknown as DaemonTickPayload,
                   settings?.values,
-                  { openMarketIds },
+                  { openStrategyMarkets },
                 );
                 return (
                   <tr key={`${item.logged_at}-${index}`}>
@@ -1320,10 +1338,15 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
   const positionExtras = hb?.position_extras ?? {};
   const trailPct = hb?.paper_trailing_stop_pct ?? 0;
   const trailArmPct = hb?.paper_trail_arm_pct ?? 0;
-  // Markets with an existing open position — used by deriveDecisionReason to
-  // label YES/NO ticks on those markets as "Position already open" instead
-  // of pretending the entry could have fired.
-  const openMarketIds = new Set(openPositions.map((p) => p.market_id));
+  // (strategy_id, market_id) pairs with an open position — used by
+  // deriveDecisionReason to label YES/NO ticks on those pairs as
+  // "Position already open" instead of pretending the entry could have
+  // fired. Keying on both dimensions matters because each strategy has
+  // its own portfolio slice: adaptive_v2 being long on a market doesn't
+  // block fade from entering the same market.
+  const openStrategyMarkets = new Set(
+    openPositions.map((p) => strategyMarketKey(p.strategy_id, p.market_id)),
+  );
   // Bump to force Polymarket iframes to remount with a fresh src. The embed
   // is a 3rd-party page we can't message, so a URL-level cache-bust is the
   // only reliable way to refresh it on demand.
@@ -1453,7 +1476,7 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
                     const sideClass = side === "YES" ? "side-yes" : side === "NO" ? "side-no" : "side-abstain";
                     const icon = side === "YES" ? "▲" : side === "NO" ? "▼" : "—";
                     const edge = side === "YES" ? tick.edge_yes : side === "NO" ? tick.edge_no : null;
-                    const reason = deriveDecisionReason(tick, settings?.values, { openMarketIds });
+                    const reason = deriveDecisionReason(tick, settings?.values, { openStrategyMarkets });
                     const question = tick.question ?? marketId;
                     const label = question.length > 36 ? `${question.slice(0, 36)}…` : question;
                     return (
