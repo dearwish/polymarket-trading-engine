@@ -262,20 +262,26 @@ def create_app(
 
     def _latest_daemon_ticks(service: AgentService) -> dict:
         # read_recent_events returns file-order (oldest first); iterate newest-first
-        # so "first occurrence per market_id" is the most recent tick for that market.
+        # so "first occurrence per (strategy_id, market_id)" is the most recent
+        # tick that scorer emitted for that market. De-duping by market_id alone
+        # would collapse a multi-strategy run to one tick per market and hide
+        # fade / adaptive behind whichever scorer fired last.
         #
         # Scan a wide window (~hours of runtime) so MarketCell hover + link works on
         # older closed positions whose markets are no longer actively tracked.
         events = service.journal.read_recent_events(limit=5000)
-        seen: set[str] = set()
+        seen: set[tuple[str, str]] = set()
         ticks: list[dict] = []
         for e in reversed(events):
             if e.get("event_type") != "daemon_tick":
                 continue
-            mid = e.get("payload", {}).get("market_id", "")
-            if mid and mid not in seen:
-                seen.add(mid)
-                ticks.append(e.get("payload", {}))
+            payload = e.get("payload", {})
+            mid = str(payload.get("market_id", ""))
+            strategy_id = str(payload.get("strategy_id") or "fade")
+            key = (strategy_id, mid)
+            if mid and key not in seen:
+                seen.add(key)
+                ticks.append(payload)
         return {"ticks": ticks}
 
     def build_dashboard_snapshot(service: AgentService) -> dict:
