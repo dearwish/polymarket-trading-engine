@@ -143,6 +143,12 @@ class Settings(BaseSettings):
     # alongside fade + adaptive. See ``engine/penny_scoring.py`` for the
     # thesis and ``scripts/backtest_penny.py`` for the parameter sweep
     # that chose these defaults. All four settings hot-reload.
+    # Phase 1 scorer clone — delegates to fade in every regime (trending
+    # path was retired 2026-04-23 after follow-maker hit 17% win rate on
+    # 250 trades). With it enabled the daemon doubles market-impact for
+    # zero alpha; default off. Flip true only to bootstrap a genuinely
+    # different adaptive variant in the strategy slot.
+    adaptive_enabled: bool = False
     penny_enabled: bool = True
     penny_entry_thresh: float = 0.03
     penny_min_entry_tte_seconds: int = 300
@@ -156,12 +162,13 @@ class Settings(BaseSettings):
     # to 0 disables the gate. See scripts/backtest_penny.py for the
     # break-even hit-rate math.
     penny_stop_loss_multiple: float = 0.5
-    # Stabilisation gate: skip entries when the YES mid has moved
-    # strongly against our intended side over the last 30s. Encodes
-    # "don't catch a falling knife" from the 2026-04-24 live analysis:
-    # losers hit SL in 11-25 s because they entered mid-crash, while
-    # winners entered after the move paused. 0 disables the gate.
-    penny_max_adverse_move_bps: float = 50.0
+    # Reversal-confirmation gate: require YES mid to have moved IN OUR
+    # FAVOUR by at least this many bps over the last 30s before entering.
+    # Replaces the earlier "max adverse move" gate which only required a
+    # pause — the 2026-04-24 soak showed pauses are often temporary and
+    # the side keeps crashing. Requiring actual reversal gives a much
+    # stronger "the knife has bounced" signal. 0 disables.
+    penny_min_favorable_move_bps: float = 25.0
     # Overreaction-fade strategy (adaptive_v2). Runs as a third scorer
     # alongside fade + penny; orthogonal signal: detects Polymarket mid
     # moves that outpace BTC's justification and bets the reversion. See
@@ -374,6 +381,11 @@ EDITABLE_SETTINGS_METADATA: dict[str, dict[str, Any]] = {
         "step": 1,
         "group": "paper",
     },
+    "adaptive_enabled": {
+        "label": "Adaptive (V1, fade-clone) Enabled",
+        "type": "boolean",
+        "group": "paper",
+    },
     "penny_enabled": {
         "label": "Penny Strategy Enabled",
         "type": "boolean",
@@ -427,8 +439,8 @@ EDITABLE_SETTINGS_METADATA: dict[str, dict[str, Any]] = {
         "step": 0.05,
         "group": "paper",
     },
-    "penny_max_adverse_move_bps": {
-        "label": "Penny Max Adverse Move (bps over 30s)",
+    "penny_min_favorable_move_bps": {
+        "label": "Penny Min Favorable Move (bps over 30s)",
         "type": "number",
         "min": 0,
         "max": 2000,

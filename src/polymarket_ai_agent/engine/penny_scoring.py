@@ -48,18 +48,26 @@ class PennyScorer:
         self,
         entry_thresh: float = 0.03,
         min_entry_tte_seconds: int = 300,
-        max_adverse_move_bps: float = 50.0,
+        min_favorable_move_bps: float = 25.0,
     ):
         self.entry_thresh = entry_thresh
         self.min_entry_tte_seconds = min_entry_tte_seconds
-        # Stabilisation gate: the YES mid must not have moved strongly
-        # AGAINST our intended side over the last 30s. Catching a falling
-        # knife in a trending move is the dominant loss pattern — losing
-        # trades exit the SL in 11-25 s (vs 34-164 s for winners), which
-        # means the price keeps collapsing straight through our entry.
-        # This gate filters for ticks where the move has paused, which is
-        # when a bounce actually becomes plausible.
-        self.max_adverse_move_bps = max_adverse_move_bps
+        # Reversal-confirmation gate: the YES mid must have moved IN our
+        # favour by at least this many bps over 30s before we enter.
+        # Replaces the earlier "no strong adverse move" gate after the
+        # 2026-04-24 soak showed that just waiting for the crash to PAUSE
+        # wasn't enough — the pause was often temporary and the side kept
+        # crashing. Requiring actual reversal (bid ticked back up,
+        # reflected in YES-mid reversing toward our side) cuts out the
+        # "knife pause" fake-outs too.
+        #
+        #   - NO buy wants YES mid DROPPING (NO bid rising)  → require
+        #     recent_price_change_bps ≤ −threshold
+        #   - YES buy wants YES mid RISING  → require
+        #     recent_price_change_bps ≥ +threshold
+        #
+        # Set to 0 to disable the gate entirely.
+        self.min_favorable_move_bps = min_favorable_move_bps
 
     def score_market(self, packet: EvidencePacket) -> MarketAssessment:
         """Return an APPROVED YES/NO assessment when a penny setup is live,
@@ -113,32 +121,33 @@ class PennyScorer:
                 ],
             )
 
-        # Stabilisation gate: skip when the 30s YES-mid move is strongly
-        # pointed AGAINST our intended side. Encodes the "don't catch a
-        # falling knife" rule in one comparison.
-        #   - Buying NO → we need YES to stop rising (or start falling)
-        #   - Buying YES → we need YES to stop falling (or start rising)
-        # A zero threshold disables the gate and preserves legacy behaviour.
+        # Reversal-confirmation gate: require YES mid to have moved IN
+        # OUR FAVOUR by at least min_favorable_move_bps over the last 30s
+        # BEFORE we enter. Strictly stronger than "no adverse move" — it
+        # demands actual bounce evidence, not merely a pause in the
+        # crash. Setting to 0 opts out entirely.
         recent_move_bps = float(packet.recent_price_change_bps or 0.0)
-        if self.max_adverse_move_bps > 0.0:
-            if side is SuggestedSide.NO and recent_move_bps > self.max_adverse_move_bps:
+        if self.min_favorable_move_bps > 0.0:
+            if side is SuggestedSide.NO and recent_move_bps > -self.min_favorable_move_bps:
                 return replace(
                     base,
                     reasons_to_abstain=[
                         (
-                            f"Penny: YES mid +{recent_move_bps:.0f}bps over 30s "
-                            f"> {self.max_adverse_move_bps:.0f}bps; NO still collapsing."
+                            f"Penny: YES mid {recent_move_bps:+.0f}bps over 30s; "
+                            f"need ≤ -{self.min_favorable_move_bps:.0f}bps (NO bounce "
+                            f"evidence) before entering."
                         ),
                         *base.reasons_to_abstain,
                     ],
                 )
-            if side is SuggestedSide.YES and recent_move_bps < -self.max_adverse_move_bps:
+            if side is SuggestedSide.YES and recent_move_bps < self.min_favorable_move_bps:
                 return replace(
                     base,
                     reasons_to_abstain=[
                         (
-                            f"Penny: YES mid {recent_move_bps:.0f}bps over 30s "
-                            f"< -{self.max_adverse_move_bps:.0f}bps; YES still collapsing."
+                            f"Penny: YES mid {recent_move_bps:+.0f}bps over 30s; "
+                            f"need ≥ +{self.min_favorable_move_bps:.0f}bps (YES bounce "
+                            f"evidence) before entering."
                         ),
                         *base.reasons_to_abstain,
                     ],

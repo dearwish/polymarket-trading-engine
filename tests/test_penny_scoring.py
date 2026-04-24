@@ -22,7 +22,13 @@ def _packet(**overrides) -> EvidencePacket:
         depth_usd=500.0,
         seconds_to_expiry=600,
         external_price=0.0,
-        recent_price_change_bps=0.0,
+        # Default packet has NO as the cheap side (ask_no=0.02). The
+        # reversal-confirmation gate requires YES mid to have fallen for
+        # NO entries; −40 bps is above the default threshold (25 bps)
+        # so entry-logic tests pass the gate without having to name it.
+        # Tests that flip the cheap side (YES cheap) explicitly override
+        # this to +40.
+        recent_price_change_bps=-40.0,
         recent_trade_count=0,
         reasons_context=[],
         citations=[],
@@ -47,8 +53,11 @@ def test_enters_no_side_when_ask_no_below_threshold() -> None:
 
 def test_enters_yes_side_when_ask_yes_below_threshold() -> None:
     scorer = PennyScorer(entry_thresh=0.03, min_entry_tte_seconds=300)
-    # Flip: YES becomes the cheap side.
-    result = scorer.score_market(_packet(ask_yes=0.02, ask_no=0.98, seconds_to_expiry=600))
+    # Flip: YES becomes the cheap side. For a YES entry the gate wants
+    # YES mid to have risen — override the NO-oriented default.
+    result = scorer.score_market(
+        _packet(ask_yes=0.02, ask_no=0.98, seconds_to_expiry=600, recent_price_change_bps=40.0)
+    )
     assert result.suggested_side == SuggestedSide.YES
     assert result.edge_yes == result.edge
     assert result.edge_no == 0.0
@@ -136,86 +145,78 @@ def test_raw_model_output_tagged_for_daemon_routing() -> None:
     assert abstained.raw_model_output == PENNY_STRATEGY_TAG
 
 
-def test_stabilisation_gate_blocks_no_entry_when_yes_mid_still_rising() -> None:
-    """Entering NO while YES is still rallying means we caught the knife
-    — this was the dominant loss pattern on 2026-04-24 (43/55 trades
-    were NO-side; losers hit SL in 11-25 s mid-crash). The gate must
-    abstain when recent_price_change_bps > threshold on a NO entry.
+def test_reversal_gate_blocks_no_entry_without_yes_mid_drop() -> None:
+    """NO buy requires YES mid to have fallen ≥ threshold over 30s — i.e.
+    NO has bounced off its lows. If YES is still rising (knife mid-fall)
+    or flat (pause, not reversal), abstain.
     """
     scorer = PennyScorer(
-        entry_thresh=0.03, min_entry_tte_seconds=300, max_adverse_move_bps=50.0
+        entry_thresh=0.03, min_entry_tte_seconds=300, min_favorable_move_bps=25.0
     )
+    # YES still rising → NO still bleeding → abstain.
     packet = _packet(
         ask_no=0.02,
         seconds_to_expiry=600,
-        recent_price_change_bps=120.0,  # YES mid +1.2% in 30s — still rallying
+        recent_price_change_bps=120.0,
     )
     result = scorer.score_market(packet)
     assert result.suggested_side == SuggestedSide.ABSTAIN
-    assert any("still collapsing" in r for r in result.reasons_to_abstain)
+    assert any("bounce evidence" in r for r in result.reasons_to_abstain)
 
 
-def test_stabilisation_gate_blocks_yes_entry_when_yes_mid_still_falling() -> None:
-    """Mirror of the NO case: buying YES while YES mid is still dropping
-    means we're mid-crash and will get SL'd.
+def test_reversal_gate_blocks_no_entry_when_only_paused() -> None:
+    """A mere pause (YES mid change near 0) is NOT sufficient — the gate
+    requires actual reversal. This is the upgrade from the prior
+    'stabilisation' gate, which admitted pauses.
     """
-    scorer = PennyScorer(max_adverse_move_bps=50.0)
-    packet = _packet(
-        ask_yes=0.02,
-        ask_no=0.98,
-        seconds_to_expiry=600,
-        recent_price_change_bps=-120.0,  # YES mid −1.2% in 30s
-    )
-    result = scorer.score_market(packet)
-    assert result.suggested_side == SuggestedSide.ABSTAIN
-    assert any("still collapsing" in r for r in result.reasons_to_abstain)
-
-
-def test_stabilisation_gate_allows_entry_when_move_paused() -> None:
-    """Positive case: ask ≤ threshold, TTE OK, AND YES mid has stabilised
-    (30s change within the band). This is the setup the gate is supposed
-    to preserve — the bounce is plausible when the trend has paused.
-    """
-    scorer = PennyScorer(max_adverse_move_bps=50.0)
+    scorer = PennyScorer(min_favorable_move_bps=25.0)
     packet = _packet(
         ask_no=0.02,
         seconds_to_expiry=600,
-        recent_price_change_bps=20.0,  # +0.2% in 30s — well under 50bps
+        recent_price_change_bps=0.0,  # paused, not reversed
+    )
+    result = scorer.score_market(packet)
+    assert result.suggested_side == SuggestedSide.ABSTAIN
+    assert any("bounce evidence" in r for r in result.reasons_to_abstain)
+
+
+def test_reversal_gate_admits_no_entry_on_yes_mid_reversing_down() -> None:
+    """YES mid fell ≥ 25 bps over 30s → NO has bounced → enter NO. This
+    is the positive case the gate is designed to preserve.
+    """
+    scorer = PennyScorer(min_favorable_move_bps=25.0)
+    packet = _packet(
+        ask_no=0.02,
+        seconds_to_expiry=600,
+        recent_price_change_bps=-40.0,  # YES −0.4% → NO +0.4%-ish
     )
     result = scorer.score_market(packet)
     assert result.suggested_side == SuggestedSide.NO
 
 
-def test_stabilisation_gate_disabled_when_zero() -> None:
-    """max_adverse_move_bps=0 opts out of the gate. Legacy behaviour —
-    preserved so operators can A/B the gate by flipping one setting.
-    """
-    scorer = PennyScorer(max_adverse_move_bps=0.0)
-    packet = _packet(
-        ask_no=0.02,
-        seconds_to_expiry=600,
-        recent_price_change_bps=500.0,  # violent YES rally
-    )
-    result = scorer.score_market(packet)
-    # With gate off, the knife gets caught — scorer does not abstain.
-    assert result.suggested_side == SuggestedSide.NO
-
-
-def test_stabilisation_gate_allows_adverse_move_on_opposite_side() -> None:
-    """A YES mid RISE favours buying YES (we'd want continuation), so
-    the gate must NOT fire on positive moves when the intended side is
-    YES. The check is direction-aware.
-    """
-    scorer = PennyScorer(max_adverse_move_bps=50.0)
+def test_reversal_gate_admits_yes_entry_on_yes_mid_bouncing_up() -> None:
+    """Mirror: YES side cheap, YES mid has risen ≥ 25 bps → enter YES."""
+    scorer = PennyScorer(min_favorable_move_bps=25.0)
     packet = _packet(
         ask_yes=0.02,
         ask_no=0.98,
         seconds_to_expiry=600,
-        recent_price_change_bps=200.0,  # YES rising — favourable for YES buy
+        recent_price_change_bps=40.0,
     )
     result = scorer.score_market(packet)
-    # NOTE: the stabilisation gate is a "don't catch falling knife"
-    # filter. It's not "confirm trend" — so we don't actively require
-    # favourable movement, just absence of strong adverse movement.
-    # This tick should pass the gate and open YES.
     assert result.suggested_side == SuggestedSide.YES
+
+
+def test_reversal_gate_disabled_when_zero() -> None:
+    """min_favorable_move_bps=0 opts out so operators can A/B the gate
+    without a code change. With gate off, any penny setup fires.
+    """
+    scorer = PennyScorer(min_favorable_move_bps=0.0)
+    packet = _packet(
+        ask_no=0.02,
+        seconds_to_expiry=600,
+        recent_price_change_bps=500.0,  # YES still rallying hard
+    )
+    result = scorer.score_market(packet)
+    # Gate off — scorer still fires even though the knife is falling.
+    assert result.suggested_side == SuggestedSide.NO

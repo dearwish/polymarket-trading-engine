@@ -1216,6 +1216,10 @@ def test_daemon_multi_strategy_opens_per_strategy_positions(tmp_path: Path) -> N
         "quant_min_entry_price": 0.0,
         "min_candle_elapsed_seconds": 0,
         "paper_entry_cooldown_seconds": 0,
+        # Explicit opt-in: adaptive defaults to off post-2026-04-24 (it was a
+        # pure fade clone). This test asserts its delegation behaviour still
+        # works, so it has to re-enable the registration.
+        "adaptive_enabled": True,
     })
     service = AgentService(settings)
     candidate = _candidate("m-multi", "yes-tok", "no-tok")
@@ -1319,6 +1323,8 @@ def test_daemon_multi_strategy_adaptive_delegates_in_trend(tmp_path: Path) -> No
         "quant_min_entry_price": 0.0,
         "min_candle_elapsed_seconds": 0,
         "paper_entry_cooldown_seconds": 0,
+        # See note on the other multi-strategy test — adaptive defaults off.
+        "adaptive_enabled": True,
     })
     service = AgentService(settings)
     candidate = _candidate("m-trend", "yes-tok", "no-tok")
@@ -2065,6 +2071,12 @@ def _penny_context(runner, candidate, state, ask_yes: float, ask_no: float, seco
     # an end_date N seconds from now to match the intended TTE.
     end_at = datetime.now(timezone.utc) + timedelta(seconds=seconds_to_expiry)
     candidate = _replace(candidate, end_date_iso=end_at.isoformat())
+    # Reversal gate: direction-aware favorable move based on which side
+    # is cheap. NO cheap (default runner config) → want YES mid falling.
+    # YES cheap → want YES mid rising. Default +40 bps in either sign so
+    # the gate always passes in these integration tests; tests explicitly
+    # exercising the gate flip the setting instead.
+    favorable_move = -40.0 if ask_no <= 0.03 else 40.0
     packet = EvidencePacket(
         market_id=candidate.market_id,
         question=candidate.question,
@@ -2075,7 +2087,7 @@ def _penny_context(runner, candidate, state, ask_yes: float, ask_no: float, seco
         depth_usd=500.0,
         seconds_to_expiry=seconds_to_expiry,
         external_price=70000.0,
-        recent_price_change_bps=0.0,
+        recent_price_change_bps=favorable_move,
         recent_trade_count=0,
         reasons_context=[],
         citations=[],
@@ -2249,13 +2261,14 @@ def test_penny_force_exit_triggers_when_tte_expires(tmp_path: Path) -> None:
 
 def test_penny_is_registered_when_enabled(tmp_path: Path) -> None:
     """Startup wiring: penny_enabled=True must place a 'penny' strategy
-    in the daemon's strategy list alongside fade + adaptive.
+    in the daemon's strategy list. Fade is always registered; adaptive
+    defaults off post-2026-04-24 and is not asserted here.
     """
     runner, *_ = _penny_runner(tmp_path)
     strategy_ids = [s.strategy_id for s in runner._strategies]
     assert "penny" in strategy_ids
     assert "fade" in strategy_ids
-    assert "adaptive" in strategy_ids
+    assert "adaptive" not in strategy_ids
 
 
 def test_penny_not_registered_when_disabled(tmp_path: Path) -> None:

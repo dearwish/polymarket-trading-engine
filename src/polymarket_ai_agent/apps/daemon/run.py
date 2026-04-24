@@ -238,7 +238,7 @@ class DaemonRunner:
         self.penny = PennyScorer(
             entry_thresh=float(settings.penny_entry_thresh),
             min_entry_tte_seconds=int(settings.penny_min_entry_tte_seconds),
-            max_adverse_move_bps=float(settings.penny_max_adverse_move_bps),
+            min_favorable_move_bps=float(settings.penny_min_favorable_move_bps),
         )
         self.adaptive_v2 = OverreactionScorer(
             overreaction_threshold=float(settings.adaptive_v2_overreaction_threshold),
@@ -248,8 +248,9 @@ class DaemonRunner:
         )
         self._strategies: list[StrategyConfig] = [
             StrategyConfig(strategy_id=_DEFAULT_STRATEGY_ID, scorer=self.quant),
-            StrategyConfig(strategy_id="adaptive", scorer=self.adaptive),
         ]
+        if settings.adaptive_enabled:
+            self._strategies.append(StrategyConfig(strategy_id="adaptive", scorer=self.adaptive))
         if settings.penny_enabled:
             self._strategies.append(StrategyConfig(strategy_id="penny", scorer=self.penny))
         if settings.adaptive_v2_enabled:
@@ -1780,12 +1781,12 @@ class DaemonRunner:
         except Exception as exc:  # noqa: BLE001
             logger.warning("execution.refresh failed: %s", exc)
         # Rebuild the penny scorer so parameter changes (entry_thresh,
-        # min_entry_tte_seconds, stabilisation gate) take effect without
-        # a restart.
+        # min_entry_tte_seconds, reversal-confirmation gate) take effect
+        # without a restart.
         self.penny = PennyScorer(
             entry_thresh=float(new_settings.penny_entry_thresh),
             min_entry_tte_seconds=int(new_settings.penny_min_entry_tte_seconds),
-            max_adverse_move_bps=float(new_settings.penny_max_adverse_move_bps),
+            min_favorable_move_bps=float(new_settings.penny_min_favorable_move_bps),
         )
         # Same pattern for adaptive_v2 (overreaction-fade).
         self.adaptive_v2 = OverreactionScorer(
@@ -1794,12 +1795,14 @@ class DaemonRunner:
             cost_floor=float(new_settings.adaptive_v2_cost_floor),
             min_seconds_to_expiry=int(new_settings.adaptive_v2_min_seconds_to_expiry),
         )
-        # Toggle penny + adaptive_v2 in/out of the strategy list in place —
-        # preserves fade + adaptive at indexes 0/1 so nothing else reshuffles.
+        # Toggle optional strategies in/out of the list in place, preserving
+        # fade at index 0 so the order stays stable.
         self._strategies = [
             s for s in self._strategies
-            if s.strategy_id not in ("penny", "adaptive_v2")
+            if s.strategy_id not in ("adaptive", "penny", "adaptive_v2")
         ]
+        if new_settings.adaptive_enabled:
+            self._strategies.append(StrategyConfig(strategy_id="adaptive", scorer=self.adaptive))
         if new_settings.penny_enabled:
             self._strategies.append(StrategyConfig(strategy_id="penny", scorer=self.penny))
         if new_settings.adaptive_v2_enabled:

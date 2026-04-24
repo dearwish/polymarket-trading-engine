@@ -69,6 +69,10 @@ INITIAL_SETTINGS_BASELINE: dict[str, Any] = {
     # Penny-buy strategy defaults (from 8h backtest sweep, 2026-04-23):
     # entry_thresh=0.03 + TTE≥300s + TP=2x produced 63.6% hit, +46% ROI
     # on n=11 trades. Paper mode, parallel to fade + adaptive.
+    # Adaptive V1 is a fade-clone since 2026-04-23 (trending branch retired
+    # after empirical failure). Off by default — toggle via dashboard only
+    # to seed a new adaptive variant experiment.
+    "adaptive_enabled": False,
     "penny_enabled": True,
     "penny_entry_thresh": 0.03,
     "penny_min_entry_tte_seconds": 300,
@@ -78,9 +82,13 @@ INITIAL_SETTINGS_BASELINE: dict[str, Any] = {
     # Stop-loss as a fraction of entry. 0.5 caps each loser at −50%
     # instead of the TTE-floor of roughly −67% (observed live 2026-04-24).
     "penny_stop_loss_multiple": 0.5,
-    # Reject entries when YES mid moved > 50 bps against us in the last
-    # 30s — observed failure mode from the 2026-04-24 live soak.
-    "penny_max_adverse_move_bps": 50.0,
+    # Require YES mid to have moved in our favour by ≥ 25 bps in the
+    # last 30s — stricter than the earlier "no adverse move" gate,
+    # which permitted pauses that then resumed downward. 2026-04-24
+    # live data: all post-gate ticks abstained on violent adverse
+    # moves (5000+ bps); this reversal-confirmation gate is the next
+    # refinement to filter the slow-bleed cases too.
+    "penny_min_favorable_move_bps": 25.0,
     # Adaptive V2 — overreaction-fade. Default threshold 2% (mid moved
     # 2%+ faster than BTC justifies); sensitivity 10 = a 1% BTC move is
     # "expected" to move mid 10 percentage points, calibrated roughly
