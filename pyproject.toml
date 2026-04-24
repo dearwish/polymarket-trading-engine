@@ -24,6 +24,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest>=8.2.0",
+  # Used by uvicorn --reload for fsevents-based file watching. Without
+  # it uvicorn silently falls back to StatReload polling which misses
+  # edits to modules that weren't imported at startup.
+  "watchfiles>=0.24.0",
 ]
 
 [project.scripts]
