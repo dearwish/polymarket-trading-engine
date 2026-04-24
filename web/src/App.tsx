@@ -245,6 +245,7 @@ type DaemonHeartbeatPayload = {
 
 type DaemonTickPayload = {
   market_id: string;
+  strategy_id?: string;
   question: string;
   slug?: string;
   end_date_iso?: string;
@@ -1309,6 +1310,10 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
   // always reflect the freshest daemon_tick. With a handful of markets the
   // cost is negligible and avoids any reference-stability bail in useMemo.
   const marketLookup = buildMarketLookup(daemonTicks);
+  // Multi-strategy lookup for the Last Signal panel, which renders one
+  // row per (market, strategy) so fade / adaptive / penny are all
+  // visible instead of whichever scorer happened to fire last.
+  const marketStrategyLookup = buildMarketStrategyLookup(daemonTicks);
   // Daemon-provided trail state (peak_price, etc.) + the trail settings so we
   // can compute each open position's live trailing-stop level.
   const hb = heartbeat?.heartbeat ?? null;
@@ -1395,18 +1400,45 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
 
       {(() => {
         const activeIds: string[] = hb?.active_market_ids ?? [];
-        const activeTicks = activeIds.map((id) => marketLookup[id]).filter((t): t is DaemonTickPayload => Boolean(t));
-        if (!activeTicks.length) return null;
+        // Render one row per (market, strategy) so fade / adaptive / penny
+        // each get their own "last signal" instead of whichever scorer
+        // happened to fire last collapsing them all into one row.
+        type Row = { marketId: string; strategyId: string; tick: DaemonTickPayload };
+        const rows: Row[] = [];
+        // Stable strategy order so the visual grouping matches the rest
+        // of the dashboard (fade column first, penny last).
+        const STRATEGY_ORDER = ["fade", "adaptive", "penny"];
+        for (const marketId of activeIds) {
+          const perStrategy = marketStrategyLookup[marketId];
+          if (!perStrategy) continue;
+          const strategyIds = Object.keys(perStrategy).sort((a, b) => {
+            const ia = STRATEGY_ORDER.indexOf(a);
+            const ib = STRATEGY_ORDER.indexOf(b);
+            return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+          });
+          for (const strategyId of strategyIds) {
+            const tick = perStrategy[strategyId];
+            // Drop pre-market rows outright — they were rendered as a
+            // greyed "pre-market" label, but with three strategies per
+            // market the clutter outweighs the information. Show only
+            // live-candle signals.
+            if (tick.seconds_to_expiry > 900) continue;
+            rows.push({ marketId, strategyId, tick });
+          }
+        }
+        if (!rows.length) return null;
+        const distinctMarkets = new Set(rows.map((r) => r.marketId)).size;
         return (
           <article className="panel full-span">
             <div className="panel-header">
               <h2>Last Signal</h2>
-              <span>{activeTicks.length} active markets</span>
+              <span>{distinctMarkets} active market{distinctMarkets === 1 ? "" : "s"} × {STRATEGY_ORDER.filter((s) => rows.some((r) => r.strategyId === s)).length} strategies</span>
             </div>
             <div className="table-wrap">
               <table>
                 <thead>
                   <tr>
+                    <th>Strategy</th>
                     <th>Market</th>
                     <th>Decision</th>
                     <th>Edge</th>
@@ -1416,41 +1448,33 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
                   </tr>
                 </thead>
                 <tbody>
-                  {activeTicks.map((tick) => {
+                  {rows.map(({ marketId, strategyId, tick }) => {
                     const side = tick.suggested_side;
                     const sideClass = side === "YES" ? "side-yes" : side === "NO" ? "side-no" : "side-abstain";
                     const icon = side === "YES" ? "▲" : side === "NO" ? "▼" : "—";
                     const edge = side === "YES" ? tick.edge_yes : side === "NO" ? tick.edge_no : null;
                     const reason = deriveDecisionReason(tick, settings?.values, { openMarketIds });
-                    const question = tick.question ?? tick.market_id;
+                    const question = tick.question ?? marketId;
                     const label = question.length > 36 ? `${question.slice(0, 36)}…` : question;
-                    // BTC 15m candle window = 900s. If TTE > 900 the candle
-                    // hasn't opened yet — suppress the signal entirely.
-                    const preMarket = tick.seconds_to_expiry > 900;
                     return (
-                      <tr key={tick.market_id}>
+                      <tr key={`${marketId}-${strategyId}`}>
+                        <td><span className={`strategy-badge strategy-${strategyId}`}>{strategyId}</span></td>
                         <td title={question} style={{ fontSize: "12px" }}>{label}</td>
                         <td>
-                          {preMarket ? (
-                            <span className="side-abstain" style={{ fontStyle: "italic", opacity: 0.6 }}>pre-market</span>
-                          ) : (
-                            <span
-                              className={sideClass}
-                              style={{ fontWeight: 600, letterSpacing: "0.02em" }}
-                              data-tooltip={reason}
-                            >
-                              {icon} {side}
-                            </span>
-                          )}
+                          <span
+                            className={sideClass}
+                            style={{ fontWeight: 600, letterSpacing: "0.02em" }}
+                            data-tooltip={reason}
+                          >
+                            {icon} {side}
+                          </span>
                         </td>
-                        <td className={!preMarket && edge != null && edge > 0 ? "positive" : !preMarket && edge != null ? "negative" : ""}>
-                          {!preMarket && edge != null ? `${edge >= 0 ? "+" : ""}${(edge * 100).toFixed(1)}%` : "—"}
+                        <td className={edge != null && edge > 0 ? "positive" : edge != null ? "negative" : ""}>
+                          {edge != null ? `${edge >= 0 ? "+" : ""}${(edge * 100).toFixed(1)}%` : "—"}
                         </td>
-                        <td>{!preMarket && tick.confidence > 0 ? `${(tick.confidence * 100).toFixed(0)}%` : "—"}</td>
+                        <td>{tick.confidence > 0 ? `${(tick.confidence * 100).toFixed(0)}%` : "—"}</td>
                         <td style={{ whiteSpace: "nowrap" }}>{formatDuration(tick.seconds_to_expiry)}</td>
-                        <td style={{ fontSize: "12px", color: "var(--muted)" }}>
-                          {preMarket ? `Opens in ${formatDuration(tick.seconds_to_expiry - 900)}` : reason}
-                        </td>
+                        <td style={{ fontSize: "12px", color: "var(--muted)" }}>{reason}</td>
                       </tr>
                     );
                   })}
@@ -1951,6 +1975,29 @@ function buildMarketLookup(ticks: DaemonTickPayload[]): MarketLookup {
     lookup[tick.market_id] = tick;
   }
   return lookup;
+}
+
+type MarketStrategyLookup = Record<string, Record<string, DaemonTickPayload>>;
+
+/** Multi-strategy lookup keyed by market_id → strategy_id → latest tick.
+ *  The daemon emits one daemon_tick per scorer per decision, and the
+ *  global "last" tick (used by buildMarketLookup) collapses all three
+ *  scorers into whichever fired last. The Last Signal panel needs the
+ *  per-strategy breakdown so fade / adaptive / penny each get a row.
+ *
+ *  Ticks are processed in arrival order, so later ticks overwrite earlier
+ *  ones for the same (market, strategy) pair. Missing strategy_id falls
+ *  back to "fade" to match the daemon's default value on older rows.
+ */
+function buildMarketStrategyLookup(ticks: DaemonTickPayload[]): MarketStrategyLookup {
+  const out: MarketStrategyLookup = {};
+  for (const tick of ticks) {
+    if (!tick.market_id) continue;
+    const strategy = tick.strategy_id || "fade";
+    if (!out[tick.market_id]) out[tick.market_id] = {};
+    out[tick.market_id][strategy] = tick;
+  }
+  return out;
 }
 
 /** Realisable mark price in the position's own frame — the bid we could
