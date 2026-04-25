@@ -2333,7 +2333,12 @@ export default function App() {
     const connect = () => {
       if (disposed) return;
       setStreamStatus((current) => (current === "connected" ? current : "connecting"));
-      source = new EventSource("/api/dashboard/stream?interval_seconds=5");
+      // 1 s cycle (was 5 s). Server-side dedupe by section JSON equality
+      // means React only re-renders sections that actually changed, so
+      // dropping the cadence costs ~5× DB reads but no extra render work.
+      // WAL-mode SQLite handles this comfortably; bump back up if /api/dashboard
+      // p99 drifts above ~200 ms on prod (see polymarket_agent_db_size_bytes).
+      source = new EventSource("/api/dashboard/stream?interval_seconds=1");
       source.onopen = () => {
         setStreamStatus("connected");
         setError("");
