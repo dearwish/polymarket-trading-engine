@@ -51,6 +51,7 @@ class TickRecord:
     btc_session: str = "off"
     btc_log_return_1h: float = 0.0
     strategy_id: str = "fade"
+    trigger_reason: str = "unknown"
     # Live shadow fields (present only when QUANT_SHADOW_VARIANT was set during soak)
     shadow_fair_probability: float | None = None
     shadow_suggested_side: str | None = None
@@ -200,6 +201,7 @@ def load_ticks(
                 btc_session=str(p.get("btc_session") or "off"),
                 btc_log_return_1h=float(p.get("btc_log_return_1h") or 0.0),
                 strategy_id=tick_strategy,
+                trigger_reason=str(p.get("trigger_reason") or "unknown"),
                 shadow_fair_probability=float(p["shadow_fair_probability"]) if p.get("shadow_fair_probability") is not None else None,
                 shadow_suggested_side=str(shadow_side_raw) if shadow_side_raw is not None else None,
                 shadow_edge_yes=float(p["shadow_edge_yes"]) if p.get("shadow_edge_yes") is not None else None,
@@ -335,6 +337,55 @@ def _print_scorer_stats(
         print(f"    Session {sess:6s}    : {h:.1%}  (n={len(data)})")
 
 
+def analyze_by_trigger(resolved: dict[str, MarketSummary]) -> None:
+    """Stratify outcome stats by the daemon_tick `trigger_reason` tag.
+
+    A non-uniform hit-rate / Brier across triggers is the signal we hoped
+    the new tag would surface — e.g. ticks fired on `last_trade_price`
+    (someone just took our level) showing worse hit-rate than ticks fired
+    on `book` (passive snapshot) would be classic adverse selection.
+    """
+    by_trigger_volume: dict[str, int] = defaultdict(int)
+    by_trigger_correct: dict[str, list[bool]] = defaultdict(list)
+    by_trigger_fair: dict[str, list[float]] = defaultdict(list)
+    by_trigger_outcomes: dict[str, list[float]] = defaultdict(list)
+    by_trigger_edges: dict[str, list[float]] = defaultdict(list)
+
+    for ms in resolved.values():
+        for t in ms.ticks:
+            by_trigger_volume[t.trigger_reason] += 1
+        if ms.outcome is None:
+            continue
+        outcome_bool = 1.0 if ms.outcome == "YES" else 0.0
+        for t in ms.ticks:
+            if t.suggested_side == "ABSTAIN":
+                continue
+            by_trigger_correct[t.trigger_reason].append(t.suggested_side == ms.outcome)
+            by_trigger_fair[t.trigger_reason].append(t.fair_probability)
+            by_trigger_outcomes[t.trigger_reason].append(outcome_bool)
+            chosen_edge = t.edge_yes if t.suggested_side == "YES" else t.edge_no
+            by_trigger_edges[t.trigger_reason].append(chosen_edge)
+
+    print("\n=== Per-trigger_reason breakdown ===")
+    if not by_trigger_volume:
+        print("  No ticks loaded.")
+        return
+    print(f"  {'trigger':<20s} {'all_ticks':>10s} {'non_abstain':>12s} {'hit':>7s} {'brier':>7s} {'mean_edge':>10s}")
+    for trig in sorted(by_trigger_volume.keys()):
+        vol = by_trigger_volume[trig]
+        decisions = by_trigger_correct.get(trig, [])
+        if decisions:
+            hit = sum(decisions) / len(decisions)
+            bs = brier_score(by_trigger_fair[trig], by_trigger_outcomes[trig])
+            mean_edge = sum(by_trigger_edges[trig]) / len(by_trigger_edges[trig])
+            print(
+                f"  {trig:<20s} {vol:>10d} {len(decisions):>12d} "
+                f"{hit:>6.1%} {bs:>7.4f} {mean_edge:>+10.4f}"
+            )
+        else:
+            print(f"  {trig:<20s} {vol:>10d} {0:>12d} {'n/a':>7s} {'n/a':>7s} {'n/a':>10s}")
+
+
 def _hold_to_expiry_pnl(pos: ClosedPositionRecord, outcome: str) -> float:
     """P&L had the position been held to resolution instead of stopped out.
 
@@ -451,6 +502,7 @@ def analyze(
     session_bias_us: float = 0.0,
     closed_positions: list[ClosedPositionRecord] | None = None,
     hold_to_expiry: bool = False,
+    by_trigger: bool = False,
 ) -> None:
     client = httpx.Client(timeout=15)
 
@@ -538,6 +590,9 @@ def analyze(
 
     if hold_to_expiry and closed_positions is not None:
         analyze_hold_to_expiry(closed_positions, resolved)
+
+    if by_trigger:
+        analyze_by_trigger(resolved)
 
     if not shadow:
         return
@@ -654,6 +709,11 @@ def main() -> None:
         help="Only include ticks logged at or before this ISO timestamp (e.g. 2026-04-21T09:59Z)",
     )
     parser.add_argument(
+        "--by-trigger",
+        action="store_true",
+        help="Stratify hit-rate / Brier / mean-edge by daemon_tick trigger_reason",
+    )
+    parser.add_argument(
         "--settings-timeline",
         action="store_true",
         help="Print chronological settings_changes from the DB and exit",
@@ -726,6 +786,7 @@ def main() -> None:
         session_bias_us=args.session_bias_us,
         closed_positions=closed_positions,
         hold_to_expiry=args.hold_to_expiry,
+        by_trigger=args.by_trigger,
     )
 
 
