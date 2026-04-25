@@ -183,6 +183,14 @@ class Settings(BaseSettings):
     execution_maker_min_edge: float = 0.04
     execution_maker_min_tte_seconds: int = 120
     execution_price_tick: float = 0.01
+    # Hysteresis on maker cancel/replace: only re-quote when the fresh maker
+    # price has moved by more than ``execution_replace_min_ticks`` × tick OR
+    # when the resting size differs from a target size by more than
+    # ``execution_replace_min_size_pct``. Default of 2 ticks (warproxxx /
+    # gamma-trade-lab pattern) prevents the cancel-thrash that kills queue
+    # position when our scorer re-fires on every WS event with sub-tick noise.
+    execution_replace_min_ticks: float = 2.0
+    execution_replace_min_size_pct: float = 0.10
     execution_exit_buffer_floor_seconds: int = 10
     execution_exit_buffer_pct_of_tte: float = 0.1
     quant_drift_damping: float = 0.5

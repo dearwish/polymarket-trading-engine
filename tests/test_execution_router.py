@@ -104,12 +104,58 @@ def test_router_taker_sell_prices_to_bid(tmp_path: Path) -> None:
     assert routed.limit_price == 0.48  # bid
 
 
-def test_router_should_replace_triggers_when_best_moves_more_than_tick(tmp_path: Path) -> None:
+def test_router_should_replace_triggers_when_best_moves_more_than_threshold(tmp_path: Path) -> None:
+    # Default min_ticks=2.0 → threshold is 2 ticks; sub-2-tick wiggles are
+    # absorbed (no churn) but a real best-level shift triggers the replace.
     router = ExecutionRouter(_settings(tmp_path, execution_price_tick=0.01))
     decision = _approved_decision()
     orderbook = _orderbook(bid=0.50)
     assert router.should_replace(existing_limit_price=0.45, orderbook=orderbook, decision=decision) is True
+    # 1-tick drift is absorbed by the new 2-tick hysteresis floor.
+    assert router.should_replace(existing_limit_price=0.49, orderbook=orderbook, decision=decision) is False
+    # Sub-tick noise is also absorbed.
     assert router.should_replace(existing_limit_price=0.495, orderbook=orderbook, decision=decision) is False
+
+
+def test_router_should_replace_threshold_configurable(tmp_path: Path) -> None:
+    # min_ticks=1.0 reproduces the legacy "strictly more than one tick"
+    # behaviour for any operator who wants a tighter cancel/replace cadence.
+    router = ExecutionRouter(_settings(tmp_path, execution_price_tick=0.01, execution_replace_min_ticks=1.0))
+    decision = _approved_decision()
+    orderbook = _orderbook(bid=0.50)
+    # ~half a tick apart → no replace.
+    assert router.should_replace(existing_limit_price=0.495, orderbook=orderbook, decision=decision) is False
+    # ~1.5 ticks apart → fires.
+    assert router.should_replace(existing_limit_price=0.485, orderbook=orderbook, decision=decision) is True
+
+
+def test_router_should_replace_size_drift_triggers_when_above_pct(tmp_path: Path) -> None:
+    # Price within hysteresis but resting size has drifted too far from target.
+    router = ExecutionRouter(_settings(tmp_path, execution_price_tick=0.01, execution_replace_min_size_pct=0.10))
+    decision = _approved_decision()
+    orderbook = _orderbook(bid=0.50)
+    # Price stable (fresh = existing = 0.50). 8% size drift → no replace.
+    assert (
+        router.should_replace(
+            existing_limit_price=0.50,
+            orderbook=orderbook,
+            decision=decision,
+            existing_size=100.0,
+            target_size=108.0,
+        )
+        is False
+    )
+    # 15% drift → replace.
+    assert (
+        router.should_replace(
+            existing_limit_price=0.50,
+            orderbook=orderbook,
+            decision=decision,
+            existing_size=100.0,
+            target_size=85.0,
+        )
+        is True
+    )
 
 
 def test_execution_engine_paper_vwap_walks_ask_levels(tmp_path: Path) -> None:

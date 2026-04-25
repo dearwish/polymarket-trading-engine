@@ -70,18 +70,32 @@ class ExecutionRouter:
         existing_limit_price: float,
         orderbook: OrderBookSnapshot | None,
         decision: TradeDecision,
+        existing_size: float | None = None,
+        target_size: float | None = None,
     ) -> bool:
         """Return True when a resting maker quote should be cancel/replaced.
 
-        Triggers on a best-level shift of more than one tick since the quote
-        was posted; the executor is responsible for computing the fresh price
-        via :py:meth:`route` and re-submitting.
+        Hysteresis-gated to avoid the cancel-thrash pattern (warproxxx /
+        gamma-trade-lab): re-quote only if the fresh maker price has moved by
+        more than ``execution_replace_min_ticks`` × ``execution_price_tick``,
+        or — when both ``existing_size`` and ``target_size`` are supplied —
+        the resting size deviates by more than
+        ``execution_replace_min_size_pct``. The executor is responsible for
+        computing the fresh price via :py:meth:`route` and re-submitting.
         """
         if orderbook is None:
             return False
         fresh_price = self._maker_price(decision, orderbook)
         tick = self.settings.execution_price_tick
-        return abs(fresh_price - existing_limit_price) > tick
+        min_ticks = max(0.0, float(self.settings.execution_replace_min_ticks))
+        price_threshold = tick * min_ticks
+        if abs(fresh_price - existing_limit_price) > price_threshold:
+            return True
+        if existing_size is not None and target_size is not None and existing_size > 0:
+            size_drift = abs(target_size - existing_size) / existing_size
+            if size_drift > float(self.settings.execution_replace_min_size_pct):
+                return True
+        return False
 
     # --- internals -----------------------------------------------------
 

@@ -2286,3 +2286,118 @@ def test_penny_not_registered_when_disabled(tmp_path: Path) -> None:
     )
     strategy_ids = [s.strategy_id for s in runner._strategies]
     assert "penny" not in strategy_ids
+
+
+def test_daemon_tick_records_trigger_reason(tmp_path: Path) -> None:
+    """daemon_tick payloads should be tagged with the WS event type that
+    fired them, and the metrics histogram should track the same reasons.
+    """
+    settings = _settings(tmp_path)
+    candidates = [_candidate("m1", "yes-1", "no-1")]
+    journal = FakeJournal()
+    service = FakeService(candidates, journal)
+    events = [
+        MarketStreamEvent(
+            event_type="book",
+            payload={
+                "asset_id": "yes-1",
+                "bids": [{"price": "0.48", "size": "100"}],
+                "asks": [{"price": "0.52", "size": "100"}],
+            },
+        ),
+        MarketStreamEvent(
+            event_type="price_change",
+            payload={
+                "asset_id": "yes-1",
+                "price_changes": [{"price": "0.49", "size": "50", "side": "BUY"}],
+            },
+        ),
+    ]
+    market_stream = FakeMarketStream(events)
+    btc_feed = FakeBtcFeed([])
+    runner = DaemonRunner(
+        settings=settings,
+        service=service,  # type: ignore[arg-type]
+        config=DaemonConfig(
+            market_family="btc_1h",
+            discovery_interval_seconds=3600.0,
+            decision_min_interval_seconds=0.0,
+        ),
+        market_stream_factory=lambda url: market_stream,  # type: ignore[arg-type]
+        btc_feed_factory=lambda: btc_feed,  # type: ignore[arg-type]
+    )
+    asyncio.run(runner.run_for(0.4))
+
+    tick_payloads = [p for evt, p in journal.events if evt == "daemon_tick"]
+    assert tick_payloads, "expected at least one daemon_tick"
+    reasons = {p["trigger_reason"] for p in tick_payloads}
+    # Both event types should have been observed as triggers given the 0s
+    # decision interval.
+    assert reasons.issubset({"book", "price_change"})
+    assert reasons, "trigger_reason field must be populated"
+    triggers_metric = runner.metrics.decision_triggers
+    assert sum(triggers_metric.values()) == runner.metrics.decision_ticks
+    assert set(triggers_metric.keys()).issubset({"book", "price_change"})
+
+
+def test_daemon_skips_decision_when_prior_tick_still_running(tmp_path: Path) -> None:
+    """Re-entrant guard: a second decision attempt arriving while the first
+    is still awaiting the callback must be dropped (and counted), not queued.
+    """
+    settings = _settings(tmp_path)
+    candidates = [_candidate("m1", "yes-1", "no-1")]
+    journal = FakeJournal()
+    service = FakeService(candidates, journal)
+
+    # Block the callback on a controllable event so the test can interleave a
+    # second decision attempt while the first is still in-flight.
+    release = asyncio.Event()
+    in_flight = asyncio.Event()
+    callback_invocations = 0
+
+    async def slow_callback(context):  # type: ignore[no-untyped-def]
+        nonlocal callback_invocations
+        callback_invocations += 1
+        in_flight.set()
+        await release.wait()
+
+    runner = DaemonRunner(
+        settings=settings,
+        service=service,  # type: ignore[arg-type]
+        config=DaemonConfig(
+            market_family="btc_1h",
+            discovery_interval_seconds=3600.0,
+            decision_min_interval_seconds=0.0,
+        ),
+        market_stream_factory=lambda url: FakeMarketStream([]),  # type: ignore[arg-type]
+        btc_feed_factory=lambda: FakeBtcFeed([]),  # type: ignore[arg-type]
+        decision_callback=slow_callback,
+    )
+
+    # Manually drive _maybe_fire_decision twice — the daemon's normal WS loop
+    # would interleave these via the same event loop tick.
+    from polymarket_ai_agent.engine.market_state import MarketState
+
+    state = MarketState(market_id="m1", yes_token_id="yes-1", no_token_id="no-1")
+    state.apply_book_snapshot({
+        "asset_id": "yes-1",
+        "bids": [{"price": "0.48", "size": "100"}],
+        "asks": [{"price": "0.52", "size": "100"}],
+    })
+    runner._market_states["m1"] = state
+    runner._candidates["m1"] = candidates[0]
+
+    async def driver() -> None:
+        first = asyncio.create_task(runner._maybe_fire_decision(state, trigger_reason="book"))
+        await in_flight.wait()
+        # While the first call is still awaiting `release`, kick off a second.
+        # It must observe the locked decision lock and short-circuit.
+        await runner._maybe_fire_decision(state, trigger_reason="price_change")
+        release.set()
+        await first
+
+    asyncio.run(driver())
+
+    assert callback_invocations == 1, "second tick must not invoke the callback"
+    assert runner.metrics.decision_ticks == 1
+    assert runner.metrics.decision_skips_busy == 1

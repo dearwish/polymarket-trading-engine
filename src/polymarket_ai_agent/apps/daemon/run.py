@@ -88,6 +88,16 @@ class DaemonMetrics:
     btc_ticks: int = 0
     btc_reconnects: int = 0
     decision_ticks: int = 0
+    # Number of would-be decision ticks dropped because the prior tick was
+    # still running (re-entrant guard). A non-zero counter under load is the
+    # signal that ``decision_min_interval_seconds`` is shorter than callback
+    # latency — operators tune from there.
+    decision_skips_busy: int = 0
+    # Trigger-reason histogram for decision ticks that actually fired. Lets
+    # the operator stratify "why did we score then?" — book updates vs. price
+    # changes vs. trade prints — without joining the journal. Keys are the
+    # raw Polymarket WS event types plus "btc_tick" for BTC-driven re-scoring.
+    decision_triggers: dict[str, int] = field(default_factory=dict)
     last_polymarket_event_at: datetime | None = None
     last_btc_tick_at: datetime | None = None
     last_decision_at: datetime | None = None
@@ -143,6 +153,11 @@ class DecisionContext:
     metrics: "DaemonMetrics"
     packet: "EvidencePacket | None" = None
     shadow_assessment: "MarketAssessment | None" = None
+    # Why this decision tick fired — Polymarket WS event types ("book",
+    # "price_change", "last_trade_price") or "btc_tick" / "manual". Surfaced
+    # on the ``daemon_tick`` journal event so post-hoc analysis can stratify
+    # adverse-selection by trigger.
+    trigger_reason: str = "unknown"
 
 
 # Minimal protocol satisfied by both QuantScoringEngine and AdaptiveScorer —
@@ -263,6 +278,15 @@ class DaemonRunner:
         self._market_subscriber_task: asyncio.Task[None] | None = None
         self._stop_event: asyncio.Event | None = None
         self._last_decision_at: datetime | None = None
+        # Re-entrant guard: bursty WS events can fire ``_maybe_fire_decision``
+        # faster than a paper-pipeline tick can complete (multi-strategy +
+        # SQLite writes can exceed ``decision_min_interval_seconds`` under
+        # load). Mirroring the official ``Lifecycle.AsyncCallback.trigger``
+        # pattern, we *skip* — not queue — any tick attempted while the prior
+        # one is still running, and bump ``decision_skips_busy`` so operators
+        # can see the pressure. Lazily allocated on first use to avoid binding
+        # to a loop in ``__init__`` (constructed off-loop in some tests).
+        self._decision_lock: asyncio.Lock | None = None
         # Per-open-position state used by trailing stop / tranche ladder logic.
         # Paper-mode only: lives in memory, reset if the daemon restarts.
         # Per-(strategy_id, market_id) extras. Keyed on a tuple so multiple
@@ -451,7 +475,7 @@ class DaemonRunner:
             state.apply_price_change(payload)
         elif event.event_type in {"last_trade_price", "trade"}:
             state.apply_last_trade(payload)
-        await self._maybe_fire_decision(state)
+        await self._maybe_fire_decision(state, trigger_reason=event.event_type)
 
     # --- BTC WS --------------------------------------------------------
 
@@ -485,7 +509,9 @@ class DaemonRunner:
 
     # --- Decision gating ----------------------------------------------
 
-    async def _maybe_fire_decision(self, state: MarketState) -> None:
+    async def _maybe_fire_decision(
+        self, state: MarketState, trigger_reason: str = "unknown"
+    ) -> None:
         now = _utc_now()
         if self._last_decision_at is not None:
             elapsed = (now - self._last_decision_at).total_seconds()
@@ -500,9 +526,30 @@ class DaemonRunner:
         candidate = self._candidates.get(state.market_id)
         if candidate is None:
             return
+        # Re-entrant guard. If the prior tick is still running, drop this one
+        # rather than queueing — a queued tick would just process against
+        # state that's about to be superseded by the next event anyway.
+        if self._decision_lock is None:
+            self._decision_lock = asyncio.Lock()
+        if self._decision_lock.locked():
+            self.metrics.decision_skips_busy += 1
+            return
+        async with self._decision_lock:
+            await self._run_decision(state, candidate, now, trigger_reason)
+
+    async def _run_decision(
+        self,
+        state: MarketState,
+        candidate: MarketCandidate,
+        now: datetime,
+        trigger_reason: str,
+    ) -> None:
         self._last_decision_at = now
         self.metrics.decision_ticks += 1
         self.metrics.last_decision_at = now
+        self.metrics.decision_triggers[trigger_reason] = (
+            self.metrics.decision_triggers.get(trigger_reason, 0) + 1
+        )
         started = _utc_now()
         features = state.features(now=now)
         btc_snapshot = self.btc_state.snapshot(now=now)
@@ -539,6 +586,7 @@ class DaemonRunner:
             metrics=self.metrics,
             packet=packet,
             shadow_assessment=shadow_assessment,
+            trigger_reason=trigger_reason,
         )
         try:
             await self._decision_callback(context)
@@ -607,6 +655,7 @@ class DaemonRunner:
         )
         payload: dict[str, Any] = {
             "strategy_id": strategy_id,
+            "trigger_reason": context.trigger_reason,
             "market_id": features.market_id,
             "question": context.candidate.question,
             "slug": context.candidate.slug,

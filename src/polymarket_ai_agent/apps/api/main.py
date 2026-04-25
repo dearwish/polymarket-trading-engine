@@ -168,6 +168,7 @@ def create_app(
             "polymarket_events",
             "btc_ticks",
             "decision_ticks",
+            "decision_skips_busy",
             "discovery_cycles",
             "discovery_errors",
             "active_market_count",
@@ -179,6 +180,17 @@ def create_app(
                         f"polymarket_agent_{key}",
                         daemon_metrics[key],
                         help_text=f"Daemon runtime metric: {key} (from heartbeat).",
+                    )
+                )
+        triggers = daemon_metrics.get("decision_triggers") or {}
+        if isinstance(triggers, dict):
+            for trigger, count in triggers.items():
+                lines.extend(
+                    line(
+                        "polymarket_agent_decision_triggers",
+                        count,
+                        labels={"reason": str(trigger)},
+                        help_text="Decision ticks that fired, broken down by trigger reason (Polymarket WS event type).",
                     )
                 )
         safety = metrics.get("safety_stop_reason")
