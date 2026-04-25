@@ -10,6 +10,15 @@ from polymarket_ai_agent.types import EvidencePacket, MarketAssessment, Suggeste
 _SQRT_1800 = math.sqrt(1800.0)
 
 
+# Sentinel on ``MarketAssessment.raw_model_output`` that tells the daemon's
+# strategy-tick router to push this assessment through the paper-maker
+# lifecycle (rest a limit at mid − discount, wait for the book to cross)
+# instead of the immediate taker-fill path. Set when ``fade_post_only`` is
+# on. Distinct from ``ADAPTIVE_FOLLOW_MAKER_TAG`` so each scorer owns its
+# own routing signal; the daemon accepts both.
+FADE_POST_ONLY_TAG = "fade-post-only-maker"
+
+
 def _normal_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
@@ -85,6 +94,12 @@ class QuantScoringEngine:
                 f"Chosen edge {chosen_edge:+.4f} exceeds |edge| ceiling {ceiling:.2f}.",
             )
         expiry_risk = self._expiry_risk(packet)
+        raw_model_output = "quant-scoring"
+        if (
+            bool(self.settings.fade_post_only)
+            and side is not SuggestedSide.ABSTAIN
+        ):
+            raw_model_output = FADE_POST_ONLY_TAG
         return MarketAssessment(
             market_id=packet.market_id,
             fair_probability=round(fair_yes, 6),
@@ -94,7 +109,7 @@ class QuantScoringEngine:
             reasons_for_trade=reasons_for_trade,
             reasons_to_abstain=reasons_to_abstain,
             edge=round(chosen_edge, 6),
-            raw_model_output="quant-scoring",
+            raw_model_output=raw_model_output,
             edge_yes=round(breakdown.edge_yes, 6),
             edge_no=round(breakdown.edge_no, 6),
             fair_probability_no=round(1.0 - fair_yes, 6),

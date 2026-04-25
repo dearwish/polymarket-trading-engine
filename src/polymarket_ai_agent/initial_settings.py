@@ -66,6 +66,10 @@ INITIAL_SETTINGS_BASELINE: dict[str, Any] = {
     "paper_follow_cancel_price_threshold": 0.005,
     "paper_follow_cancel_size_threshold_pct": 10.0,
     "paper_follow_min_level_size_shares": 10.0,
+    # Off by default. Flip true to soak the fade scorer through the
+    # paper-maker lifecycle (resting limit, TTL, hysteresis) — the
+    # paper-mode equivalent of live_post_only=GTC.
+    "fade_post_only": False,
     # Penny-buy strategy defaults (from 8h backtest sweep, 2026-04-23):
     # entry_thresh=0.03 + TTE≥300s + TP=2x produced 63.6% hit, +46% ROI
     # on n=11 trades. Paper mode, parallel to fade + adaptive.

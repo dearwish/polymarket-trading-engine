@@ -33,7 +33,7 @@ from polymarket_ai_agent.engine.maker_rewards import estimate_reward_per_100
 from polymarket_ai_agent.engine.overreaction_scoring import OverreactionScorer
 from polymarket_ai_agent.engine.penny_scoring import PENNY_STRATEGY_TAG, PennyScorer
 from polymarket_ai_agent.engine.market_state import MarketFeatures, MarketState
-from polymarket_ai_agent.engine.quant_scoring import QuantScoringEngine
+from polymarket_ai_agent.engine.quant_scoring import FADE_POST_ONLY_TAG, QuantScoringEngine
 from polymarket_ai_agent.engine.regime import Regime, classify_regime
 from polymarket_ai_agent.engine.research import ResearchEngine
 from polymarket_ai_agent.service import AgentService
@@ -1024,7 +1024,10 @@ class DaemonRunner:
         # via raw_model_output. Route to the paper-maker lifecycle and
         # return — the normal risk → execute → taker path doesn't apply
         # because the follow assessment's ``edge`` is zeroed by design.
-        if assessment.raw_model_output == ADAPTIVE_FOLLOW_MAKER_TAG:
+        if assessment.raw_model_output in (
+            ADAPTIVE_FOLLOW_MAKER_TAG,
+            FADE_POST_ONLY_TAG,
+        ):
             await self._handle_follow_maker(context, strategy_id)
             return
 

@@ -139,6 +139,12 @@ class Settings(BaseSettings):
     # 1-lot levels when computing best-bid/best-ask — prevents the paper
     # maker from posting behind a phantom order. 0.0 disables (raw mid).
     paper_follow_min_level_size_shares: float = 0.0
+    # Route the fade scorer's BUY assessments through the paper-maker
+    # lifecycle (resting limit at mid − ``paper_follow_limit_discount_bps``,
+    # TTL ``paper_follow_maker_ttl_seconds``) instead of the immediate
+    # taker fill. Lets us simulate a post-only-GTC live-trading mode on
+    # paper before flipping the live flag. Off by default; live-reloadable.
+    fade_post_only: bool = False
     # Penny-buy strategy (extreme-tail dip). Runs as a third strategy
     # alongside fade + adaptive. See ``engine/penny_scoring.py`` for the
     # thesis and ``scripts/backtest_penny.py`` for the parameter sweep
@@ -393,6 +399,11 @@ EDITABLE_SETTINGS_METADATA: dict[str, dict[str, Any]] = {
         "min": 0,
         "max": 100000,
         "step": 1,
+        "group": "paper",
+    },
+    "fade_post_only": {
+        "label": "Fade Post-Only (route through paper-maker)",
+        "type": "boolean",
         "group": "paper",
     },
     "adaptive_enabled": {

@@ -4,7 +4,11 @@ import math
 from pathlib import Path
 
 from polymarket_ai_agent.config import Settings
-from polymarket_ai_agent.engine.quant_scoring import QuantScoringEngine, _normal_cdf
+from polymarket_ai_agent.engine.quant_scoring import (
+    FADE_POST_ONLY_TAG,
+    QuantScoringEngine,
+    _normal_cdf,
+)
 from polymarket_ai_agent.engine.research import ResearchEngine
 from polymarket_ai_agent.types import EvidencePacket, SuggestedSide
 
@@ -143,6 +147,46 @@ def test_quant_max_abs_edge_forces_abstain_above_ceiling(tmp_path: Path) -> None
     # A moderate pick inside the ceiling is unaffected.
     moderate = engine.score_market(_packet(ask_yes=0.40, ask_no=0.55))
     assert moderate.suggested_side == SuggestedSide.YES
+
+
+def test_fade_post_only_tags_non_abstain_assessments(tmp_path: Path) -> None:
+    """fade_post_only=True must rewrite raw_model_output to the maker-routing
+    sentinel for any non-ABSTAIN side, while leaving abstains unchanged. The
+    daemon's strategy-tick router uses this string to push the assessment
+    through the paper-maker lifecycle instead of the immediate taker fill.
+    """
+    settings = _settings(
+        tmp_path,
+        quant_slippage_baseline_bps=0.0,
+        quant_slippage_spread_coef=0.0,
+        fee_bps=0.0,
+        fade_post_only=True,
+    )
+    engine = QuantScoringEngine(settings)
+    # ask_yes 0.40 → fair 0.5 → edge_yes +0.10 → side YES, tag must flip.
+    buy = engine.score_market(_packet(ask_yes=0.40, ask_no=0.55))
+    assert buy.suggested_side == SuggestedSide.YES
+    assert buy.raw_model_output == FADE_POST_ONLY_TAG
+    # Symmetric ask=0.51 → no positive edge → ABSTAIN, tag stays default.
+    abstain = engine.score_market(_packet())
+    assert abstain.suggested_side == SuggestedSide.ABSTAIN
+    assert abstain.raw_model_output == "quant-scoring"
+
+
+def test_fade_post_only_off_keeps_default_tag(tmp_path: Path) -> None:
+    """With the flag off the scorer must emit its normal raw_model_output
+    even on a non-abstain side, so taker routing stays the default behaviour.
+    """
+    settings = _settings(
+        tmp_path,
+        quant_slippage_baseline_bps=0.0,
+        quant_slippage_spread_coef=0.0,
+        fee_bps=0.0,
+    )
+    engine = QuantScoringEngine(settings)
+    buy = engine.score_market(_packet(ask_yes=0.40, ask_no=0.55))
+    assert buy.suggested_side == SuggestedSide.YES
+    assert buy.raw_model_output == "quant-scoring"
 
 
 def test_candle_open_log_return_takes_precedence_over_rolling_windows(tmp_path: Path) -> None:
