@@ -102,6 +102,39 @@ type ClosedPositionsPayload = {
   positions: ClosedPosition[];
 };
 
+type TimelineEvent = {
+  event_type: string;
+  logged_at: string;
+  payload: Record<string, unknown>;
+};
+
+type TradeTimelinePayload = {
+  order_id: string;
+  found: boolean;
+  market_id?: string;
+  strategy_id?: string;
+  rows?: Array<{
+    market_id: string;
+    side: string;
+    size_usd: number;
+    entry_price: number;
+    exit_price: number;
+    realized_pnl: number;
+    close_reason: string;
+    opened_at: string;
+    closed_at: string | null;
+    fees_paid?: number;
+  }>;
+  events?: TimelineEvent[];
+  stats?: {
+    total_realized_pnl: number;
+    total_size_usd: number;
+    roi_pct: number;
+    hold_seconds: number;
+    tranches: number;
+  };
+};
+
 type OpenPosition = {
   market_id: string;
   side: string;
@@ -1391,7 +1424,160 @@ function OrdersPage({ liveOrders, liveTrades, liveActivity, paperActivity, tradi
   );
 }
 
+function summarizeTimelineEvent(e: TimelineEvent): { kind: string; summary: string } {
+  const p = (e.payload || {}) as Record<string, unknown>;
+  switch (e.event_type) {
+    case "paper_maker_placed": {
+      const side = String(p.side ?? "?");
+      const limit = typeof p.limit_price === "number" ? p.limit_price.toFixed(4) : "?";
+      const midYes = typeof p.mid_yes === "number" ? p.mid_yes.toFixed(3) : "?";
+      const source = p.source ? ` [${p.source}]` : "";
+      return { kind: "Maker placed", summary: `${side} @ ${limit} (mid_yes=${midYes})${source}` };
+    }
+    case "paper_maker_cancelled": {
+      const side = String(p.side ?? "?");
+      const limit = typeof p.limit_price === "number" ? p.limit_price.toFixed(4) : "?";
+      const reason = String(p.reason ?? "?");
+      const delta = typeof p.price_delta === "number" ? `, drift=${p.price_delta.toFixed(4)}` : "";
+      return { kind: "Maker cancelled", summary: `${side} @ ${limit} — ${reason}${delta}` };
+    }
+    case "execution_result": {
+      const detail = String(p.detail ?? "");
+      const fillPrice = typeof p.fill_price === "number" ? p.fill_price.toFixed(4) : "?";
+      const shares = typeof p.filled_size_shares === "number" ? p.filled_size_shares.toFixed(4) : "?";
+      return { kind: "FILLED", summary: `${shares} shares @ ${fillPrice} — ${detail.slice(0, 80)}` };
+    }
+    case "position_closed": {
+      const reason = String(p.close_reason ?? "?");
+      const exit = typeof p.exit_price === "number" ? p.exit_price.toFixed(4) : "?";
+      const pnl = typeof p.realized_pnl === "number" ? p.realized_pnl.toFixed(4) : "?";
+      const sign = typeof p.realized_pnl === "number" && p.realized_pnl >= 0 ? "+" : "";
+      return { kind: "Position closed", summary: `${reason} @ ${exit}, PnL ${sign}$${pnl}` };
+    }
+    default:
+      return { kind: e.event_type, summary: JSON.stringify(p).slice(0, 80) };
+  }
+}
+
+function TradeTimelineModal({ orderId, onClose }: { orderId: string; onClose: () => void }) {
+  const { timezone, timeFormat } = useDisplayPrefs();
+  const [data, setData] = useState<TradeTimelinePayload | null>(null);
+  const [error, setError] = useState<string>("");
+
+  useEffect(() => {
+    let cancelled = false;
+    setError("");
+    setData(null);
+    fetchJson<TradeTimelinePayload>(`/api/positions/timeline?order_id=${encodeURIComponent(orderId)}`)
+      .then((d) => { if (!cancelled) setData(d); })
+      .catch((e) => { if (!cancelled) setError(String(e)); });
+    return () => { cancelled = true; };
+  }, [orderId]);
+
+  // Close on Escape.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-panel" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-header">
+          <h2>Trade timeline — <code style={{ fontSize: "13px" }}>{orderId}</code></h2>
+          <button className="modal-close" onClick={onClose} aria-label="Close">×</button>
+        </div>
+        <div className="modal-body">
+          {error && <div className="empty-state negative">Failed to load: {error}</div>}
+          {!error && !data && <div className="empty-state">Loading…</div>}
+          {data && !data.found && <div className="empty-state">No trade found for this order_id.</div>}
+          {data && data.found && (
+            <>
+              <div className="modal-stats">
+                <div><dt>Strategy</dt><dd>{data.strategy_id}</dd></div>
+                <div><dt>Market</dt><dd>{data.market_id}</dd></div>
+                <div><dt>Tranches</dt><dd>{data.stats?.tranches}</dd></div>
+                <div><dt>Total notional</dt><dd>{formatMoney(data.stats?.total_size_usd)}</dd></div>
+                <div>
+                  <dt>Realized PnL</dt>
+                  <dd className={(data.stats?.total_realized_pnl ?? 0) >= 0 ? "positive" : "negative"}>
+                    {(data.stats?.total_realized_pnl ?? 0) >= 0 ? "+" : ""}{formatMoney(data.stats?.total_realized_pnl)}
+                    {" "}({((data.stats?.roi_pct ?? 0) * 100).toFixed(1)}%)
+                  </dd>
+                </div>
+                <div><dt>Hold time</dt><dd>{formatDuration(data.stats?.hold_seconds)}</dd></div>
+              </div>
+
+              <h3 style={{ marginTop: 16 }}>Timeline</h3>
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Time (UTC)</th>
+                      <th>Event</th>
+                      <th>Detail</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(data.events ?? []).map((e, idx) => {
+                      const { kind, summary } = summarizeTimelineEvent(e);
+                      const cls = e.event_type === "execution_result" ? "positive"
+                        : e.event_type === "position_closed" ? ((e.payload as Record<string, unknown>).realized_pnl as number ?? 0) >= 0 ? "positive" : "negative"
+                        : "";
+                      return (
+                        <tr key={`${e.logged_at}-${idx}`}>
+                          <td style={{ whiteSpace: "nowrap", fontSize: "12px", color: "var(--muted)" }}>
+                            {formatInstant(e.logged_at, timezone, timeFormat, "datetime")}
+                          </td>
+                          <td className={cls}><strong>{kind}</strong></td>
+                          <td style={{ fontSize: "12px" }}>{summary}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+                {!(data.events ?? []).length && <div className="empty-state">No journal events found in the scan window.</div>}
+              </div>
+
+              {(data.rows?.length ?? 0) > 1 && (
+                <>
+                  <h3 style={{ marginTop: 16 }}>Tranches ({data.rows?.length})</h3>
+                  <div className="table-wrap">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Side</th><th>Size</th><th>Entry</th><th>Exit</th><th>Reason</th><th>PnL</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {(data.rows ?? []).map((r, i) => (
+                          <tr key={i}>
+                            <td>{r.side}</td>
+                            <td>{formatMoney(r.size_usd)}</td>
+                            <td>{r.entry_price.toFixed(4)}</td>
+                            <td>{r.exit_price.toFixed(4)}</td>
+                            <td>{r.close_reason}</td>
+                            <td className={r.realized_pnl >= 0 ? "positive" : "negative"}>
+                              {r.realized_pnl >= 0 ? "+" : ""}{formatMoney(r.realized_pnl)}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonTicks, heartbeat, settings }: { summary: PortfolioSummaryPayload | null; positions: ClosedPosition[]; openPositions: OpenPosition[]; equityCurve: EquityCurvePayload | null; daemonTicks: DaemonTickPayload[]; heartbeat: DaemonHeartbeatPayload | null; settings: SettingsPayload | null }) {
+  const [timelineOrderId, setTimelineOrderId] = useState<string | null>(null);
   const { timezone, timeFormat } = useDisplayPrefs();
   // Rebuild the lookup on every render so the Mark / Unrealized PnL cells
   // always reflect the freshest daemon_tick. With a handful of markets the
@@ -1826,7 +2012,11 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
                   const strategyId = position.strategy_id ?? "fade";
                   return (
                     <tr key={position.order_id || `${position.market_id}-${position.closed_at}`}>
-                      <td style={{ fontSize: "12px", color: "var(--muted)" }} title={position.order_id}>
+                      <td
+                        style={{ fontSize: "12px", color: "var(--accent)", cursor: position.order_id ? "pointer" : "default", textDecoration: position.order_id ? "underline" : "none" }}
+                        title={position.order_id ? `Click to view full timeline\n${position.order_id}` : ""}
+                        onClick={() => { if (position.order_id) setTimelineOrderId(position.order_id); }}
+                      >
                         {compactId}
                       </td>
                       <td><span className={`strategy-badge strategy-${strategyId}`}>{strategyId}</span></td>
@@ -1856,6 +2046,9 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
           {!positions.length && <div className="empty-state">No closed positions yet.</div>}
         </div>
       </article>
+      {timelineOrderId && (
+        <TradeTimelineModal orderId={timelineOrderId} onClose={() => setTimelineOrderId(null)} />
+      )}
     </section>
   );
 }

@@ -1088,3 +1088,98 @@ th {
   z-index: 50;
   pointer-events: none;
 }
+
+/* Trade-timeline modal — opened from the Closed Positions trade-id click. */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.65);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 48px 16px;
+  overflow-y: auto;
+  z-index: 100;
+}
+
+.modal-panel {
+  background: rgba(15, 20, 30, 0.98);
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.12));
+  border-radius: 8px;
+  width: min(960px, 100%);
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.5);
+  display: flex;
+  flex-direction: column;
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border, rgba(255, 255, 255, 0.12));
+  gap: 12px;
+}
+
+.modal-header h2 {
+  margin: 0;
+  font-size: 16px;
+  flex: 1;
+  word-break: break-all;
+}
+
+.modal-close {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.12));
+  border-radius: 4px;
+  width: 32px;
+  height: 32px;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.modal-close:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text, #e6eef7);
+}
+
+.modal-body {
+  padding: 16px 20px 24px;
+  overflow-y: auto;
+  max-height: calc(100vh - 160px);
+}
+
+.modal-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+}
+
+.modal-stats > div {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+  border-radius: 6px;
+  padding: 8px 12px;
+}
+
+.modal-stats dt {
+  font-size: 11px;
+  color: var(--muted);
+  margin: 0 0 4px 0;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.modal-stats dd {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.modal-body h3 {
+  font-size: 14px;
+  margin-bottom: 8px;
+}

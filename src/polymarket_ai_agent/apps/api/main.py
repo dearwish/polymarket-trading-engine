@@ -537,6 +537,136 @@ def create_app(
             "events": events,
         }
 
+    @app.get("/api/positions/timeline")
+    def position_timeline(
+        order_id: str = Query(...),
+        service: AgentService = Depends(service_factory),
+    ) -> dict:
+        """Reconstruct the full lifecycle of a single closed position.
+
+        Returns:
+        - all DB position rows sharing this ``order_id`` (TP-ladder splits
+          produce multiple rows from one fill)
+        - chronologically ordered journal events for the same market in a
+          window from ~5 minutes before the fill to ~1 minute after the
+          last close: maker placements/cancels, the fill itself,
+          position closes
+        - derived stats (total realized PnL, total notional, hold seconds,
+          ROI) so the UI can render them without re-deriving
+
+        The order_id encodes the maker-placement Unix timestamp (format:
+        ``paper-maker-{strategy_id}-{market_id}-{ts}``) — we use that
+        as the lower bound of the event scan window.
+        """
+        from datetime import datetime, timezone, timedelta
+
+        # 1. Resolve the position(s) from the DB.
+        all_closed = service.portfolio.list_closed_positions(limit=2000)
+        rows = [p for p in all_closed if getattr(p, "order_id", "") == order_id]
+        if not rows:
+            return {"order_id": order_id, "found": False, "rows": [], "events": [], "stats": None}
+
+        market_id = rows[0].market_id
+        strategy_id = getattr(rows[0], "strategy_id", "fade") or "fade"
+
+        # 2. Compute the scan window. Try to decode placed_at from the
+        # synthetic order_id; fall back to opened_at - 5min if the format
+        # doesn't match (e.g., a real CLOB order_id).
+        scan_start: datetime | None = None
+        if order_id.startswith("paper-maker-"):
+            tail = order_id.rsplit("-", 1)[-1]
+            try:
+                placed_ts = int(tail)
+                scan_start = datetime.fromtimestamp(placed_ts, tz=timezone.utc) - timedelta(seconds=30)
+            except ValueError:
+                scan_start = None
+        opened_at_dt = datetime.fromisoformat(rows[0].opened_at)
+        if scan_start is None:
+            scan_start = opened_at_dt - timedelta(minutes=5)
+        # Latest close among the rows + 60s buffer.
+        latest_closed_at = max(
+            (datetime.fromisoformat(p.closed_at) for p in rows if p.closed_at),
+            default=opened_at_dt,
+        )
+        scan_end = latest_closed_at + timedelta(seconds=60)
+
+        # 3. Walk events.jsonl. Only filter by market_id + time window —
+        # the UI decides how to render each event_type.
+        events_path = service.settings.events_path
+        timeline_events: list[dict] = []
+        if events_path.exists():
+            with events_path.open() as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        e = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    et = e.get("event_type")
+                    if et not in (
+                        "paper_maker_placed",
+                        "paper_maker_cancelled",
+                        "execution_result",
+                        "position_closed",
+                    ):
+                        continue
+                    p = e.get("payload") or {}
+                    if str(p.get("market_id") or "") != market_id:
+                        continue
+                    ts = e.get("logged_at") or ""
+                    try:
+                        ts_dt = datetime.fromisoformat(ts)
+                    except (ValueError, TypeError):
+                        continue
+                    if ts_dt < scan_start or ts_dt > scan_end:
+                        continue
+                    # For execution_result, only include the one matching
+                    # this order_id (others would be unrelated trades on
+                    # the same market). Other event types don't carry the
+                    # synthetic order_id so we keep them all.
+                    if et == "execution_result" and str(p.get("order_id") or "") != order_id:
+                        continue
+                    timeline_events.append(e)
+        timeline_events.sort(key=lambda x: x.get("logged_at") or "")
+
+        # 4. Stats.
+        total_realized = sum(float(p.realized_pnl) for p in rows)
+        total_size = sum(float(p.size_usd) for p in rows)
+        roi_pct = (total_realized / total_size) if total_size > 0 else 0.0
+        hold_seconds = (latest_closed_at - opened_at_dt).total_seconds()
+
+        return {
+            "order_id": order_id,
+            "found": True,
+            "market_id": market_id,
+            "strategy_id": strategy_id,
+            "rows": [
+                {
+                    "market_id": p.market_id,
+                    "side": p.side,
+                    "size_usd": p.size_usd,
+                    "entry_price": p.entry_price,
+                    "exit_price": p.exit_price,
+                    "realized_pnl": p.realized_pnl,
+                    "close_reason": p.close_reason,
+                    "opened_at": p.opened_at,
+                    "closed_at": p.closed_at,
+                    "fees_paid": getattr(p, "fees_paid", 0.0),
+                }
+                for p in rows
+            ],
+            "events": timeline_events,
+            "stats": {
+                "total_realized_pnl": round(total_realized, 4),
+                "total_size_usd": round(total_size, 4),
+                "roi_pct": round(roi_pct, 4),
+                "hold_seconds": round(hold_seconds, 1),
+                "tranches": len(rows),
+            },
+        }
+
     @app.get("/api/events/stream")
     async def stream_events(
         limit: int = Query(12, ge=1, le=100),
