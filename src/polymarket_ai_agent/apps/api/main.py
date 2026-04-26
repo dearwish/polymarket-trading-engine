@@ -560,6 +560,18 @@ def create_app(
         """
         from datetime import datetime, timezone, timedelta
 
+        def _to_dt(v) -> datetime | None:
+            if v is None:
+                return None
+            if isinstance(v, datetime):
+                return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
+            if isinstance(v, str):
+                try:
+                    return datetime.fromisoformat(v)
+                except ValueError:
+                    return None
+            return None
+
         # 1. Resolve the position(s) from the DB.
         all_closed = service.portfolio.list_closed_positions(limit=2000)
         rows = [p for p in all_closed if getattr(p, "order_id", "") == order_id]
@@ -580,14 +592,13 @@ def create_app(
                 scan_start = datetime.fromtimestamp(placed_ts, tz=timezone.utc) - timedelta(seconds=30)
             except ValueError:
                 scan_start = None
-        opened_at_dt = datetime.fromisoformat(rows[0].opened_at)
+        opened_at_dt = _to_dt(rows[0].opened_at) or datetime.now(timezone.utc)
         if scan_start is None:
             scan_start = opened_at_dt - timedelta(minutes=5)
         # Latest close among the rows + 60s buffer.
-        latest_closed_at = max(
-            (datetime.fromisoformat(p.closed_at) for p in rows if p.closed_at),
-            default=opened_at_dt,
-        )
+        closed_dts = [_to_dt(p.closed_at) for p in rows]
+        closed_dts = [d for d in closed_dts if d is not None]
+        latest_closed_at = max(closed_dts) if closed_dts else opened_at_dt
         scan_end = latest_closed_at + timedelta(seconds=60)
 
         # 3. Walk events.jsonl. Only filter by market_id + time window —
@@ -651,8 +662,8 @@ def create_app(
                     "exit_price": p.exit_price,
                     "realized_pnl": p.realized_pnl,
                     "close_reason": p.close_reason,
-                    "opened_at": p.opened_at,
-                    "closed_at": p.closed_at,
+                    "opened_at": (_to_dt(p.opened_at) or datetime.now(timezone.utc)).isoformat(),
+                    "closed_at": _to_dt(p.closed_at).isoformat() if _to_dt(p.closed_at) else None,
                     "fees_paid": getattr(p, "fees_paid", 0.0),
                 }
                 for p in rows
