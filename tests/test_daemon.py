@@ -1756,6 +1756,93 @@ def test_follow_maker_zero_threshold_preserves_legacy_wait_behavior(tmp_path: Pa
     assert kept.limit_price == first_order.limit_price
 
 
+def test_freshness_loop_requotes_when_drift_exceeds_threshold(tmp_path: Path) -> None:
+    """The periodic freshness sweep must re-quote a resting maker whose
+    desired limit has drifted past ``paper_follow_cancel_price_threshold``,
+    independent of any WS-driven daemon_tick. This is the bug fix for
+    quiet-window stalling: the event-driven path may not fire for
+    minutes if the market is quiet, during which the ask can drift down
+    onto our stale limit and lock in a bad-price fill.
+    """
+    runner, service, candidate, state = _follow_runner_and_state(tmp_path)
+    runner.settings = runner.settings.model_copy(update={
+        "paper_follow_cancel_price_threshold": 0.005,
+    })
+
+    _apply_book(state, bid_yes=0.66, ask_yes=0.68)
+    ctx1 = _context_for_follow(state, candidate, _follow_packet(candidate.market_id))
+    asyncio.run(runner._paper_execute_for_strategy(ctx1, "adaptive"))
+    key = ("adaptive", candidate.market_id)
+    first_order = runner._pending_makers.get(key)
+    assert first_order is not None
+
+    # Simulate a quiet window: the book moves on the WS feed but no
+    # daemon_tick fires (because the WS event didn't cross a trigger
+    # threshold). Mid drifts from 0.67 to 0.70 — would trigger a
+    # re-quote on the event path; the freshness loop must do the same.
+    _apply_book(state, bid_yes=0.69, ask_yes=0.71)
+    asyncio.run(runner._refresh_pending_makers())
+
+    fresh = runner._pending_makers.get(key)
+    assert fresh is not None
+    assert fresh.limit_price != first_order.limit_price, "freshness sweep must re-quote on drift"
+    # Same logic as event-path: 100bp discount × new mid 0.70 = 0.693.
+    assert abs(fresh.limit_price - 0.693) < 1e-3
+    assert fresh.placed_at >= first_order.placed_at, "new placement timestamp"
+
+
+def test_freshness_loop_no_op_when_drift_below_threshold(tmp_path: Path) -> None:
+    """Sub-threshold drift must NOT re-quote — same hysteresis the
+    event path enforces. Otherwise the loop becomes a thrash engine.
+    """
+    runner, service, candidate, state = _follow_runner_and_state(tmp_path)
+    runner.settings = runner.settings.model_copy(update={
+        "paper_follow_cancel_price_threshold": 0.02,  # 2¢ threshold
+    })
+
+    _apply_book(state, bid_yes=0.66, ask_yes=0.68)
+    ctx1 = _context_for_follow(state, candidate, _follow_packet(candidate.market_id))
+    asyncio.run(runner._paper_execute_for_strategy(ctx1, "adaptive"))
+    key = ("adaptive", candidate.market_id)
+    first_order = runner._pending_makers.get(key)
+    assert first_order is not None
+    original_limit = first_order.limit_price
+    original_placed_at = first_order.placed_at
+
+    # 1¢ mid drift — under the 2¢ threshold.
+    _apply_book(state, bid_yes=0.67, ask_yes=0.69)
+    asyncio.run(runner._refresh_pending_makers())
+
+    kept = runner._pending_makers.get(key)
+    assert kept is not None
+    assert kept.limit_price == original_limit, "below-threshold drift must not re-quote"
+    assert kept.placed_at == original_placed_at, "original placement preserved"
+
+
+def test_freshness_loop_disabled_when_threshold_zero(tmp_path: Path) -> None:
+    """With both axes at 0 the sweep is a pure no-op — preserves the
+    legacy "rest and wait for TTL" behaviour for soaks that haven't
+    opted into price tracking.
+    """
+    runner, service, candidate, state = _follow_runner_and_state(tmp_path)
+    # Defaults are 0 / 0 per initial_settings.
+
+    _apply_book(state, bid_yes=0.66, ask_yes=0.68)
+    ctx1 = _context_for_follow(state, candidate, _follow_packet(candidate.market_id))
+    asyncio.run(runner._paper_execute_for_strategy(ctx1, "adaptive"))
+    key = ("adaptive", candidate.market_id)
+    first_order = runner._pending_makers.get(key)
+    assert first_order is not None
+
+    # Drastic mid move — sweep must still leave the rest alone.
+    _apply_book(state, bid_yes=0.80, ask_yes=0.82)
+    asyncio.run(runner._refresh_pending_makers())
+
+    kept = runner._pending_makers.get(key)
+    assert kept is not None
+    assert kept.limit_price == first_order.limit_price
+
+
 def test_follow_maker_depth_filter_ignores_ghost_top_of_book(tmp_path: Path) -> None:
     """Tier 2b: with min_level_size_shares set, the paper maker anchors
     its mid on the first level with real size, not a 1-lot ghost at the

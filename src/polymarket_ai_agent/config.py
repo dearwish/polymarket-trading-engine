@@ -279,6 +279,11 @@ class Settings(BaseSettings):
     events_jsonl_keep_tail_bytes: int = 50_000_000
     daemon_maintenance_interval_seconds: int = 3600
     daemon_heartbeat_interval_seconds: float = 5.0
+    # How often the daemon sweeps resting paper-maker orders to re-quote
+    # any whose desired price has drifted past the cancel threshold,
+    # independent of WS event triggers. Closes the quiet-window gap
+    # where a rest sits stale for minutes between WS ticks. 0 disables.
+    daemon_maker_freshness_interval_seconds: float = 1.0
     daemon_prune_history_days: int = 14
     daemon_heartbeat_stale_seconds: float = 30.0
     daemon_ws_stale_seconds: float = 60.0

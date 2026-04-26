@@ -177,6 +177,12 @@ class DaemonConfig:
     max_active_markets: int = 4
     heartbeat_interval_seconds: float = 5.0
     maintenance_interval_seconds: float = 3600.0
+    # Re-evaluate resting paper-maker limits against current book state
+    # on this cadence, independent of WS event triggers. Closes the
+    # quiet-window gap where a maker can sit at a stale price for
+    # minutes between events and then fill at the bad price when the
+    # next tick finally fires. Setting to 0 disables the loop entirely.
+    maker_freshness_interval_seconds: float = 1.0
     prune_history_days: int = 14
 
 
@@ -257,6 +263,7 @@ class DaemonRunner:
             decision_min_interval_seconds=float(settings.daemon_decision_min_interval_seconds),
             heartbeat_interval_seconds=float(settings.daemon_heartbeat_interval_seconds),
             maintenance_interval_seconds=float(settings.daemon_maintenance_interval_seconds),
+            maker_freshness_interval_seconds=float(settings.daemon_maker_freshness_interval_seconds),
             prune_history_days=int(settings.daemon_prune_history_days),
         )
         self._market_stream_factory = market_stream_factory or (
@@ -389,6 +396,9 @@ class DaemonRunner:
         heartbeat_task = asyncio.create_task(self._heartbeat_loop(self._stop_event))
         maintenance_task = asyncio.create_task(self._maintenance_loop(self._stop_event))
         reload_task = asyncio.create_task(self._settings_reload_loop(self._stop_event))
+        maker_freshness_task = asyncio.create_task(
+            self._maker_freshness_loop(self._stop_event)
+        )
         try:
             await self._stop_event.wait()
         finally:
@@ -399,6 +409,7 @@ class DaemonRunner:
                     heartbeat_task,
                     maintenance_task,
                     reload_task,
+                    maker_freshness_task,
                     self._market_subscriber_task,
                 ]
             )
@@ -1821,6 +1832,134 @@ class DaemonRunner:
                 await asyncio.wait_for(stop_event.wait(), timeout=interval)
             except asyncio.TimeoutError:
                 continue
+
+    async def _maker_freshness_loop(self, stop_event: asyncio.Event) -> None:
+        """Periodically re-quote resting paper-maker limits whose desired
+        price has drifted past ``paper_follow_cancel_price_threshold``.
+
+        Why this exists: the event-driven path (``_handle_follow_maker``)
+        only fires when the WS feed emits a tick that re-runs the scorer.
+        On a quiet market that tick can be minutes apart from the prior
+        one — long enough for the mid to drift several cents while our
+        rest sits at a stale price. The next tick that does fire will
+        usually have the ask already inside our limit, locking in a
+        fill at the *worse* price (the fill check in
+        ``_handle_follow_maker`` runs before the drift check).
+
+        This loop closes that gap by sweeping ``_pending_makers`` on a
+        fixed cadence and re-quoting independently of WS triggers.
+        Doesn't run the scorer (regime changes are still owned by the
+        event-driven path) and doesn't check fills (also event-driven).
+        Pure price-tracking — same drift threshold the event path uses.
+
+        Disabled when ``maker_freshness_interval_seconds`` ≤ 0.
+        """
+        interval = float(self.config.maker_freshness_interval_seconds)
+        if interval <= 0.0:
+            return
+        interval = max(0.1, interval)
+        while not stop_event.is_set():
+            try:
+                await self._refresh_pending_makers()
+            except Exception as exc:
+                logger.warning("maker freshness sweep failed: %s", exc)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                continue
+
+    async def _refresh_pending_makers(self) -> None:
+        """One sweep of ``_pending_makers`` — re-quote any rest that has
+        drifted past the price threshold against current book state.
+
+        Snapshots keys upfront so we don't trip on concurrent mutations
+        from the event-driven path. For each key we re-fetch the pending
+        order before mutating; if it has been filled, cancelled, or
+        replaced in between we skip — the event path already handled it.
+        """
+        settings = self.settings
+        price_threshold = float(settings.paper_follow_cancel_price_threshold)
+        size_threshold_pct = float(settings.paper_follow_cancel_size_threshold_pct)
+        if price_threshold <= 0.0 and size_threshold_pct <= 0.0:
+            return  # No re-quote policy on either axis — loop is a no-op.
+        discount_bps = float(settings.paper_follow_limit_discount_bps)
+        ttl_seconds = int(settings.paper_follow_maker_ttl_seconds)
+        min_level_size = float(settings.paper_follow_min_level_size_shares)
+        size_usd = float(settings.max_position_usd)
+
+        for key in list(self._pending_makers.keys()):
+            pending = self._pending_makers.get(key)
+            if pending is None:
+                continue
+            strategy_id, market_id = key
+            state = self._market_states.get(market_id)
+            if state is None:
+                continue
+            features = state.features()
+            bid_yes, ask_yes, bid_no, ask_no = self._depth_filtered_quotes(
+                features, min_level_size
+            )
+            desired_limit = maker_limit_price(
+                pending.side, bid_yes, ask_yes, bid_no, ask_no, discount_bps
+            )
+            if desired_limit <= 0.0:
+                continue  # Book too thin / crossed — leave existing rest alone.
+            if not self._maker_drift_exceeds_threshold(
+                pending,
+                desired_price=desired_limit,
+                desired_size_usd=size_usd,
+                price_threshold=price_threshold,
+                size_threshold_pct=size_threshold_pct,
+            ):
+                continue
+            # Drift exceeded — cancel and replace. Re-check the slot is
+            # still ours before mutating; the event path may have just
+            # filled or cancelled it.
+            if self._pending_makers.get(key) is not pending:
+                continue
+            self._pending_makers.pop(key, None)
+            await asyncio.to_thread(
+                self.service.journal.log_event,
+                "paper_maker_cancelled",
+                {
+                    "market_id": market_id,
+                    "strategy_id": strategy_id,
+                    "side": pending.side.value,
+                    "limit_price": pending.limit_price,
+                    "reason": "freshness_drift",
+                    "desired_price": round(desired_limit, 6),
+                    "price_delta": round(abs(desired_limit - pending.limit_price), 6),
+                    "size_delta_pct": self._size_delta_pct(pending.size_usd, size_usd),
+                },
+            )
+            now = _utc_now()
+            new_order = PaperMakerOrder(
+                strategy_id=strategy_id,
+                market_id=market_id,
+                side=pending.side,
+                limit_price=round(desired_limit, 6),
+                size_usd=size_usd,
+                placed_at=now,
+                ttl_seconds=ttl_seconds,
+            )
+            self._pending_makers[key] = new_order
+            await asyncio.to_thread(
+                self.service.journal.log_event,
+                "paper_maker_placed",
+                {
+                    "market_id": market_id,
+                    "strategy_id": strategy_id,
+                    "side": new_order.side.value,
+                    "limit_price": new_order.limit_price,
+                    "size_usd": new_order.size_usd,
+                    "ttl_seconds": new_order.ttl_seconds,
+                    "discount_bps": discount_bps,
+                    "mid_yes": features.mid_yes,
+                    "mid_no": features.mid_no,
+                    "min_level_size_shares": min_level_size,
+                    "source": "freshness_loop",
+                },
+            )
 
     async def _emit_startup_settings_events(self) -> None:
         """Journal the list of migrations applied on this boot plus a
