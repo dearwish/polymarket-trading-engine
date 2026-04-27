@@ -197,6 +197,35 @@ class PortfolioEngine:
             row = conn.execute(sql, params).fetchone()
         return float(row[0] or 0.0)
 
+    def get_closed_position_stats(self) -> list[dict]:
+        """Per-strategy aggregation of every CLOSED row in the DB.
+
+        Returned shape matches what ``portfolio_summary`` builds, but
+        sourced from a single GROUP BY against the full table instead of
+        a Python loop over a row-limited fetch — so the dashboard's
+        "Closed Positions" count and per-strategy PnL no longer cap at
+        the materialised row count.
+        """
+        sql = (
+            "select strategy_id, count(*), coalesce(sum(realized_pnl), 0.0), "
+            "  sum(case when realized_pnl > 0 then 1 else 0 end), "
+            "  sum(case when realized_pnl < 0 then 1 else 0 end) "
+            "from positions where status = 'CLOSED' "
+            "group by strategy_id"
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            rows = conn.execute(sql).fetchall()
+        return [
+            {
+                "strategy_id": str(strategy_id or "fade"),
+                "closed_positions": int(count),
+                "total_realized_pnl": float(pnl_sum or 0.0),
+                "wins": int(wins or 0),
+                "losses": int(losses or 0),
+            }
+            for strategy_id, count, pnl_sum, wins, losses in rows
+        ]
+
     def get_consecutive_losses(self, limit: int = 100) -> int:
         """Count CLOSED positions from the most recent backward until a
         non-losing close breaks the streak (realized_pnl > 0 → break).

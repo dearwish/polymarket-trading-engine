@@ -161,6 +161,17 @@ class StubService:
         def get_daily_realized_pnl(self):
             return 3.75
 
+        def get_closed_position_stats(self):
+            return [
+                {
+                    "strategy_id": "fade",
+                    "closed_positions": 1,
+                    "total_realized_pnl": 3.75,
+                    "wins": 1,
+                    "losses": 0,
+                }
+            ]
+
     portfolio = Portfolio()
 
     def simulate_market(self, market_id):

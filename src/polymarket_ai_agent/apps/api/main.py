@@ -699,11 +699,21 @@ def create_app(
     @app.get("/api/portfolio/summary")
     def portfolio_summary(service: AgentService = Depends(service_factory)) -> dict:
         open_positions = service.portfolio.list_open_positions()
-        closed_positions = service.portfolio.list_closed_positions(limit=200)
-        # Group by strategy_id so the UI can render side-by-side stats for
-        # fade vs adaptive. We iterate the already-loaded row lists rather
-        # than re-querying — keeps this endpoint a single-pass aggregation.
+        # Closed-position counts and per-strategy PnL come from a SQL
+        # GROUP BY over the full table — the prior implementation
+        # materialised at most 200 rows and silently truncated counts
+        # once the soak passed that mark.
+        closed_stats = service.portfolio.get_closed_position_stats()
         per_strategy: dict[str, dict] = {}
+        for stats in closed_stats:
+            sid = stats["strategy_id"] or "fade"
+            per_strategy[sid] = {
+                "strategy_id": sid,
+                "open_positions": 0, "closed_positions": stats["closed_positions"],
+                "total_realized_pnl": stats["total_realized_pnl"],
+                "open_notional": 0.0,
+                "wins": stats["wins"], "losses": stats["losses"],
+            }
         for pos in open_positions:
             sid = getattr(pos, "strategy_id", "fade") or "fade"
             bucket = per_strategy.setdefault(sid, {
@@ -714,28 +724,15 @@ def create_app(
             })
             bucket["open_positions"] += 1
             bucket["open_notional"] += pos.size_usd
-        for pos in closed_positions:
-            sid = getattr(pos, "strategy_id", "fade") or "fade"
-            bucket = per_strategy.setdefault(sid, {
-                "strategy_id": sid,
-                "open_positions": 0, "closed_positions": 0,
-                "total_realized_pnl": 0.0, "open_notional": 0.0,
-                "wins": 0, "losses": 0,
-            })
-            bucket["closed_positions"] += 1
-            bucket["total_realized_pnl"] += pos.realized_pnl
-            if pos.realized_pnl > 0:
-                bucket["wins"] += 1
-            elif pos.realized_pnl < 0:
-                bucket["losses"] += 1
         for bucket in per_strategy.values():
             decided = bucket["wins"] + bucket["losses"]
             bucket["win_rate"] = (bucket["wins"] / decided) if decided else None
             bucket["total_realized_pnl"] = round(bucket["total_realized_pnl"], 6)
             bucket["open_notional"] = round(bucket["open_notional"], 4)
+        total_closed = sum(s["closed_positions"] for s in closed_stats)
         return {
             "open_positions": len(open_positions),
-            "closed_positions": len(closed_positions),
+            "closed_positions": total_closed,
             "total_realized_pnl": service.portfolio.get_total_realized_pnl(),
             "daily_realized_pnl": service.portfolio.get_daily_realized_pnl(),
             "open_position_notional": round(sum(position.size_usd for position in open_positions), 4),
