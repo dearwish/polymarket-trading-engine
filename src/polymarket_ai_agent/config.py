@@ -205,6 +205,13 @@ class Settings(BaseSettings):
     # *real* (not noise) Polymarket moves the BTC reference hasn't caught
     # up to yet. 0.0 disables.
     adaptive_v2_max_abs_edge: float = 0.30
+    # Route adaptive_v2's APPROVED assessments through the paper-maker
+    # lifecycle (resting limit at mid − ``paper_follow_limit_discount_bps``,
+    # TTL ``paper_follow_maker_ttl_seconds``) instead of an immediate taker
+    # fill — the adaptive_v2 analogue of ``fade_post_only``. SL / TP ladder
+    # / trail / SL-limit-out logic is already shared with fade via the
+    # standard exit pipeline so no separate knobs are needed for those.
+    adaptive_v2_post_only: bool = False
 
     fee_bps: float = 0.0
     execution_maker_min_edge: float = 0.04
@@ -541,6 +548,11 @@ EDITABLE_SETTINGS_METADATA: dict[str, dict[str, Any]] = {
         "max": 1,
         "step": 0.01,
         "group": "thresholds",
+    },
+    "adaptive_v2_post_only": {
+        "label": "Adaptive V2 Post-Only (paper-maker lifecycle)",
+        "type": "boolean",
+        "group": "paper",
     },
     "paper_take_profit_pct": {
         "label": "Paper Take Profit %",

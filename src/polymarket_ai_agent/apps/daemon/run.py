@@ -30,7 +30,10 @@ from polymarket_ai_agent.engine.execution.paper_maker import (
     maker_limit_price,
 )
 from polymarket_ai_agent.engine.maker_rewards import estimate_reward_per_100
-from polymarket_ai_agent.engine.overreaction_scoring import OverreactionScorer
+from polymarket_ai_agent.engine.overreaction_scoring import (
+    OVERREACTION_POST_ONLY_TAG,
+    OverreactionScorer,
+)
 from polymarket_ai_agent.engine.penny_scoring import PENNY_STRATEGY_TAG, PennyScorer
 from polymarket_ai_agent.engine.market_state import MarketFeatures, MarketState
 from polymarket_ai_agent.engine.quant_scoring import FADE_POST_ONLY_TAG, QuantScoringEngine
@@ -313,6 +316,7 @@ class DaemonRunner:
             cost_floor=float(settings.adaptive_v2_cost_floor),
             min_seconds_to_expiry=int(settings.adaptive_v2_min_seconds_to_expiry),
             max_abs_edge=float(settings.adaptive_v2_max_abs_edge),
+            post_only=bool(settings.adaptive_v2_post_only),
         )
         self._strategies: list[StrategyConfig] = [
             StrategyConfig(strategy_id=_DEFAULT_STRATEGY_ID, scorer=self.quant),
@@ -1194,13 +1198,14 @@ class DaemonRunner:
         self._position_extras.pop(extras_key, None)
         self._pending_sl_exits.pop(extras_key, None)
 
-        # Follow-with-maker branch: the adaptive scorer signals a follow
-        # via raw_model_output. Route to the paper-maker lifecycle and
-        # return — the normal risk → execute → taker path doesn't apply
-        # because the follow assessment's ``edge`` is zeroed by design.
+        # Follow-with-maker branch: a scorer signals "rest a paper-maker
+        # limit instead of taking" by stamping one of these tags on
+        # raw_model_output. Route to the paper-maker lifecycle and return —
+        # the normal risk → execute → taker path doesn't apply.
         if assessment.raw_model_output in (
             ADAPTIVE_FOLLOW_MAKER_TAG,
             FADE_POST_ONLY_TAG,
+            OVERREACTION_POST_ONLY_TAG,
         ):
             await self._handle_follow_maker(context, strategy_id)
             return
@@ -2273,6 +2278,7 @@ class DaemonRunner:
             cost_floor=float(new_settings.adaptive_v2_cost_floor),
             min_seconds_to_expiry=int(new_settings.adaptive_v2_min_seconds_to_expiry),
             max_abs_edge=float(new_settings.adaptive_v2_max_abs_edge),
+            post_only=bool(new_settings.adaptive_v2_post_only),
         )
         # Toggle optional strategies in/out of the list in place, preserving
         # fade at index 0 so the order stays stable.

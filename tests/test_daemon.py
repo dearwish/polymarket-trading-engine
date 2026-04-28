@@ -1776,6 +1776,90 @@ def _follow_assessment(market_id: str) -> "MarketAssessment":
     )
 
 
+def _post_only_assessment(market_id: str, side, tag: str):
+    """Build an APPROVED assessment carrying a maker-routing tag. Used to
+    drive ``_paper_execute_for_strategy`` without running a real scorer.
+    """
+    from polymarket_ai_agent.types import MarketAssessment
+    return MarketAssessment(
+        market_id=market_id,
+        fair_probability=0.55,
+        fair_probability_no=0.45,
+        confidence=0.60,
+        suggested_side=side,
+        expiry_risk="LOW",
+        reasons_for_trade=["test"],
+        reasons_to_abstain=[],
+        edge=0.10,
+        edge_yes=0.10 if side.value == "YES" else 0.0,
+        edge_no=0.10 if side.value == "NO" else 0.0,
+        raw_model_output=tag,
+        slippage_bps=10.0,
+    )
+
+
+def test_overreaction_post_only_tag_routes_to_maker_lifecycle(tmp_path: Path) -> None:
+    """Smoke: an OverreactionScorer assessment carrying
+    OVERREACTION_POST_ONLY_TAG must enter the same maker-routing branch
+    that fade_post_only and adaptive-follow already use.
+    """
+    from dataclasses import replace
+    from polymarket_ai_agent.engine.overreaction_scoring import OVERREACTION_POST_ONLY_TAG
+    from polymarket_ai_agent.types import SuggestedSide
+    runner, service, candidate, state = _follow_runner_and_state(tmp_path)
+    _apply_book(state, bid_yes=0.66, ask_yes=0.68)
+    base_ctx = _context_for_follow(state, candidate, _follow_packet(candidate.market_id))
+    v2_ctx = replace(
+        base_ctx,
+        assessment=_post_only_assessment(candidate.market_id, SuggestedSide.YES, OVERREACTION_POST_ONLY_TAG),
+    )
+    asyncio.run(runner._paper_execute_for_strategy(v2_ctx, "adaptive_v2"))
+    key = ("adaptive_v2", candidate.market_id)
+    pending = runner._pending_makers.get(key)
+    assert pending is not None, "OVERREACTION_POST_ONLY_TAG must route to maker lifecycle"
+    assert pending.side == SuggestedSide.YES
+    assert service.portfolio.list_open_positions() == []
+
+
+def test_fade_and_adaptive_v2_maker_orders_are_independent(tmp_path: Path) -> None:
+    """Regression: when both fade_post_only AND adaptive_v2_post_only fire
+    on the SAME market, each strategy parks its own resting limit under
+    its own (strategy_id, market_id) key. Adding the new tag must NOT
+    disturb fade's existing routing.
+    """
+    from dataclasses import replace
+    from polymarket_ai_agent.engine.overreaction_scoring import OVERREACTION_POST_ONLY_TAG
+    from polymarket_ai_agent.engine.quant_scoring import FADE_POST_ONLY_TAG
+    from polymarket_ai_agent.types import SuggestedSide
+    runner, service, candidate, state = _follow_runner_and_state(tmp_path)
+    _apply_book(state, bid_yes=0.66, ask_yes=0.68)
+    base_ctx = _context_for_follow(state, candidate, _follow_packet(candidate.market_id))
+
+    # Fade strategy parks its maker first.
+    fade_ctx = replace(
+        base_ctx,
+        assessment=_post_only_assessment(candidate.market_id, SuggestedSide.YES, FADE_POST_ONLY_TAG),
+    )
+    asyncio.run(runner._paper_execute_for_strategy(fade_ctx, "fade"))
+    fade_key = ("fade", candidate.market_id)
+    assert fade_key in runner._pending_makers
+    fade_limit_before = runner._pending_makers[fade_key].limit_price
+
+    # Adaptive_v2 then parks its own — must not overwrite fade's entry.
+    v2_ctx = replace(
+        base_ctx,
+        assessment=_post_only_assessment(candidate.market_id, SuggestedSide.YES, OVERREACTION_POST_ONLY_TAG),
+    )
+    asyncio.run(runner._paper_execute_for_strategy(v2_ctx, "adaptive_v2"))
+    v2_key = ("adaptive_v2", candidate.market_id)
+    assert v2_key in runner._pending_makers
+    assert fade_key in runner._pending_makers, "adaptive_v2 must not evict fade's pending maker"
+    assert runner._pending_makers[fade_key].limit_price == fade_limit_before
+    # Two distinct PaperMakerOrder objects under two distinct keys.
+    assert runner._pending_makers[fade_key] is not runner._pending_makers[v2_key]
+    assert service.portfolio.list_open_positions() == []
+
+
 def test_follow_maker_placed_on_first_tick(tmp_path: Path) -> None:
     """First tick of a trending regime with no existing maker → daemon
     parks a new paper-maker at the discounted mid. No position opens.

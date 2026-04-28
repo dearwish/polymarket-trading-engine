@@ -43,6 +43,11 @@ from polymarket_ai_agent.types import EvidencePacket, MarketAssessment, Suggeste
 
 
 OVERREACTION_TAG = "overreaction-fade"
+# Hard-coded tag consumed by the daemon's maker-routing branch when
+# adaptive_v2 is configured to use the paper-maker lifecycle. Kept distinct
+# from OVERREACTION_TAG (and from FADE_POST_ONLY_TAG) so analyze_soak can
+# attribute maker placements to the correct strategy.
+OVERREACTION_POST_ONLY_TAG = "overreaction-post-only-maker"
 
 
 class OverreactionScorer:
@@ -64,6 +69,7 @@ class OverreactionScorer:
         cost_floor: float = 0.005,
         min_seconds_to_expiry: int = 60,
         max_abs_edge: float = 0.30,
+        post_only: bool = False,
     ):
         self.overreaction_threshold = overreaction_threshold
         self.sensitivity = sensitivity
@@ -73,6 +79,11 @@ class OverreactionScorer:
         # historically mis-priced as "noise" when BTC is in fact moving
         # too fast for the 30s window to keep up. Set to 0.0 to disable.
         self.max_abs_edge = max_abs_edge
+        # When True, APPROVED assessments stamp ``OVERREACTION_POST_ONLY_TAG``
+        # so the daemon routes them through the paper-maker lifecycle
+        # (resting limit + TTL) instead of an immediate taker fill. ABSTAIN
+        # assessments are unaffected.
+        self.post_only = post_only
 
     def score_market(self, packet: EvidencePacket) -> MarketAssessment:
         """Return an APPROVED assessment when the packet shows a
@@ -154,6 +165,7 @@ class OverreactionScorer:
         else:
             fair_yes = max(0.01, min(0.99, current_mid - abs(overreaction)))
 
+        approved_tag = OVERREACTION_POST_ONLY_TAG if self.post_only else OVERREACTION_TAG
         return MarketAssessment(
             market_id=packet.market_id,
             fair_probability=fair_yes,
@@ -172,7 +184,7 @@ class OverreactionScorer:
             edge=edge,
             edge_yes=edge if side is SuggestedSide.YES else 0.0,
             edge_no=edge if side is SuggestedSide.NO else 0.0,
-            raw_model_output=OVERREACTION_TAG,
+            raw_model_output=approved_tag,
             slippage_bps=10.0,
         )
 

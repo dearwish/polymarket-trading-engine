@@ -106,6 +106,7 @@ INITIAL_SETTINGS_BASELINE: dict[str, Any] = {
     "adaptive_v2_cost_floor": 0.005,
     "adaptive_v2_min_seconds_to_expiry": 60,
     "adaptive_v2_max_abs_edge": 0.30,
+    "adaptive_v2_post_only": True,
     "fee_bps": 0.0,
     # --- Quant scorer gates ---
     "quant_invert_drift": False,

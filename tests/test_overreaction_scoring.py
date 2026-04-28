@@ -7,6 +7,7 @@ flip the decision surface.
 from __future__ import annotations
 
 from polymarket_ai_agent.engine.overreaction_scoring import (
+    OVERREACTION_POST_ONLY_TAG,
     OVERREACTION_TAG,
     OverreactionScorer,
 )
@@ -246,3 +247,42 @@ def test_max_abs_edge_zero_disables_ceiling() -> None:
     # large excess.
     assert result.suggested_side == SuggestedSide.YES
     assert result.edge > 0.30
+
+
+def test_post_only_stamps_post_only_tag_on_approved_assessments() -> None:
+    """When ``post_only=True``, an APPROVED overreaction assessment carries
+    the maker-routing tag so the daemon parks a resting limit instead of
+    crossing the spread.
+    """
+    scorer = OverreactionScorer(
+        overreaction_threshold=0.02, sensitivity=10.0, post_only=True,
+    )
+    packet = _packet(recent_price_change_bps=400.0, btc_log_return_5m=0.001)
+    result = scorer.score_market(packet)
+    assert result.suggested_side == SuggestedSide.NO
+    assert result.raw_model_output == OVERREACTION_POST_ONLY_TAG
+
+
+def test_post_only_does_not_affect_abstain_assessments() -> None:
+    """ABSTAIN paths use the legacy OVERREACTION_TAG regardless of
+    post_only — there's nothing to route through the maker lifecycle.
+    """
+    scorer = OverreactionScorer(
+        overreaction_threshold=0.02, sensitivity=10.0, post_only=True,
+    )
+    # Sub-threshold excess (1% < 2%) → ABSTAIN.
+    packet = _packet(recent_price_change_bps=100.0, btc_log_return_5m=0.0)
+    result = scorer.score_market(packet)
+    assert result.suggested_side == SuggestedSide.ABSTAIN
+    assert result.raw_model_output == OVERREACTION_TAG
+
+
+def test_post_only_default_false_preserves_legacy_taker_tag() -> None:
+    """Default constructor preserves the original OVERREACTION_TAG so
+    existing callers don't accidentally flip into the maker lifecycle.
+    """
+    scorer = OverreactionScorer(overreaction_threshold=0.02, sensitivity=10.0)
+    packet = _packet(recent_price_change_bps=400.0, btc_log_return_5m=0.001)
+    result = scorer.score_market(packet)
+    assert result.suggested_side == SuggestedSide.NO
+    assert result.raw_model_output == OVERREACTION_TAG
