@@ -256,6 +256,11 @@ class Settings(BaseSettings):
     # have bid-ask spreads that exceed the stop-loss width, causing immediate
     # gap-out on entry. 0 = off.
     quant_min_entry_price: float = 0.0
+    # Unconditional maximum entry price: skip any trade where our side's ask is
+    # above this ceiling. Mid-band entries (≥ 0.50) empirically bleed 2–3× faster
+    # than low-band trades because the fade signal is weakest near 0.50 — the
+    # "least informed" zone where price is closest to a true coin-flip. 0 = off.
+    quant_max_entry_price: float = 0.0
 
     # OFI gate: veto trades where strong signed order flow opposes the direction.
     # Informed flow (signed_flow_5s) is the single best short-term price-impact
@@ -640,6 +645,7 @@ EDITABLE_SETTINGS_METADATA: dict[str, dict[str, Any]] = {
     "quant_trend_opposed_weak_min_edge": {"label": "Counter-Trend Min Edge (1h)", "type": "number", "min": 0, "max": 1, "step": 0.01, "group": "thresholds"},
     "quant_trend_distressed_max_ask": {"label": "Distressed Max Ask", "type": "number", "min": 0, "max": 1, "step": 0.01, "group": "thresholds"},
     "quant_min_entry_price": {"label": "Min Entry Price", "type": "number", "min": 0, "max": 1, "step": 0.01, "group": "thresholds"},
+    "quant_max_entry_price": {"label": "Max Entry Price", "type": "number", "min": 0, "max": 1, "step": 0.01, "group": "thresholds"},
     "quant_ofi_gate_enabled": {"label": "OFI Gate Enabled", "type": "boolean", "group": "thresholds"},
     "quant_ofi_gate_min_abs_flow": {"label": "OFI Gate Min |Flow|", "type": "number", "min": 0, "max": 10000, "step": 1, "group": "thresholds"},
     "quant_vol_regime_enabled": {"label": "Vol Regime Enabled", "type": "boolean", "group": "thresholds"},

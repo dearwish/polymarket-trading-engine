@@ -243,8 +243,10 @@ class QuantScoringEngine:
     def _regime_gate(self, packet: EvidencePacket, side: SuggestedSide, chosen_edge: float) -> str | None:
         """Return a rejection reason string if the regime blocks this trade, else None.
 
-        Four independent checks run in priority order:
-          0. Minimum entry price — ask below floor means gap-out risk exceeds SL width.
+        Five independent checks run in priority order:
+          0a. Minimum entry price — ask below floor means gap-out risk exceeds SL width.
+          0b. Maximum entry price — mid-band entries (≥0.50) bleed 2–3× faster
+              empirically; fade signal is weakest near 0.50.
           1. Trend-based minimum edge — counter-trend trades need more edge to pass.
           2. OFI gate — strong informed flow opposing the trade direction is a veto.
           3. Volatility regime — high vol raises the edge bar; extreme vol abstains.
@@ -252,11 +254,13 @@ class QuantScoringEngine:
         # 0. Unconditional minimum entry price: if our side's ask is too low the
         # bid-ask spread alone can exceed the stop-loss width, causing an immediate
         # stop-out with no real adverse movement (gap risk at distressed prices).
+        ask_our_side = float(packet.ask_yes if side is SuggestedSide.YES else packet.ask_no)
         min_price = float(self.settings.quant_min_entry_price)
-        if min_price > 0.0:
-            ask_our_side = float(packet.ask_yes if side is SuggestedSide.YES else packet.ask_no)
-            if ask_our_side < min_price:
-                return f"Min price: {side.value} ask {ask_our_side:.3f} < floor {min_price:.3f}."
+        if min_price > 0.0 and ask_our_side < min_price:
+            return f"Min price: {side.value} ask {ask_our_side:.3f} < floor {min_price:.3f}."
+        max_price = float(self.settings.quant_max_entry_price)
+        if max_price > 0.0 and ask_our_side > max_price:
+            return f"Max price: {side.value} ask {ask_our_side:.3f} > ceiling {max_price:.3f}."
 
         # 1. Trend-based minimum edge (replaces the old binary trend veto)
         if bool(self.settings.quant_trend_filter_enabled):

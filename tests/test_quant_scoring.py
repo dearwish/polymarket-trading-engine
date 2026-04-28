@@ -33,6 +33,7 @@ def _settings(tmp_path: Path, **overrides) -> Settings:
         quant_vol_regime_enabled=False,
         quant_trend_distressed_max_ask=0.0,
         quant_min_entry_price=0.0,
+        quant_max_entry_price=0.0,
         min_candle_elapsed_seconds=0,
         max_candle_elapsed_seconds=0,
     )
@@ -520,6 +521,61 @@ def test_min_entry_price_disabled_when_zero(tmp_path: Path) -> None:
                      seconds_to_expiry=600)
     a = engine.score_market(packet)
     assert not any("Min price" in r for r in a.reasons_to_abstain)
+
+
+def test_max_entry_price_blocks_high_ask(tmp_path: Path) -> None:
+    """Max price gate abstains when our side's ask exceeds the ceiling.
+
+    Mid-band entries (≥0.50) bleed faster empirically because the fade
+    signal is weakest near 0.50. This gate vetoes them outright.
+    """
+    engine = QuantScoringEngine(_settings(
+        tmp_path,
+        quant_max_entry_price=0.50,
+        quant_slippage_baseline_bps=0.0,
+        quant_slippage_spread_coef=0.0,
+        fee_bps=0.0,
+    ))
+    # BTC trending UP → model picks YES. ask_yes=0.62 > 0.50 ceiling → blocked.
+    packet = _packet(btc_log_return_15m=0.01, realized_vol_30m=0.001,
+                     ask_yes=0.62, ask_no=0.40, bid_yes=0.60, bid_no=0.38,
+                     seconds_to_expiry=600)
+    a = engine.score_market(packet)
+    assert a.suggested_side == SuggestedSide.ABSTAIN
+    assert any("Max price" in r for r in a.reasons_to_abstain)
+
+
+def test_max_entry_price_allows_ask_below_ceiling(tmp_path: Path) -> None:
+    """Max price gate is silent when our side's ask is at or below ceiling."""
+    engine = QuantScoringEngine(_settings(
+        tmp_path,
+        quant_max_entry_price=0.50,
+        quant_slippage_baseline_bps=0.0,
+        quant_slippage_spread_coef=0.0,
+        fee_bps=0.0,
+    ))
+    # ask_yes=0.45 ≤ 0.50 ceiling → gate does not block.
+    packet = _packet(btc_log_return_15m=0.01, realized_vol_30m=0.001,
+                     ask_yes=0.45, ask_no=0.57, bid_yes=0.43, bid_no=0.55,
+                     seconds_to_expiry=600)
+    a = engine.score_market(packet)
+    assert not any("Max price" in r for r in a.reasons_to_abstain)
+
+
+def test_max_entry_price_disabled_when_zero(tmp_path: Path) -> None:
+    """Max price gate is skipped when ceiling is 0 (default off)."""
+    engine = QuantScoringEngine(_settings(
+        tmp_path,
+        quant_max_entry_price=0.0,
+        quant_slippage_baseline_bps=0.0,
+        quant_slippage_spread_coef=0.0,
+        fee_bps=0.0,
+    ))
+    packet = _packet(btc_log_return_15m=0.01, realized_vol_30m=0.001,
+                     ask_yes=0.95, ask_no=0.08, bid_yes=0.94, bid_no=0.05,
+                     seconds_to_expiry=600)
+    a = engine.score_market(packet)
+    assert not any("Max price" in r for r in a.reasons_to_abstain)
 
 
 def test_ofi_gate_blocks_trade_against_flow(tmp_path: Path) -> None:
