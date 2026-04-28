@@ -60,6 +60,13 @@ class Settings(BaseSettings):
     # trail from firing at a small loss when the peak barely moved above
     # entry. 0.0 arms immediately (previous behaviour).
     paper_trail_arm_pct: float = 0.0
+    # Trail confirmation: require N consecutive ticks where the exit-walk
+    # VWAP sits at-or-below ``trail_floor`` before firing the trail. Filters
+    # single-tick wicks / spread widenings that would otherwise stop a
+    # winning position out on a one-tick noise spike. 0 or 1 = fire on the
+    # first tick below floor (legacy behaviour). Counter resets to zero on
+    # any tick where current price recovers above the floor.
+    paper_trail_confirmation_ticks: int = 0
     # Entry cooldown: after any close on a market, block new entries on the
     # same market for this many seconds. Prevents immediate re-entry whipsaw
     # where the scorer flips sides and each flip gets stopped out. 0 disables.
@@ -557,6 +564,14 @@ EDITABLE_SETTINGS_METADATA: dict[str, dict[str, Any]] = {
         "min": 0,
         "max": 1,
         "step": 0.01,
+        "group": "paper",
+    },
+    "paper_trail_confirmation_ticks": {
+        "label": "Paper Trail Confirmation Ticks",
+        "type": "number",
+        "min": 0,
+        "max": 20,
+        "step": 1,
         "group": "paper",
     },
     "paper_entry_cooldown_seconds": {

@@ -992,21 +992,31 @@ class DaemonRunner:
                 # at entry: a freshly-armed trail with arm_pct < trail_pct / (1 -
                 # trail_pct) would otherwise place its floor below entry and
                 # could fire as a realised loss on the first pullback.
+                # Confirmation ticks: require N consecutive ticks at-or-below
+                # ``trail_floor`` before firing, filtering single-tick wicks.
+                # Counter resets the moment current_price recovers above floor.
                 trail_pct = float(settings.paper_trailing_stop_pct)
                 arm_pct = float(settings.paper_trail_arm_pct)
+                trail_confirm_ticks = max(1, int(settings.paper_trail_confirmation_ticks))
                 peak = extras["peak_price"]
                 arm_threshold = entry_price * (1.0 + arm_pct)
                 trail_armed = peak >= arm_threshold
                 trail_floor = max(peak * (1.0 - trail_pct), entry_price)
-                if trail_pct > 0.0 and trail_armed and current_price <= trail_floor:
-                    exit_price_walk = self._paper_exit_fill(
-                        market_id, open_pos.side, float(open_pos.size_usd), entry_price, float(current_price)
-                    )
-                    await self._finalize_paper_close(
-                        open_pos, exit_price_walk, "paper_trailing_stop", tte_seconds, context,
-                        strategy_id=strategy_id,
-                    )
-                    return
+                if trail_pct > 0.0 and trail_armed:
+                    if current_price <= trail_floor:
+                        ticks_below = float(extras.get("trail_below_floor_ticks", 0.0)) + 1.0
+                        extras["trail_below_floor_ticks"] = ticks_below
+                        if ticks_below >= trail_confirm_ticks:
+                            exit_price_walk = self._paper_exit_fill(
+                                market_id, open_pos.side, float(open_pos.size_usd), entry_price, float(current_price)
+                            )
+                            await self._finalize_paper_close(
+                                open_pos, exit_price_walk, "paper_trailing_stop", tte_seconds, context,
+                                strategy_id=strategy_id,
+                            )
+                            return
+                    elif extras.get("trail_below_floor_ticks", 0.0) > 0.0:
+                        extras["trail_below_floor_ticks"] = 0.0
                 # --- 3 + 4. Fixed TP / SL ---------------------------------
                 # If any ladder tranche has already fired, the remaining slice
                 # is meant to "ride the runner" and be captured by the trail —
@@ -1190,6 +1200,7 @@ class DaemonRunner:
             "peak_price": 0.0,
             "tranches_closed": float(tp_ladder_count),
             "original_size_usd": float(open_pos.size_usd) + closed_size,
+            "trail_below_floor_ticks": 0.0,
         }
 
     async def _close_orphaned_position(

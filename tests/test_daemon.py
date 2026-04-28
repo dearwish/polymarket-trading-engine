@@ -573,6 +573,103 @@ def test_paper_trailing_stop_rides_up_then_exits_on_reversal(tmp_path) -> None:
     assert closed[0].realized_pnl > 0  # Peak was 0.80, exit at 0.70 still above 0.50 entry.
 
 
+def _tick_with_book(runner, candidate, approved, btc, bid: float, ask: float):
+    """Apply a fresh book snapshot and run one decision-callback tick."""
+    from polymarket_ai_agent.apps.daemon.run import DecisionContext
+    from polymarket_ai_agent.engine.market_state import MarketState
+
+    state = MarketState(
+        market_id=candidate.market_id, yes_token_id="yes-tok", no_token_id="no-tok",
+    )
+    state.apply_book_snapshot({
+        "asset_id": "yes-tok",
+        "bids": [{"price": str(bid), "size": "500"}],
+        "asks": [{"price": str(ask), "size": "500"}],
+    })
+    runner._market_states[candidate.market_id] = state
+    ctx = DecisionContext(
+        market_id=candidate.market_id, candidate=candidate,
+        features=state.features(), btc_snapshot=btc, assessment=approved,
+        metrics=runner.metrics,
+    )
+    asyncio.run(runner._paper_execute_decision_callback(ctx))
+
+
+def test_paper_trail_confirmation_ticks_filter_single_tick_dip(tmp_path) -> None:
+    """A single tick below trail_floor must NOT fire the trail when
+    paper_trail_confirmation_ticks=3. The counter resets the moment the
+    next tick recovers above floor — simulating the wick-and-bounce noise
+    pattern that whipsaws a one-tick trail.
+    """
+    runner, service, candidate, approved, btc = _setup_runner_with_open_yes_position(
+        tmp_path, entry_price=0.50, settings_overrides={
+            "paper_trailing_stop_pct": 0.10,
+            "paper_trail_arm_pct": 0.0,
+            "paper_trail_confirmation_ticks": 3,
+        },
+    )
+    # Ride up: peak walk-VWAP ≈ 0.789. Trail floor = 0.789 × 0.90 ≈ 0.710.
+    _tick_with_book(runner, candidate, approved, btc, bid=0.79, ask=0.81)
+    extras = runner._position_extras[("fade", candidate.market_id)]
+    assert extras["peak_price"] >= 0.78
+
+    # Single dip below floor (bid=0.60 → walk ≈ 0.5994). Counter reaches 1.
+    _tick_with_book(runner, candidate, approved, btc, bid=0.60, ask=0.62)
+    assert len(service.portfolio.list_open_positions()) == 1
+    assert extras["trail_below_floor_ticks"] == 1.0
+
+    # Recover above floor (bid=0.78). Counter resets to 0; position still open.
+    _tick_with_book(runner, candidate, approved, btc, bid=0.78, ask=0.80)
+    assert len(service.portfolio.list_open_positions()) == 1
+    assert extras["trail_below_floor_ticks"] == 0.0
+
+
+def test_paper_trail_confirmation_ticks_fire_after_n_consecutive(tmp_path) -> None:
+    """N consecutive ticks below trail_floor MUST fire the trail."""
+    runner, service, candidate, approved, btc = _setup_runner_with_open_yes_position(
+        tmp_path, entry_price=0.50, settings_overrides={
+            "paper_trailing_stop_pct": 0.10,
+            "paper_trail_arm_pct": 0.0,
+            "paper_trail_confirmation_ticks": 3,
+        },
+    )
+    # Establish peak.
+    _tick_with_book(runner, candidate, approved, btc, bid=0.79, ask=0.81)
+    extras = runner._position_extras[("fade", candidate.market_id)]
+
+    # Tick 1 below: counter=1, still open.
+    _tick_with_book(runner, candidate, approved, btc, bid=0.60, ask=0.62)
+    assert len(service.portfolio.list_open_positions()) == 1
+    assert extras["trail_below_floor_ticks"] == 1.0
+    # Tick 2 below: counter=2, still open.
+    _tick_with_book(runner, candidate, approved, btc, bid=0.60, ask=0.62)
+    assert len(service.portfolio.list_open_positions()) == 1
+    assert extras["trail_below_floor_ticks"] == 2.0
+    # Tick 3 below: counter would hit 3, threshold met → fire.
+    _tick_with_book(runner, candidate, approved, btc, bid=0.60, ask=0.62)
+    assert service.portfolio.list_open_positions() == []
+    closed = service.portfolio.list_closed_positions(limit=1)
+    assert closed[0].close_reason == "paper_trailing_stop"
+
+
+def test_paper_trail_confirmation_ticks_default_zero_fires_immediately(tmp_path) -> None:
+    """Setting=0 (or unset) preserves legacy behaviour: trail fires on the
+    first tick below floor, no confirmation needed.
+    """
+    runner, service, candidate, approved, btc = _setup_runner_with_open_yes_position(
+        tmp_path, entry_price=0.50, settings_overrides={
+            "paper_trailing_stop_pct": 0.10,
+            "paper_trail_arm_pct": 0.0,
+            "paper_trail_confirmation_ticks": 0,
+        },
+    )
+    _tick_with_book(runner, candidate, approved, btc, bid=0.79, ask=0.81)
+    _tick_with_book(runner, candidate, approved, btc, bid=0.60, ask=0.62)
+    assert service.portfolio.list_open_positions() == []
+    closed = service.portfolio.list_closed_positions(limit=1)
+    assert closed[0].close_reason == "paper_trailing_stop"
+
+
 def test_paper_tp_ladder_closes_position_in_tranches(tmp_path) -> None:
     from polymarket_ai_agent.apps.daemon.run import DecisionContext
     from polymarket_ai_agent.engine.market_state import MarketState
