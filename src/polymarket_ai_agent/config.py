@@ -67,6 +67,14 @@ class Settings(BaseSettings):
     # first tick below floor (legacy behaviour). Counter resets to zero on
     # any tick where current price recovers above the floor.
     paper_trail_confirmation_ticks: int = 0
+    # Stop-loss limit-out path: when SL triggers, post a passive limit at
+    # ``threshold − slippage_ticks × tick`` and wait up to
+    # ``paper_sl_limit_ttl_ticks`` daemon ticks for it to fully fill against
+    # the live bid book. If filled, exit at the limit-or-better VWAP (clean
+    # ~−SL_pct close). If the TTL expires unfilled, fall back to the legacy
+    # full-book walk (accepting the gap). 0 = disabled (legacy walk-immediate).
+    paper_sl_limit_ttl_ticks: int = 0
+    paper_sl_limit_slippage_ticks: int = 1
     # Entry cooldown: after any close on a market, block new entries on the
     # same market for this many seconds. Prevents immediate re-entry whipsaw
     # where the scorer flips sides and each flip gets stopped out. 0 disables.
@@ -576,6 +584,22 @@ EDITABLE_SETTINGS_METADATA: dict[str, dict[str, Any]] = {
         "type": "number",
         "min": 0,
         "max": 20,
+        "step": 1,
+        "group": "paper",
+    },
+    "paper_sl_limit_ttl_ticks": {
+        "label": "Paper SL Limit-Out TTL (ticks)",
+        "type": "number",
+        "min": 0,
+        "max": 20,
+        "step": 1,
+        "group": "paper",
+    },
+    "paper_sl_limit_slippage_ticks": {
+        "label": "Paper SL Limit Slippage (ticks)",
+        "type": "number",
+        "min": 0,
+        "max": 10,
         "step": 1,
         "group": "paper",
     },

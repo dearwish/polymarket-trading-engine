@@ -502,6 +502,157 @@ def test_paper_take_profit_closes_position_when_mid_rises(tmp_path) -> None:
     assert closed[0].realized_pnl > 0
 
 
+def test_paper_sl_limit_out_fills_at_threshold_when_book_has_size(tmp_path) -> None:
+    """SL limit-out path: with TTL>0, posting tick is silent (no close); the
+    next tick walks bids ≥ limit_price and exits at that VWAP, capping the
+    realized loss at ~−SL_pct instead of a deep book-walk gap.
+    """
+    runner, service, candidate, approved, btc = _setup_runner_with_open_yes_position(
+        tmp_path, entry_price=0.50, settings_overrides={
+            "paper_stop_loss_pct": 0.10,
+            "paper_sl_limit_ttl_ticks": 3,
+            "paper_sl_limit_slippage_ticks": 1,
+        },
+    )
+    # Entry fill ≈ 0.5101 (0.51 ask × 1.001 slippage). SL threshold ≈ 0.4591;
+    # limit_price = threshold − 1 tick = 0.4491.
+    # First tick in SL territory: bid=0.43 (well below threshold) — limit posts,
+    # NO close yet. Book has only one thin level below the limit.
+    _tick_with_book(runner, candidate, approved, btc, bid=0.43, ask=0.45)
+    extras_key = ("fade", candidate.market_id)
+    assert extras_key in runner._pending_sl_exits
+    assert len(service.portfolio.list_open_positions()) == 1
+
+    # Next tick: a deep bid posted at 0.46 (≥ limit 0.4491) — limit fully fills.
+    # Realized exit ≈ 0.46 × (1 − 0.001) = 0.45954, far cleaner than the −13%
+    # walk a deeper book would have produced.
+    _tick_with_book(runner, candidate, approved, btc, bid=0.46, ask=0.48)
+    assert extras_key not in runner._pending_sl_exits
+    assert service.portfolio.list_open_positions() == []
+    closed = service.portfolio.list_closed_positions(limit=1)
+    assert closed[0].close_reason == "paper_stop_loss"
+    # Exit price is ≥ limit_price (0.4491) — that's the entire point.
+    assert closed[0].exit_price >= 0.4491
+
+
+def test_paper_sl_limit_out_falls_back_to_walk_when_ttl_expires(tmp_path) -> None:
+    """If no qualifying bid appears within ``ttl_ticks``, the limit is
+    cancelled and the legacy full-book walk closes the position (accepting
+    the gap rather than hanging the position open forever).
+    """
+    runner, service, candidate, approved, btc = _setup_runner_with_open_yes_position(
+        tmp_path, entry_price=0.50, settings_overrides={
+            "paper_stop_loss_pct": 0.10,
+            "paper_sl_limit_ttl_ticks": 2,
+            "paper_sl_limit_slippage_ticks": 1,
+        },
+    )
+    extras_key = ("fade", candidate.market_id)
+    # Tick 1: SL territory, no qualifying liquidity (bid 0.40 < limit 0.4491)
+    # → post pending, position still open.
+    _tick_with_book(runner, candidate, approved, btc, bid=0.40, ask=0.42)
+    assert extras_key in runner._pending_sl_exits
+    assert len(service.portfolio.list_open_positions()) == 1
+    # Tick 2: still no qualifying liquidity, ticks_waited becomes 1 → still open.
+    _tick_with_book(runner, candidate, approved, btc, bid=0.40, ask=0.42)
+    assert extras_key in runner._pending_sl_exits
+    assert runner._pending_sl_exits[extras_key]["ticks_waited"] == 1.0
+    assert len(service.portfolio.list_open_positions()) == 1
+    # Tick 3: ticks_waited would hit 2 (= TTL) → fall back to walk + close.
+    _tick_with_book(runner, candidate, approved, btc, bid=0.40, ask=0.42)
+    assert extras_key not in runner._pending_sl_exits
+    assert service.portfolio.list_open_positions() == []
+    closed = service.portfolio.list_closed_positions(limit=1)
+    assert closed[0].close_reason == "paper_stop_loss"
+    # Walk realized below the limit_price — i.e. accepted the gap.
+    assert closed[0].exit_price < 0.4491
+
+
+def test_paper_sl_limit_out_fills_on_partial_recovery(tmp_path) -> None:
+    """A pending limit is filled by ANY bid that crosses it, even if the
+    walk-VWAP has technically recovered above the SL threshold (which is
+    how a real resting limit order behaves). Closes as paper_stop_loss
+    with a realized loss at-or-better than the limit price.
+    """
+    runner, service, candidate, approved, btc = _setup_runner_with_open_yes_position(
+        tmp_path, entry_price=0.50, settings_overrides={
+            "paper_stop_loss_pct": 0.10,
+            "paper_sl_limit_ttl_ticks": 5,
+            "paper_sl_limit_slippage_ticks": 1,
+        },
+    )
+    extras_key = ("fade", candidate.market_id)
+    # Tick 1: deep SL territory → post pending limit @ 0.4491.
+    _tick_with_book(runner, candidate, approved, btc, bid=0.40, ask=0.42)
+    assert extras_key in runner._pending_sl_exits
+    # Tick 2: bid recovers to 0.49 (mid 0.50, no longer in SL territory) —
+    # but the limit at 0.4491 is crossed, so the limit fills at the bid.
+    _tick_with_book(runner, candidate, approved, btc, bid=0.49, ask=0.51)
+    assert extras_key not in runner._pending_sl_exits
+    assert service.portfolio.list_open_positions() == []
+    closed = service.portfolio.list_closed_positions(limit=1)
+    assert closed[0].close_reason == "paper_stop_loss"
+    # Realized loss is small (bid was high) — limit-out captured the bounce.
+    assert closed[0].exit_price >= 0.4491
+
+
+def test_paper_sl_limit_out_cancels_when_book_empty_and_price_recovered(tmp_path) -> None:
+    """Edge case: pending limit can't be filled (no bid liquidity at all)
+    AND the position has structurally recovered above SL threshold (mid
+    moved up with the spread). Pending is cancelled so a future SL retrigger
+    can post a fresh limit against the new market state.
+    """
+    runner, service, candidate, approved, btc = _setup_runner_with_open_yes_position(
+        tmp_path, entry_price=0.50, settings_overrides={
+            "paper_stop_loss_pct": 0.10,
+            "paper_sl_limit_ttl_ticks": 5,
+            "paper_sl_limit_slippage_ticks": 1,
+        },
+    )
+    extras_key = ("fade", candidate.market_id)
+    _tick_with_book(runner, candidate, approved, btc, bid=0.40, ask=0.42)
+    assert extras_key in runner._pending_sl_exits
+    # Snapshot with NO bid levels and a high ask — fallback uses mid (high),
+    # so sl_triggered becomes false; limit can't fill (empty book) → cancel.
+    from polymarket_ai_agent.apps.daemon.run import DecisionContext
+    from polymarket_ai_agent.engine.market_state import MarketState
+    state = MarketState(
+        market_id=candidate.market_id, yes_token_id="yes-tok", no_token_id="no-tok",
+    )
+    state.apply_book_snapshot({
+        "asset_id": "yes-tok",
+        "bids": [],
+        "asks": [{"price": "0.51", "size": "500"}],
+    })
+    runner._market_states[candidate.market_id] = state
+    ctx = DecisionContext(
+        market_id=candidate.market_id, candidate=candidate,
+        features=state.features(), btc_snapshot=btc, assessment=approved,
+        metrics=runner.metrics,
+    )
+    asyncio.run(runner._paper_execute_decision_callback(ctx))
+    assert extras_key not in runner._pending_sl_exits
+    assert len(service.portfolio.list_open_positions()) == 1
+
+
+def test_paper_sl_limit_out_disabled_uses_legacy_walk(tmp_path) -> None:
+    """With TTL=0 (default), the SL fires immediately via the full-book walk —
+    behaviour identical to before the limit-out path existed.
+    """
+    runner, service, candidate, approved, btc = _setup_runner_with_open_yes_position(
+        tmp_path, entry_price=0.50, settings_overrides={
+            "paper_stop_loss_pct": 0.10,
+            "paper_sl_limit_ttl_ticks": 0,
+        },
+    )
+    _tick_with_book(runner, candidate, approved, btc, bid=0.40, ask=0.42)
+    # Closed on the same tick — no pending state ever created.
+    assert ("fade", candidate.market_id) not in runner._pending_sl_exits
+    assert service.portfolio.list_open_positions() == []
+    closed = service.portfolio.list_closed_positions(limit=1)
+    assert closed[0].close_reason == "paper_stop_loss"
+
+
 def test_paper_stop_loss_closes_position_when_mid_drops(tmp_path) -> None:
     from polymarket_ai_agent.apps.daemon.run import DecisionContext
     from polymarket_ai_agent.engine.market_state import MarketState

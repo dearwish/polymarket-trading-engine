@@ -48,6 +48,8 @@ INITIAL_SETTINGS_BASELINE: dict[str, Any] = {
     "paper_trailing_stop_pct": 0.15,
     "paper_trail_arm_pct": 0.12,
     "paper_trail_confirmation_ticks": 3,
+    "paper_sl_limit_ttl_ticks": 3,
+    "paper_sl_limit_slippage_ticks": 2,
     "paper_tp_ladder": "0.20:0.25,0.40:0.25,0.60:0.25",
     "paper_entry_cooldown_seconds": 120,
     "position_force_exit_tte_seconds": 45,

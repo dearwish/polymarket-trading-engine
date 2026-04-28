@@ -352,6 +352,12 @@ class DaemonRunner:
         # scorers running side-by-side (phase 2+) keep independent TP-ladder
         # and trailing-stop state on the same market.
         self._position_extras: dict[tuple[str, str], dict[str, float]] = {}
+        # Pending stop-loss limit-out exits keyed on (strategy_id, market_id).
+        # When SL triggers and ``paper_sl_limit_ttl_ticks > 0`` the daemon posts
+        # a passive limit at threshold (− slippage) and stores the request here.
+        # Subsequent ticks check the live bid book for a limit-or-better fill;
+        # when the TTL expires unfilled we fall back to the legacy walk close.
+        self._pending_sl_exits: dict[tuple[str, str], dict[str, float]] = {}
         self._tp_ladder: list[tuple[float, float]] = self._parse_tp_ladder(settings.paper_tp_ladder)
         # Last close timestamp per (strategy_id, market_id), used to enforce
         # an entry cooldown that blocks whipsaw re-entries on the same
@@ -981,6 +987,11 @@ class DaemonRunner:
                             )
                         )
                         extras["tranches_closed"] = tranches_closed + 1
+                        # The remaining size has shrunk — any pending SL limit
+                        # was sized for the pre-tranche notional, so cancel it.
+                        # The next tick re-evaluates SL against the fresh size
+                        # and posts a new limit if still in SL territory.
+                        self._pending_sl_exits.pop(extras_key, None)
                         # Partial closes don't start a cooldown — position is
                         # still live for the remainder; cooldown only applies
                         # after a FULL close.
@@ -1027,10 +1038,120 @@ class DaemonRunner:
                 tp_pct = float(settings.paper_take_profit_pct)
                 sl_pct = float(settings.paper_stop_loss_pct)
                 ladder_has_fired = int(extras["tranches_closed"]) > 0
+                sl_triggered = sl_pct > 0.0 and pnl_pct <= -sl_pct
+                # SL limit-out path. Posts a passive limit at threshold price
+                # and waits up to ``ttl_ticks`` for a fill at-or-better. If
+                # the position recovers above SL territory before TTL, the
+                # pending exit is cancelled (price came back). If TTL expires
+                # unfilled, fall back to the legacy full-book walk so the
+                # position can't get stuck under the limit forever.
+                sl_limit_ttl_ticks = int(settings.paper_sl_limit_ttl_ticks)
+                pending_sl = self._pending_sl_exits.get(extras_key)
+                if pending_sl is not None:
+                    # Always attempt the limit fill first — the limit may have
+                    # been crossed mid-tick by recovering bids even if we're no
+                    # longer technically below the SL threshold this snapshot.
+                    # Mirrors how a real resting limit would have been hit.
+                    limit_fill = self._paper_limit_exit_fill(
+                        market_id, open_pos.side,
+                        float(pending_sl["target_shares"]),
+                        float(pending_sl["limit_price"]),
+                    )
+                    if limit_fill is not None:
+                        self._pending_sl_exits.pop(extras_key, None)
+                        await asyncio.to_thread(
+                            self.service.journal.log_event,
+                            "paper_sl_limit_filled",
+                            {
+                                "strategy_id": strategy_id,
+                                "market_id": market_id,
+                                "limit_price": float(pending_sl["limit_price"]),
+                                "fill_price": float(limit_fill),
+                                "ticks_waited": float(pending_sl["ticks_waited"]),
+                            },
+                        )
+                        await self._finalize_paper_close(
+                            open_pos, limit_fill, "paper_stop_loss", tte_seconds, context,
+                            strategy_id=strategy_id,
+                        )
+                        return
+                    if not sl_triggered:
+                        # Limit didn't fill AND we're back above SL threshold —
+                        # cancel the pending limit so a future SL re-trigger
+                        # posts a fresh one against the then-current state.
+                        self._pending_sl_exits.pop(extras_key, None)
+                        await asyncio.to_thread(
+                            self.service.journal.log_event,
+                            "paper_sl_limit_cancelled",
+                            {
+                                "strategy_id": strategy_id,
+                                "market_id": market_id,
+                                "limit_price": float(pending_sl["limit_price"]),
+                                "reason": "recovered_above_threshold",
+                            },
+                        )
+                        pending_sl = None
+                    else:
+                        pending_sl["ticks_waited"] = float(pending_sl["ticks_waited"]) + 1.0
+                        if pending_sl["ticks_waited"] >= sl_limit_ttl_ticks:
+                            # TTL expired — fall back to the legacy walk close
+                            # rather than camping under the limit while the
+                            # book continues to gap deeper.
+                            self._pending_sl_exits.pop(extras_key, None)
+                            exit_price_walk = self._paper_exit_fill(
+                                market_id, open_pos.side, float(open_pos.size_usd),
+                                entry_price, float(current_price),
+                            )
+                            await asyncio.to_thread(
+                                self.service.journal.log_event,
+                                "paper_sl_limit_expired",
+                                {
+                                    "strategy_id": strategy_id,
+                                    "market_id": market_id,
+                                    "limit_price": float(pending_sl["limit_price"]),
+                                    "fallback_exit_price": float(exit_price_walk),
+                                    "ticks_waited": float(pending_sl["ticks_waited"]),
+                                },
+                            )
+                            await self._finalize_paper_close(
+                                open_pos, exit_price_walk, "paper_stop_loss", tte_seconds, context,
+                                strategy_id=strategy_id,
+                            )
+                            return
+                        # Still pending and still in SL territory — wait.
+                        return
+                if sl_triggered and sl_limit_ttl_ticks > 0 and pending_sl is None:
+                    # First tick in SL territory (or after a cancel-then-recover
+                    # cycle) — post a fresh limit. Next tick handles the fill.
+                    slippage_ticks = int(settings.paper_sl_limit_slippage_ticks)
+                    tick_size = float(settings.execution_price_tick) or 0.01
+                    threshold_price = entry_price * (1.0 - sl_pct)
+                    limit_price = max(0.01, threshold_price - slippage_ticks * tick_size)
+                    target_shares = float(open_pos.size_usd) / max(entry_price, 1e-9)
+                    self._pending_sl_exits[extras_key] = {
+                        "limit_price": float(limit_price),
+                        "ticks_waited": 0.0,
+                        "target_shares": float(target_shares),
+                    }
+                    await asyncio.to_thread(
+                        self.service.journal.log_event,
+                        "paper_sl_limit_posted",
+                        {
+                            "strategy_id": strategy_id,
+                            "market_id": market_id,
+                            "side": open_pos.side.value,
+                            "entry_price": float(entry_price),
+                            "threshold_price": float(threshold_price),
+                            "limit_price": float(limit_price),
+                            "ttl_ticks": sl_limit_ttl_ticks,
+                            "slippage_ticks": slippage_ticks,
+                        },
+                    )
+                    return
                 close_reason: str | None = None
                 if tp_pct > 0.0 and not ladder_has_fired and pnl_pct >= tp_pct:
                     close_reason = "paper_take_profit"
-                elif sl_pct > 0.0 and pnl_pct <= -sl_pct:
+                elif sl_triggered:
                     close_reason = "paper_stop_loss"
                 if close_reason is not None:
                     exit_price_walk = self._paper_exit_fill(
@@ -1071,6 +1192,7 @@ class DaemonRunner:
             return  # Do not open a duplicate while a position is live.
         # Clean up extras if no open position exists (e.g., previous TTE close).
         self._position_extras.pop(extras_key, None)
+        self._pending_sl_exits.pop(extras_key, None)
 
         # Follow-with-maker branch: the adaptive scorer signals a follow
         # via raw_model_output. Route to the paper-maker lifecycle and
@@ -1246,6 +1368,7 @@ class DaemonRunner:
         )
         extras_key = (strategy_id, market_id)
         self._position_extras.pop(extras_key, None)
+        self._pending_sl_exits.pop(extras_key, None)
         self._last_close_at[extras_key] = _utc_now()
         # Backfill the close payload from the most recent scorer output for
         # this (strategy, market). Orphan closes don't re-score, but skipping
@@ -1317,6 +1440,7 @@ class DaemonRunner:
         )
         extras_key = (strategy_id, market_id)
         self._position_extras.pop(extras_key, None)
+        self._pending_sl_exits.pop(extras_key, None)
         self._last_close_at[extras_key] = _utc_now()
         entry_price = float(open_pos.entry_price)
         size_usd = float(open_pos.size_usd)
@@ -1781,6 +1905,46 @@ class DaemonRunner:
         # book-walked price so the two settings compose (walk captures spread,
         # slippage captures latency / size-beyond-book).
         return self.service.portfolio.apply_exit_slippage(vwap)
+
+    def _paper_limit_exit_fill(
+        self,
+        market_id: str,
+        side: "SuggestedSide",
+        target_shares: float,
+        limit_price: float,
+    ) -> float | None:
+        """Try to fully exit ``target_shares`` at-or-better than ``limit_price``.
+
+        Walks the bid book taking only levels priced ≥ ``limit_price`` (since
+        bids descend from best to worst, we ``break`` the moment we cross the
+        limit). Returns the slippage-adjusted VWAP if the limit can absorb the
+        full size; ``None`` if the qualifying liquidity is short — caller
+        keeps the order pending and re-checks next tick.
+        """
+        state = self._market_states.get(market_id)
+        if state is None:
+            return None
+        book = state.yes_book if side == SuggestedSide.YES else state.no_book
+        levels = list(book.bids.sorted_levels())
+        if not levels:
+            return None
+        remaining = target_shares
+        notional = 0.0
+        filled = 0.0
+        for price, avail in levels:
+            if price < limit_price:
+                break
+            if remaining <= 0.0 or avail <= 0.0:
+                continue
+            take = min(remaining, avail)
+            notional += price * take
+            filled += take
+            remaining -= take
+            if remaining <= 1e-9:
+                break
+        if remaining > 1e-9 or filled <= 0.0:
+            return None
+        return self.service.portfolio.apply_exit_slippage(notional / filled)
 
     # --- Heartbeat + maintenance --------------------------------------
 
