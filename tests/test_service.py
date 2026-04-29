@@ -282,7 +282,11 @@ def test_agent_service_get_active_market_id(settings, market_candidate) -> None:
     assert service.get_active_market_id() == market_candidate.market_id
 
 
-def test_agent_service_safety_stop_reason(settings) -> None:
+def test_agent_service_safety_stop_does_not_halt_on_global_daily_loss(settings) -> None:
+    """Daily-loss enforcement moved to RiskEngine (per-strategy) on 2026-04-29 —
+    the daemon-wide safety_stop_reason no longer fires on aggregated PnL,
+    so a single losing strategy can't freeze every other strategy.
+    """
     service = AgentService(settings)
     account_state = AccountState(
         mode=ExecutionMode.PAPER,
@@ -291,7 +295,20 @@ def test_agent_service_safety_stop_reason(settings) -> None:
         daily_realized_pnl=-settings.max_daily_loss_usd,
         rejected_orders=0,
     )
-    assert service.safety_stop_reason(account_state) == "daily_loss_limit"
+    assert service.safety_stop_reason(account_state) is None
+
+
+def test_agent_service_safety_stop_still_fires_on_rejected_orders(settings) -> None:
+    """Other daemon-wide kill-switch reasons (operational) still apply."""
+    service = AgentService(settings)
+    account_state = AccountState(
+        mode=ExecutionMode.PAPER,
+        available_usd=100.0,
+        open_positions=0,
+        daily_realized_pnl=0.0,
+        rejected_orders=settings.max_rejected_orders,
+    )
+    assert service.safety_stop_reason(account_state) == "rejected_order_limit"
 
 
 def test_agent_service_status_reports_auth_probe(settings) -> None:

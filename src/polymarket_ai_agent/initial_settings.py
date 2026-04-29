@@ -36,7 +36,7 @@ INITIAL_SETTINGS_BASELINE: dict[str, Any] = {
     "min_depth_usd": 200.0,
     "exit_buffer_seconds": 5,
     "exit_buffer_pct_of_tte": 0.0,
-    "max_daily_loss_usd": 20.0,
+    "max_daily_loss_usd": 50.0,
     "max_consecutive_losses": 0,
     "max_rejected_orders": 3,
     "max_net_btc_exposure_usd": 50.0,

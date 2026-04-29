@@ -124,6 +124,12 @@ class Settings(BaseSettings):
     min_depth_usd: float = 200.0
     exit_buffer_seconds: int = 5
     exit_buffer_pct_of_tte: float = 0.0
+    # Per-strategy daily-loss budget. RiskEngine rejects new entries with
+    # ``daily_loss_limit`` once a strategy's own ``daily_realized_pnl``
+    # falls below ``-max_daily_loss_usd``. Halts entries on that strategy
+    # only — other strategies keep trading and existing positions still
+    # get managed (SL/TP/trail) regardless. Was a daemon-wide kill-switch
+    # before 2026-04-29.
     max_daily_loss_usd: float = 25.0
     stale_data_seconds: int = 30
     max_rejected_orders: int = 3

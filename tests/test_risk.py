@@ -231,3 +231,26 @@ def test_risk_entry_price_gates_skip_when_ask_zero() -> None:
     risk = engine.evaluate(build_snapshot(), no_assessment, state)
     assert "min_entry_price" not in risk.rejected_by
     assert "max_entry_price" not in risk.rejected_by
+
+
+def test_risk_rejects_when_per_strategy_daily_pnl_below_limit() -> None:
+    """RiskEngine enforces ``max_daily_loss_usd`` per-strategy via the
+    strategy-scoped ``account_state.daily_realized_pnl``. The caller passes
+    the per-strategy account state; one strategy hitting its budget does
+    NOT block another strategy that's still in the green.
+    """
+    settings = Settings(max_daily_loss_usd=50.0, max_spread=0.05)
+    engine = RiskEngine(settings)
+    losing = AccountState(
+        mode=ExecutionMode.PAPER, available_usd=100.0, open_positions=0,
+        daily_realized_pnl=-50.0,  # at the limit
+    )
+    risk = engine.evaluate(build_snapshot(), build_assessment(), losing)
+    assert "daily_loss_limit" in risk.rejected_by
+
+    healthy = AccountState(
+        mode=ExecutionMode.PAPER, available_usd=100.0, open_positions=0,
+        daily_realized_pnl=-10.0,  # well under
+    )
+    risk = engine.evaluate(build_snapshot(), build_assessment(), healthy)
+    assert "daily_loss_limit" not in risk.rejected_by

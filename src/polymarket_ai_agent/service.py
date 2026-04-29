@@ -771,14 +771,16 @@ class AgentService:
     ) -> str | None:
         """Return a non-null reason if the daemon should halt trading.
 
-        The two base checks (daily loss / rejected orders) run unconditionally.
+        Daemon-wide kill-switch reasons only — these halt EVERY strategy.
+        ``daily_loss_limit`` is now enforced per-strategy by RiskEngine
+        (uses the strategy-scoped ``account_state.daily_realized_pnl``),
+        so a single losing scorer no longer freezes the whole daemon.
+
         The optional keyword args let callers layer in operational signals
         they already have — e.g. the daemon passes its heartbeat age so the
         API / CLI can share the same determination.
         """
         state = account_state or self.portfolio.get_account_state(ExecutionMode(self.settings.trading_mode))
-        if state.daily_realized_pnl <= -self.settings.max_daily_loss_usd:
-            return "daily_loss_limit"
         if state.rejected_orders >= self.settings.max_rejected_orders:
             return "rejected_order_limit"
         max_streak = int(self.settings.max_consecutive_losses)
