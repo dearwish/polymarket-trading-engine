@@ -1860,6 +1860,117 @@ def test_fade_and_adaptive_v2_maker_orders_are_independent(tmp_path: Path) -> No
     assert service.portfolio.list_open_positions() == []
 
 
+def test_follow_maker_blocked_by_thin_exit_book(tmp_path: Path) -> None:
+    """Pre-trade exit-depth gate must reject placements when the bid book
+    on the exit side has less than ``size × multiplier`` of dollar depth.
+    Filters the doomed setups where SL would expire to a deep fallback.
+    """
+    from polymarket_ai_agent.engine.market_state import MarketState
+    settings = _follow_settings(tmp_path).model_copy(update={
+        "min_exit_depth_multiplier": 2.0,
+        "max_position_usd": 2.0,
+    })
+    service = AgentService(settings)
+    candidate = _candidate("m-thin", "yes-tok", "no-tok")
+    runner = DaemonRunner(
+        settings=settings, service=service,
+        config=DaemonConfig(market_family=settings.market_family),
+        market_stream_factory=lambda url: FakeMarketStream([]),  # type: ignore[arg-type]
+        btc_feed_factory=lambda: FakeBtcFeed([]),  # type: ignore[arg-type]
+    )
+    state = MarketState(market_id=candidate.market_id, yes_token_id="yes-tok", no_token_id="no-tok")
+    runner._market_states[candidate.market_id] = state
+    runner._candidates[candidate.market_id] = candidate
+    # YES bids deliberately too thin: 1 share @ 0.66 = $0.66 dollar depth.
+    # Required: size_usd ($2) × multiplier (2.0) = $4.00 → gate must fire.
+    state.apply_book_snapshot({
+        "asset_id": "yes-tok",
+        "bids": [{"price": "0.66", "size": "1"}],
+        "asks": [{"price": "0.68", "size": "500"}],
+    })
+    ctx = _context_for_follow(state, candidate, _follow_packet(candidate.market_id))
+
+    asyncio.run(runner._paper_execute_for_strategy(ctx, "adaptive"))
+
+    assert ("adaptive", candidate.market_id) not in runner._pending_makers
+
+
+def test_follow_maker_passes_thick_exit_book(tmp_path: Path) -> None:
+    """A healthy book (depth × multiplier covered) does NOT trip the gate.
+    Sanity check that the gate is calibrated, not blanket-blocking.
+    """
+    from polymarket_ai_agent.engine.market_state import MarketState
+    settings = _follow_settings(tmp_path).model_copy(update={
+        "min_exit_depth_multiplier": 2.0,
+        "max_position_usd": 2.0,
+    })
+    service = AgentService(settings)
+    candidate = _candidate("m-thick", "yes-tok", "no-tok")
+    runner = DaemonRunner(
+        settings=settings, service=service,
+        config=DaemonConfig(market_family=settings.market_family),
+        market_stream_factory=lambda url: FakeMarketStream([]),  # type: ignore[arg-type]
+        btc_feed_factory=lambda: FakeBtcFeed([]),  # type: ignore[arg-type]
+    )
+    state = MarketState(market_id=candidate.market_id, yes_token_id="yes-tok", no_token_id="no-tok")
+    runner._market_states[candidate.market_id] = state
+    runner._candidates[candidate.market_id] = candidate
+    # 500 shares × 0.66 = $330 dollar depth, comfortably ≥ $4 required.
+    _apply_book(state, bid_yes=0.66, ask_yes=0.68)
+    ctx = _context_for_follow(state, candidate, _follow_packet(candidate.market_id))
+
+    asyncio.run(runner._paper_execute_for_strategy(ctx, "adaptive"))
+
+    assert ("adaptive", candidate.market_id) in runner._pending_makers
+
+
+def test_adaptive_v2_uses_per_strategy_stop_loss_override(tmp_path) -> None:
+    """``adaptive_v2_stop_loss_pct = 0.10`` overrides the global 0.20
+    for adaptive_v2 positions only. Reproduces the SL fix where
+    adaptive_v2 fires earlier so its limit-out catches still-populated
+    bids before the book vacates.
+    """
+    runner, service, candidate, approved, btc = _setup_runner_with_open_yes_position(
+        tmp_path, entry_price=0.50, settings_overrides={
+            "paper_stop_loss_pct": 0.20,
+            "adaptive_v2_stop_loss_pct": 0.10,
+            "paper_sl_limit_ttl_ticks": 0,  # legacy walk for simpler test
+        },
+    )
+    # Re-stamp the open position as adaptive_v2 so the per-tick branch
+    # evaluates the override. Mirror the in-memory bookkeeping so the
+    # next ``_paper_execute_for_strategy("adaptive_v2", ...)`` finds it.
+    import sqlite3
+    conn = sqlite3.connect(runner.config.market_family and service.settings.runtime_settings_path.parent / "agent.db" or "data/agent.db")
+    conn.execute("UPDATE positions SET strategy_id='adaptive_v2' WHERE market_id=? AND status='OPEN'", (candidate.market_id,))
+    conn.commit()
+    conn.close()
+    runner._position_extras.pop(("fade", candidate.market_id), None)
+
+    from polymarket_ai_agent.apps.daemon.run import DecisionContext
+    from polymarket_ai_agent.engine.market_state import MarketState
+    # Drop bid to 0.45 — pnl_pct ≈ -12%. Under global SL (-20%) the position
+    # would HOLD. Under adaptive_v2 override (-10%) the SL fires.
+    state = MarketState(market_id=candidate.market_id, yes_token_id="yes-tok", no_token_id="no-tok")
+    state.apply_book_snapshot({
+        "asset_id": "yes-tok",
+        "bids": [{"price": "0.45", "size": "500"}],
+        "asks": [{"price": "0.47", "size": "500"}],
+    })
+    runner._market_states[candidate.market_id] = state
+    ctx = DecisionContext(
+        market_id=candidate.market_id, candidate=candidate,
+        features=state.features(), btc_snapshot=btc, assessment=approved,
+        metrics=runner.metrics,
+    )
+    asyncio.run(runner._paper_execute_for_strategy(ctx, "adaptive_v2"))
+    open_after = [
+        p for p in service.portfolio.list_open_positions()
+        if p.market_id == candidate.market_id
+    ]
+    assert open_after == [], "override should fire SL at -12% (over adaptive_v2's 10%)"
+
+
 def test_follow_maker_blocked_by_min_entry_price_gate(tmp_path: Path) -> None:
     """The maker-follow path must respect ``quant_min_entry_price`` — used
     to bypass it, allowing falling-knife re-entries on crashing markets.

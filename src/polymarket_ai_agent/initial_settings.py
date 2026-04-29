@@ -50,6 +50,7 @@ INITIAL_SETTINGS_BASELINE: dict[str, Any] = {
     "paper_trail_confirmation_ticks": 3,
     "paper_sl_limit_ttl_ticks": 3,
     "paper_sl_limit_slippage_ticks": 2,
+    "min_exit_depth_multiplier": 2.0,
     "paper_tp_ladder": "0.20:0.25,0.40:0.25,0.60:0.25",
     "paper_entry_cooldown_seconds": 120,
     "position_force_exit_tte_seconds": 45,
@@ -107,6 +108,7 @@ INITIAL_SETTINGS_BASELINE: dict[str, Any] = {
     "adaptive_v2_min_seconds_to_expiry": 60,
     "adaptive_v2_max_abs_edge": 0.30,
     "adaptive_v2_post_only": True,
+    "adaptive_v2_stop_loss_pct": 0.10,
     "fee_bps": 0.0,
     # --- Quant scorer gates ---
     "quant_invert_drift": False,

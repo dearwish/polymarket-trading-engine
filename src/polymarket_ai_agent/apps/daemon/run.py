@@ -1040,7 +1040,15 @@ class DaemonRunner:
                 # no ladder configured, or ladder hasn't hit its first threshold
                 # yet). Stop-loss still applies unconditionally as a safety floor.
                 tp_pct = float(settings.paper_take_profit_pct)
+                # Per-strategy SL override: adaptive_v2 fires earlier than
+                # the global threshold because its setups (overreaction
+                # fades) collapse the bid book during fast moves; tighter
+                # SL keeps the limit-out filling instead of expiring.
                 sl_pct = float(settings.paper_stop_loss_pct)
+                if strategy_id == "adaptive_v2":
+                    override = float(settings.adaptive_v2_stop_loss_pct)
+                    if override > 0.0:
+                        sl_pct = override
                 ladder_has_fired = int(extras["tranches_closed"]) > 0
                 sl_triggered = sl_pct > 0.0 and pnl_pct <= -sl_pct
                 # SL limit-out path. Posts a passive limit at threshold price
@@ -1709,6 +1717,16 @@ class DaemonRunner:
                 max_entry_price = float(settings.quant_max_entry_price)
                 if max_entry_price > 0.0 and ask_our_side > max_entry_price:
                     gate_block = "max_entry_price"
+        if gate_block is None:
+            depth_mult = float(settings.min_exit_depth_multiplier)
+            if depth_mult > 0.0:
+                exit_depth = self._exit_side_bid_depth_usd(
+                    market_id, assessment.suggested_side
+                )
+                # Fail open when state is unavailable (None); only block when
+                # we can actually measure the depth and it's insufficient.
+                if exit_depth is not None and exit_depth < size_usd * depth_mult:
+                    gate_block = "exit_depth"
         if gate_block is not None:
             if pending is not None:
                 # Cancel — we'd otherwise leave a stale quote that could
@@ -1955,6 +1973,31 @@ class DaemonRunner:
         # book-walked price so the two settings compose (walk captures spread,
         # slippage captures latency / size-beyond-book).
         return self.service.portfolio.apply_exit_slippage(vwap)
+
+    def _exit_side_bid_depth_usd(
+        self,
+        market_id: str,
+        side: "SuggestedSide",
+        levels: int = 5,
+    ) -> float | None:
+        """Top-N bid-side dollar depth for the side a position would exit on.
+
+        For a YES position the exit walks ``yes_book.bids``; for NO it walks
+        ``no_book.bids``. Returns the sum of ``price × shares`` across the
+        first ``levels`` bid levels — a coarse "can the book absorb me at
+        these prices?" check used by the entry gate to filter setups where
+        the SL limit-out would inevitably expire into a deep walk fallback.
+
+        ``None`` if the market state is unavailable so callers can fail open.
+        """
+        state = self._market_states.get(market_id)
+        if state is None:
+            return None
+        book = state.yes_book if side == SuggestedSide.YES else state.no_book
+        return sum(
+            float(price) * float(size)
+            for price, size in list(book.bids.sorted_levels()[:levels])
+        )
 
     def _paper_limit_exit_fill(
         self,

@@ -75,6 +75,13 @@ class Settings(BaseSettings):
     # full-book walk (accepting the gap). 0 = disabled (legacy walk-immediate).
     paper_sl_limit_ttl_ticks: int = 0
     paper_sl_limit_slippage_ticks: int = 1
+    # Pre-trade exit-depth gate. Block new entries (maker AND taker paths)
+    # when the bid book on the exit side has less than
+    # ``size_usd × min_exit_depth_multiplier`` of dollar-depth across the
+    # top 5 levels. Catches the doomed setups where SL would inevitably
+    # expire to a deep walk fallback because there's no liquidity to
+    # absorb our position near the threshold. 0.0 = disabled.
+    min_exit_depth_multiplier: float = 0.0
     # Entry cooldown: after any close on a market, block new entries on the
     # same market for this many seconds. Prevents immediate re-entry whipsaw
     # where the scorer flips sides and each flip gets stopped out. 0 disables.
@@ -218,6 +225,13 @@ class Settings(BaseSettings):
     # / trail / SL-limit-out logic is already shared with fade via the
     # standard exit pipeline so no separate knobs are needed for those.
     adaptive_v2_post_only: bool = False
+    # Per-strategy stop-loss override for adaptive_v2. When > 0, replaces
+    # ``paper_stop_loss_pct`` for adaptive_v2 positions only — fade keeps
+    # the global value. Adaptive_v2 fights fast moves, so its SL needs to
+    # fire earlier (while bids are still populated near the threshold) to
+    # let the limit-out path actually fill instead of expiring into a deep
+    # walk fallback. 0 = use global ``paper_stop_loss_pct``.
+    adaptive_v2_stop_loss_pct: float = 0.0
 
     fee_bps: float = 0.0
     execution_maker_min_edge: float = 0.04
@@ -560,6 +574,14 @@ EDITABLE_SETTINGS_METADATA: dict[str, dict[str, Any]] = {
         "type": "boolean",
         "group": "paper",
     },
+    "adaptive_v2_stop_loss_pct": {
+        "label": "Adaptive V2 Stop Loss % (overrides global)",
+        "type": "number",
+        "min": 0,
+        "max": 1,
+        "step": 0.01,
+        "group": "paper",
+    },
     "paper_take_profit_pct": {
         "label": "Paper Take Profit %",
         "type": "number",
@@ -620,6 +642,14 @@ EDITABLE_SETTINGS_METADATA: dict[str, dict[str, Any]] = {
         "max": 10,
         "step": 1,
         "group": "paper",
+    },
+    "min_exit_depth_multiplier": {
+        "label": "Min Exit-Side Bid Depth (× position size)",
+        "type": "number",
+        "min": 0,
+        "max": 50,
+        "step": 0.1,
+        "group": "thresholds",
     },
     "paper_entry_cooldown_seconds": {
         "label": "Paper Entry Cooldown Seconds",
