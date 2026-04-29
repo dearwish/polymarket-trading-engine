@@ -122,7 +122,7 @@ INITIAL_SETTINGS_BASELINE: dict[str, Any] = {
     "quant_min_entry_price": 0.32,
     "quant_max_entry_price": 0.50,
     "quant_ofi_gate_enabled": True,
-    "quant_ofi_gate_min_abs_flow": 60.0,
+    "quant_ofi_gate_min_abs_flow": 25.0,
     "quant_vol_regime_enabled": True,
     "quant_vol_regime_high_threshold": 0.005,
     "quant_vol_regime_extreme_threshold": 0.008,

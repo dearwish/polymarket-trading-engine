@@ -286,3 +286,68 @@ def test_post_only_default_false_preserves_legacy_taker_tag() -> None:
     result = scorer.score_market(packet)
     assert result.suggested_side == SuggestedSide.NO
     assert result.raw_model_output == OVERREACTION_TAG
+
+
+def test_ofi_gate_blocks_when_flow_opposes_side() -> None:
+    """Strong informed sell-flow (negative signed_flow_5s) opposes a YES
+    bet — gate must abstain. Mirrors QuantScoringEngine's OFI logic so
+    both scorers respect the same adverse-selection floor.
+    """
+    scorer = OverreactionScorer(
+        overreaction_threshold=0.02, sensitivity=10.0,
+        ofi_gate_enabled=True, ofi_gate_min_abs_flow=25.0,
+    )
+    # Mid dropped −4% with BTC flat → bet YES (expect bounce).
+    # But flow=−50 (heavy selling) opposes YES → abstain.
+    packet = _packet(
+        recent_price_change_bps=-400.0, btc_log_return_5m=0.0,
+        signed_flow_5s=-50.0,
+    )
+    result = scorer.score_market(packet)
+    assert result.suggested_side == SuggestedSide.ABSTAIN
+    assert any("OFI gate" in r for r in result.reasons_to_abstain)
+
+
+def test_ofi_gate_allows_flow_aligned_with_side() -> None:
+    """Flow matching our side direction is NOT blocked — the gate only
+    fires when flow OPPOSES our trade.
+    """
+    scorer = OverreactionScorer(
+        overreaction_threshold=0.02, sensitivity=10.0,
+        ofi_gate_enabled=True, ofi_gate_min_abs_flow=25.0,
+    )
+    # Mid dropped → bet YES; flow=+50 (buying) aligns with YES → allow.
+    packet = _packet(
+        recent_price_change_bps=-400.0, btc_log_return_5m=0.0,
+        signed_flow_5s=50.0,
+    )
+    result = scorer.score_market(packet)
+    assert result.suggested_side == SuggestedSide.YES
+    assert not any("OFI gate" in r for r in result.reasons_to_abstain)
+
+
+def test_ofi_gate_passes_when_flow_below_threshold() -> None:
+    """Below-threshold flow is treated as noise; gate stays silent."""
+    scorer = OverreactionScorer(
+        overreaction_threshold=0.02, sensitivity=10.0,
+        ofi_gate_enabled=True, ofi_gate_min_abs_flow=25.0,
+    )
+    # Same setup but flow=−10 (under 25 threshold) → no abstain.
+    packet = _packet(
+        recent_price_change_bps=-400.0, btc_log_return_5m=0.0,
+        signed_flow_5s=-10.0,
+    )
+    result = scorer.score_market(packet)
+    assert result.suggested_side == SuggestedSide.YES
+    assert not any("OFI gate" in r for r in result.reasons_to_abstain)
+
+
+def test_ofi_gate_disabled_by_default() -> None:
+    """Default constructor has the OFI gate off — opt-in via daemon wiring."""
+    scorer = OverreactionScorer(overreaction_threshold=0.02, sensitivity=10.0)
+    packet = _packet(
+        recent_price_change_bps=-400.0, btc_log_return_5m=0.0,
+        signed_flow_5s=-100.0,
+    )
+    result = scorer.score_market(packet)
+    assert result.suggested_side == SuggestedSide.YES

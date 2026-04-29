@@ -70,6 +70,8 @@ class OverreactionScorer:
         min_seconds_to_expiry: int = 60,
         max_abs_edge: float = 0.30,
         post_only: bool = False,
+        ofi_gate_enabled: bool = False,
+        ofi_gate_min_abs_flow: float = 0.0,
     ):
         self.overreaction_threshold = overreaction_threshold
         self.sensitivity = sensitivity
@@ -84,6 +86,13 @@ class OverreactionScorer:
         # (resting limit + TTL) instead of an immediate taker fill. ABSTAIN
         # assessments are unaffected.
         self.post_only = post_only
+        # OFI gate: abstain when ``signed_flow_5s`` opposes our chosen side
+        # with magnitude ≥ ``ofi_gate_min_abs_flow``. Mirrors the gate in
+        # QuantScoringEngine — soak data showed that adverse-flow trades
+        # accounted for the bulk of losses on BOTH strategies (winners avg
+        # +0.3 flow, losers avg −50.5).
+        self.ofi_gate_enabled = ofi_gate_enabled
+        self.ofi_gate_min_abs_flow = ofi_gate_min_abs_flow
 
     def score_market(self, packet: EvidencePacket) -> MarketAssessment:
         """Return an APPROVED assessment when the packet shows a
@@ -154,6 +163,22 @@ class OverreactionScorer:
                     f"(typically a real BTC move outpacing the 30s window)."
                 ),
             )
+
+        # OFI gate: abstain when informed flow opposes our side with
+        # significant magnitude. Mirrors QuantScoringEngine's check so
+        # both scorers use the same adverse-selection floor. ``flow > 0``
+        # means net buying pressure on YES; opposes a NO bet.
+        if self.ofi_gate_enabled and self.ofi_gate_min_abs_flow > 0.0:
+            flow = float(packet.signed_flow_5s)
+            if abs(flow) >= self.ofi_gate_min_abs_flow:
+                flow_bullish = flow > 0.0
+                if (side is SuggestedSide.YES and not flow_bullish) or (
+                    side is SuggestedSide.NO and flow_bullish
+                ):
+                    return _with_reason(
+                        base,
+                        f"OFI gate: flow {flow:+.1f} opposes {side.value}.",
+                    )
 
         # Fair-probability for the SCORER's frame — the direction we're
         # fading toward. If we're buying YES because mid overshot down,

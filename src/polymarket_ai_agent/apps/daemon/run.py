@@ -317,6 +317,8 @@ class DaemonRunner:
             min_seconds_to_expiry=int(settings.adaptive_v2_min_seconds_to_expiry),
             max_abs_edge=float(settings.adaptive_v2_max_abs_edge),
             post_only=bool(settings.adaptive_v2_post_only),
+            ofi_gate_enabled=bool(settings.quant_ofi_gate_enabled),
+            ofi_gate_min_abs_flow=float(settings.quant_ofi_gate_min_abs_flow),
         )
         self._strategies: list[StrategyConfig] = [
             StrategyConfig(strategy_id=_DEFAULT_STRATEGY_ID, scorer=self.quant),
@@ -2367,6 +2369,8 @@ class DaemonRunner:
             min_seconds_to_expiry=int(new_settings.adaptive_v2_min_seconds_to_expiry),
             max_abs_edge=float(new_settings.adaptive_v2_max_abs_edge),
             post_only=bool(new_settings.adaptive_v2_post_only),
+            ofi_gate_enabled=bool(new_settings.quant_ofi_gate_enabled),
+            ofi_gate_min_abs_flow=float(new_settings.quant_ofi_gate_min_abs_flow),
         )
         # Toggle optional strategies in/out of the list in place, preserving
         # fade at index 0 so the order stays stable.
