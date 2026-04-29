@@ -133,6 +133,26 @@ class RiskEngine:
             rejected_by.append("confidence_limit")
         if abs(assessment.edge) < profile.min_edge:
             rejected_by.append("edge_limit")
+        # Strategy-agnostic entry-price gates: floor blocks distressed-low
+        # asks where bid-ask spread alone exceeds the SL width (gap-out
+        # risk); ceiling blocks mid-band entries (≥0.50) where the fade
+        # signal is weakest because price is closest to a true coin-flip.
+        # Lifted out of QuantScoringEngine so all strategies (fade,
+        # adaptive_v2, future scorers) get the same protection. Settings
+        # keep their ``quant_*`` names for migration-free continuity; a
+        # rename to strategy-agnostic ``entry_price_*`` is a follow-up.
+        ask_our_side = (
+            snapshot.orderbook.ask
+            if assessment.suggested_side is SuggestedSide.YES
+            else snapshot.orderbook.ask_no
+        )
+        if ask_our_side > 0.0:
+            min_entry_price = float(self.settings.quant_min_entry_price)
+            if min_entry_price > 0.0 and ask_our_side < min_entry_price:
+                rejected_by.append("min_entry_price")
+            max_entry_price = float(self.settings.quant_max_entry_price)
+            if max_entry_price > 0.0 and ask_our_side > max_entry_price:
+                rejected_by.append("max_entry_price")
         if account_state.available_usd < profile.max_position_usd:
             rejected_by.append("insufficient_usd")
         if account_state.open_positions >= profile.max_concurrent_positions:

@@ -133,3 +133,101 @@ def test_risk_rejects_stale_data() -> None:
     )
     assert not risk.approved
     assert "stale_data" in risk.rejected_by
+
+
+def _snapshot_with_asks(ask_yes: float, ask_no: float, **kw) -> MarketSnapshot:
+    """Variant of build_snapshot that lets a test pin both YES and NO asks
+    explicitly. Used by the entry-price-gate tests so the chosen-side ask
+    is unambiguous."""
+    snap = build_snapshot(**kw)
+    book = snap.orderbook
+    snap.orderbook = OrderBookSnapshot(
+        bid=book.bid,
+        ask=ask_yes,
+        midpoint=book.midpoint,
+        spread=book.spread,
+        depth_usd=book.depth_usd,
+        last_trade_price=book.last_trade_price,
+        two_sided=book.two_sided,
+        observed_at=book.observed_at,
+        bid_no=1.0 - ask_yes,
+        ask_no=ask_no,
+    )
+    return snap
+
+
+def test_risk_rejects_below_min_entry_price_yes_side() -> None:
+    """YES trade with ask below floor → min_entry_price reject."""
+    settings = Settings(quant_min_entry_price=0.20, max_spread=0.05)
+    engine = RiskEngine(settings)
+    state = AccountState(mode=ExecutionMode.PAPER, available_usd=100.0, open_positions=0, daily_realized_pnl=0.0)
+    snap = _snapshot_with_asks(ask_yes=0.10, ask_no=0.92)
+    risk = engine.evaluate(snap, build_assessment(), state)
+    assert not risk.approved
+    assert "min_entry_price" in risk.rejected_by
+
+
+def test_risk_rejects_below_min_entry_price_no_side() -> None:
+    """NO trade with NO-side ask below floor → min_entry_price reject."""
+    settings = Settings(quant_min_entry_price=0.20, max_spread=0.05)
+    engine = RiskEngine(settings)
+    state = AccountState(mode=ExecutionMode.PAPER, available_usd=100.0, open_positions=0, daily_realized_pnl=0.0)
+    snap = _snapshot_with_asks(ask_yes=0.92, ask_no=0.10)
+    no_assessment = MarketAssessment(
+        market_id="1", fair_probability=0.30, confidence=0.9,
+        suggested_side=SuggestedSide.NO, expiry_risk="LOW",
+        reasons_for_trade=[], reasons_to_abstain=[], edge=0.05, raw_model_output="{}",
+    )
+    risk = engine.evaluate(snap, no_assessment, state)
+    assert not risk.approved
+    assert "min_entry_price" in risk.rejected_by
+
+
+def test_risk_rejects_above_max_entry_price() -> None:
+    """Mid-band entries (ask above ceiling) → max_entry_price reject."""
+    settings = Settings(quant_max_entry_price=0.50, max_spread=0.05)
+    engine = RiskEngine(settings)
+    state = AccountState(mode=ExecutionMode.PAPER, available_usd=100.0, open_positions=0, daily_realized_pnl=0.0)
+    snap = _snapshot_with_asks(ask_yes=0.62, ask_no=0.40)
+    risk = engine.evaluate(snap, build_assessment(), state)
+    assert not risk.approved
+    assert "max_entry_price" in risk.rejected_by
+
+
+def test_risk_min_entry_price_disabled_when_zero() -> None:
+    """Floor=0 (default) → no min_entry_price reject even at distressed prices."""
+    settings = Settings(quant_min_entry_price=0.0, max_spread=0.05)
+    engine = RiskEngine(settings)
+    state = AccountState(mode=ExecutionMode.PAPER, available_usd=100.0, open_positions=0, daily_realized_pnl=0.0)
+    snap = _snapshot_with_asks(ask_yes=0.05, ask_no=0.97)
+    risk = engine.evaluate(snap, build_assessment(), state)
+    assert "min_entry_price" not in risk.rejected_by
+
+
+def test_risk_max_entry_price_disabled_when_zero() -> None:
+    """Ceiling=0 (default) → no max_entry_price reject even at high prices."""
+    settings = Settings(quant_max_entry_price=0.0, max_spread=0.05)
+    engine = RiskEngine(settings)
+    state = AccountState(mode=ExecutionMode.PAPER, available_usd=100.0, open_positions=0, daily_realized_pnl=0.0)
+    snap = _snapshot_with_asks(ask_yes=0.95, ask_no=0.07)
+    risk = engine.evaluate(snap, build_assessment(), state)
+    assert "max_entry_price" not in risk.rejected_by
+
+
+def test_risk_entry_price_gates_skip_when_ask_zero() -> None:
+    """Snapshots with default ask=0 (legacy callers / test fixtures) must
+    NOT trip either gate — the ``ask > 0`` guard short-circuits.
+    """
+    settings = Settings(quant_min_entry_price=0.32, quant_max_entry_price=0.50, max_spread=0.05)
+    engine = RiskEngine(settings)
+    state = AccountState(mode=ExecutionMode.PAPER, available_usd=100.0, open_positions=0, daily_realized_pnl=0.0)
+    no_assessment = MarketAssessment(
+        market_id="1", fair_probability=0.30, confidence=0.9,
+        suggested_side=SuggestedSide.NO, expiry_risk="LOW",
+        reasons_for_trade=[], reasons_to_abstain=[], edge=0.05, raw_model_output="{}",
+    )
+    # build_snapshot leaves ask_no=0.0 (default) — the NO trade must not be
+    # rejected by the price gates.
+    risk = engine.evaluate(build_snapshot(), no_assessment, state)
+    assert "min_entry_price" not in risk.rejected_by
+    assert "max_entry_price" not in risk.rejected_by

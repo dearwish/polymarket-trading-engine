@@ -71,6 +71,13 @@ class OrderBookSnapshot:
     bid_levels: list[tuple[float, float]] = field(default_factory=list)
     ask_levels: list[tuple[float, float]] = field(default_factory=list)
     observed_at: datetime = field(default_factory=utc_now)
+    # NO-side top-of-book quotes. Carried alongside the YES-side ``bid``/
+    # ``ask`` so strategy-agnostic gates (RiskEngine entry-price floor /
+    # ceiling) can resolve the chosen-side ask without re-deriving it from
+    # parity. Defaults to 0.0 for legacy callers; the daemon's snapshot
+    # builder populates these from per-tick features.
+    bid_no: float = 0.0
+    ask_no: float = 0.0
 
 
 @dataclass(slots=True)

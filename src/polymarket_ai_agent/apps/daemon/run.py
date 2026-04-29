@@ -1302,6 +1302,8 @@ class DaemonRunner:
             two_sided=features.two_sided,
             bid_levels=bid_levels,
             ask_levels=ask_levels,
+            bid_no=features.bid_no,
+            ask_no=features.ask_no,
         )
 
     def _hydrate_position_extras(self, open_pos) -> dict[str, float]:
