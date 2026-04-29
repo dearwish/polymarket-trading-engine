@@ -1684,6 +1684,49 @@ class DaemonRunner:
 
         size_usd = float(settings.max_position_usd)
 
+        # Entry gates for NEW maker placements. The maker-follow path used to
+        # bypass cooldown + entry-price filtering by design ("rest quietly")
+        # but soak data (29 Apr market 2104140) showed 8 consecutive fills
+        # on a crashing market in 4 min, all stopping out — the rapid-fire
+        # falling-knife pattern the cooldown was designed to prevent. Apply
+        # the same gates the RiskEngine uses on the taker path. Existing
+        # pending makers above are still managed (filled/expired/drift) so
+        # quotes posted before the gate fired can still resolve naturally.
+        ask_our_side = ask_yes if assessment.suggested_side == SuggestedSide.YES else ask_no
+        gate_block: str | None = None
+        cooldown_seconds = int(settings.paper_entry_cooldown_seconds)
+        if cooldown_seconds > 0:
+            last_close = self._last_close_at.get(key)
+            if last_close is not None:
+                elapsed = (now - last_close).total_seconds()
+                if elapsed < cooldown_seconds:
+                    gate_block = "cooldown"
+        if gate_block is None and ask_our_side > 0.0:
+            min_entry_price = float(settings.quant_min_entry_price)
+            if min_entry_price > 0.0 and ask_our_side < min_entry_price:
+                gate_block = "min_entry_price"
+            else:
+                max_entry_price = float(settings.quant_max_entry_price)
+                if max_entry_price > 0.0 and ask_our_side > max_entry_price:
+                    gate_block = "max_entry_price"
+        if gate_block is not None:
+            if pending is not None:
+                # Cancel — we'd otherwise leave a stale quote that could
+                # fill in an entry the gate just rejected.
+                self._pending_makers.pop(key, None)
+                await asyncio.to_thread(
+                    self.service.journal.log_event,
+                    "paper_maker_cancelled",
+                    {
+                        "market_id": market_id,
+                        "strategy_id": strategy_id,
+                        "side": pending.side.value,
+                        "limit_price": pending.limit_price,
+                        "reason": gate_block,
+                    },
+                )
+            return
+
         if pending is not None and not self._maker_drift_exceeds_threshold(
             pending,
             desired_price=limit_price,

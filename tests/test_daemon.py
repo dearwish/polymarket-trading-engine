@@ -1860,6 +1860,95 @@ def test_fade_and_adaptive_v2_maker_orders_are_independent(tmp_path: Path) -> No
     assert service.portfolio.list_open_positions() == []
 
 
+def test_follow_maker_blocked_by_min_entry_price_gate(tmp_path: Path) -> None:
+    """The maker-follow path must respect ``quant_min_entry_price`` — used
+    to bypass it, allowing falling-knife re-entries on crashing markets.
+    """
+    from polymarket_ai_agent.engine.market_state import MarketState
+    settings = _follow_settings(tmp_path).model_copy(update={
+        "quant_min_entry_price": 0.40,
+    })
+    service = AgentService(settings)
+    candidate = _candidate("m-follow-low", "yes-tok", "no-tok")
+    runner = DaemonRunner(
+        settings=settings, service=service,
+        config=DaemonConfig(market_family=settings.market_family),
+        market_stream_factory=lambda url: FakeMarketStream([]),  # type: ignore[arg-type]
+        btc_feed_factory=lambda: FakeBtcFeed([]),  # type: ignore[arg-type]
+    )
+    state = MarketState(market_id=candidate.market_id, yes_token_id="yes-tok", no_token_id="no-tok")
+    runner._market_states[candidate.market_id] = state
+    runner._candidates[candidate.market_id] = candidate
+    # ASK_YES = 0.20 < 0.40 floor → gate must block placement.
+    _apply_book(state, bid_yes=0.18, ask_yes=0.20)
+    ctx = _context_for_follow(state, candidate, _follow_packet(candidate.market_id, bid_yes=0.18, ask_yes=0.20))
+
+    asyncio.run(runner._paper_execute_for_strategy(ctx, "adaptive"))
+
+    key = ("adaptive", candidate.market_id)
+    assert key not in runner._pending_makers
+    assert service.portfolio.list_open_positions() == []
+
+
+def test_follow_maker_blocked_by_max_entry_price_gate(tmp_path: Path) -> None:
+    """Maker placements must also respect ``quant_max_entry_price`` so the
+    mid-band veto applies symmetrically to fade and adaptive_v2 maker entries.
+    """
+    from polymarket_ai_agent.engine.market_state import MarketState
+    settings = _follow_settings(tmp_path).model_copy(update={
+        "quant_max_entry_price": 0.50,
+    })
+    service = AgentService(settings)
+    candidate = _candidate("m-follow-high", "yes-tok", "no-tok")
+    runner = DaemonRunner(
+        settings=settings, service=service,
+        config=DaemonConfig(market_family=settings.market_family),
+        market_stream_factory=lambda url: FakeMarketStream([]),  # type: ignore[arg-type]
+        btc_feed_factory=lambda: FakeBtcFeed([]),  # type: ignore[arg-type]
+    )
+    state = MarketState(market_id=candidate.market_id, yes_token_id="yes-tok", no_token_id="no-tok")
+    runner._market_states[candidate.market_id] = state
+    runner._candidates[candidate.market_id] = candidate
+    # ASK_YES = 0.68 > 0.50 ceiling → gate must block.
+    _apply_book(state, bid_yes=0.66, ask_yes=0.68)
+    ctx = _context_for_follow(state, candidate, _follow_packet(candidate.market_id))
+
+    asyncio.run(runner._paper_execute_for_strategy(ctx, "adaptive"))
+
+    key = ("adaptive", candidate.market_id)
+    assert key not in runner._pending_makers
+
+
+def test_follow_maker_blocked_by_cooldown_after_recent_close(tmp_path: Path) -> None:
+    """A close within the cooldown window must prevent a fresh maker
+    placement on the same (strategy, market). Reproduces the falling-knife
+    re-entry pattern observed on 29 Apr market 2104140.
+    """
+    from polymarket_ai_agent.engine.market_state import MarketState
+    settings = _follow_settings(tmp_path).model_copy(update={
+        "paper_entry_cooldown_seconds": 60,
+    })
+    service = AgentService(settings)
+    candidate = _candidate("m-follow-cool", "yes-tok", "no-tok")
+    runner = DaemonRunner(
+        settings=settings, service=service,
+        config=DaemonConfig(market_family=settings.market_family),
+        market_stream_factory=lambda url: FakeMarketStream([]),  # type: ignore[arg-type]
+        btc_feed_factory=lambda: FakeBtcFeed([]),  # type: ignore[arg-type]
+    )
+    state = MarketState(market_id=candidate.market_id, yes_token_id="yes-tok", no_token_id="no-tok")
+    runner._market_states[candidate.market_id] = state
+    runner._candidates[candidate.market_id] = candidate
+    _apply_book(state, bid_yes=0.66, ask_yes=0.68)
+    # Pretend a close just happened on this (strategy, market).
+    runner._last_close_at[("adaptive", candidate.market_id)] = datetime.now(timezone.utc)
+    ctx = _context_for_follow(state, candidate, _follow_packet(candidate.market_id))
+
+    asyncio.run(runner._paper_execute_for_strategy(ctx, "adaptive"))
+
+    assert ("adaptive", candidate.market_id) not in runner._pending_makers
+
+
 def test_follow_maker_placed_on_first_tick(tmp_path: Path) -> None:
     """First tick of a trending regime with no existing maker → daemon
     parks a new paper-maker at the discounted mid. No position opens.
