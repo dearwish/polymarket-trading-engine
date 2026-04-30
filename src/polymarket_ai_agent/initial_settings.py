@@ -44,11 +44,11 @@ INITIAL_SETTINGS_BASELINE: dict[str, Any] = {
     "min_entry_tte_seconds": 90,
     # --- Paper exit ladder ---
     "paper_take_profit_pct": 0.0,
-    "paper_stop_loss_pct": 0.20,
+    "paper_stop_loss_pct": 0.15,
     "paper_trailing_stop_pct": 0.15,
     "paper_trail_arm_pct": 0.12,
     "paper_trail_confirmation_ticks": 3,
-    "paper_sl_limit_ttl_ticks": 3,
+    "paper_sl_limit_ttl_ticks": 5,
     "paper_sl_limit_slippage_ticks": 2,
     "min_exit_depth_multiplier": 2.0,
     "paper_tp_ladder": "0.20:0.25,0.40:0.25,0.60:0.25",
