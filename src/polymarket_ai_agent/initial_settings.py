@@ -111,7 +111,7 @@ INITIAL_SETTINGS_BASELINE: dict[str, Any] = {
     "adaptive_v2_stop_loss_pct": 0.10,
     "fee_bps": 0.0,
     # --- Quant scorer gates ---
-    "quant_invert_drift": False,
+    "quant_invert_drift": True,
     "quant_drift_damping": 0.5,
     "quant_max_abs_edge": 0.25,
     "quant_trend_filter_enabled": True,
