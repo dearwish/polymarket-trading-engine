@@ -72,6 +72,7 @@ class OverreactionScorer:
         post_only: bool = False,
         ofi_gate_enabled: bool = False,
         ofi_gate_min_abs_flow: float = 0.0,
+        invert: bool = False,
     ):
         self.overreaction_threshold = overreaction_threshold
         self.sensitivity = sensitivity
@@ -93,6 +94,13 @@ class OverreactionScorer:
         # +0.3 flow, losers avg −50.5).
         self.ofi_gate_enabled = ofi_gate_enabled
         self.ofi_gate_min_abs_flow = ofi_gate_min_abs_flow
+        # When True, swap the side direction: mid overshot UP → bet YES
+        # (continuation) instead of NO (reversion). Mirrors the
+        # ``quant_invert_drift`` flip on QuantScoringEngine — same
+        # rationale: short-horizon BTC binary moves continue more often
+        # than they revert, so the original mean-reversion thesis was the
+        # wrong sign of the signal.
+        self.invert = invert
 
     def score_market(self, packet: EvidencePacket) -> MarketAssessment:
         """Return an APPROVED assessment when the packet shows a
@@ -138,12 +146,14 @@ class OverreactionScorer:
                 ),
             )
 
-        # Fade the direction of the excess: mid overshot upward → NO;
-        # overshot downward → YES.
-        if overreaction > 0:
-            side = SuggestedSide.NO
+        # Direction selection. When inverted (continuation thesis): mid
+        # overshot upward → bet YES (continues up). Default (reversion):
+        # mid overshot upward → bet NO (pulls back).
+        overshot_up = overreaction > 0
+        if self.invert:
+            side = SuggestedSide.YES if overshot_up else SuggestedSide.NO
         else:
-            side = SuggestedSide.YES
+            side = SuggestedSide.NO if overshot_up else SuggestedSide.YES
 
         edge = abs(overreaction) - self.cost_floor
         if edge <= 0.0:

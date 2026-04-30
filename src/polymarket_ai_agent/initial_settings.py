@@ -109,6 +109,7 @@ INITIAL_SETTINGS_BASELINE: dict[str, Any] = {
     "adaptive_v2_max_abs_edge": 0.30,
     "adaptive_v2_post_only": True,
     "adaptive_v2_stop_loss_pct": 0.10,
+    "adaptive_v2_invert": True,
     "fee_bps": 0.0,
     # --- Quant scorer gates ---
     "quant_invert_drift": True,

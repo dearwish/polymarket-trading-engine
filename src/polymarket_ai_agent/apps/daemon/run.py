@@ -319,6 +319,7 @@ class DaemonRunner:
             post_only=bool(settings.adaptive_v2_post_only),
             ofi_gate_enabled=bool(settings.quant_ofi_gate_enabled),
             ofi_gate_min_abs_flow=float(settings.quant_ofi_gate_min_abs_flow),
+            invert=bool(settings.adaptive_v2_invert),
         )
         self._strategies: list[StrategyConfig] = [
             StrategyConfig(strategy_id=_DEFAULT_STRATEGY_ID, scorer=self.quant),
@@ -2371,6 +2372,7 @@ class DaemonRunner:
             post_only=bool(new_settings.adaptive_v2_post_only),
             ofi_gate_enabled=bool(new_settings.quant_ofi_gate_enabled),
             ofi_gate_min_abs_flow=float(new_settings.quant_ofi_gate_min_abs_flow),
+            invert=bool(new_settings.adaptive_v2_invert),
         )
         # Toggle optional strategies in/out of the list in place, preserving
         # fade at index 0 so the order stays stable.

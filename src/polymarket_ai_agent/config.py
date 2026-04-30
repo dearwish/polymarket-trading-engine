@@ -232,6 +232,12 @@ class Settings(BaseSettings):
     # let the limit-out path actually fill instead of expiring into a deep
     # walk fallback. 0 = use global ``paper_stop_loss_pct``.
     adaptive_v2_stop_loss_pct: float = 0.0
+    # Direction-flip for the OverreactionScorer. Mirrors
+    # ``quant_invert_drift`` on the fade scorer: when True the scorer bets
+    # CONTINUATION instead of reversion (mid overshot up → bet YES). The
+    # same short-horizon momentum thesis that flipped fade from −16% ROI
+    # to break-even should apply here too.
+    adaptive_v2_invert: bool = False
 
     fee_bps: float = 0.0
     execution_maker_min_edge: float = 0.04
@@ -581,6 +587,11 @@ EDITABLE_SETTINGS_METADATA: dict[str, dict[str, Any]] = {
         "max": 1,
         "step": 0.01,
         "group": "paper",
+    },
+    "adaptive_v2_invert": {
+        "label": "Adaptive V2 Invert (continuation instead of reversion)",
+        "type": "boolean",
+        "group": "thresholds",
     },
     "paper_take_profit_pct": {
         "label": "Paper Take Profit %",

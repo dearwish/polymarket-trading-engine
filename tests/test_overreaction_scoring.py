@@ -351,3 +351,62 @@ def test_ofi_gate_disabled_by_default() -> None:
     )
     result = scorer.score_market(packet)
     assert result.suggested_side == SuggestedSide.YES
+
+
+def test_invert_flips_upward_overreaction_to_yes() -> None:
+    """With ``invert=True``, an upward overshoot bets YES (continuation)
+    instead of NO (reversion). Mirrors quant_invert_drift on fade after
+    the 2026-04-30 soak showed the reversion thesis was the wrong sign.
+    """
+    scorer = OverreactionScorer(
+        overreaction_threshold=0.02, sensitivity=10.0, invert=True,
+    )
+    # Same packet as test_fades_upward_overreaction_by_betting_no — only
+    # the inversion flag differs.
+    packet = _packet(recent_price_change_bps=400.0, btc_log_return_5m=0.001)
+    result = scorer.score_market(packet)
+    assert result.suggested_side == SuggestedSide.YES
+    assert result.fair_probability > packet.orderbook_midpoint
+    assert result.edge_yes == result.edge
+    assert result.edge_no == 0.0
+
+
+def test_invert_flips_downward_overreaction_to_no() -> None:
+    """Downward overshoot bets NO (continuation down) when inverted."""
+    scorer = OverreactionScorer(
+        overreaction_threshold=0.02, sensitivity=10.0, invert=True,
+    )
+    packet = _packet(recent_price_change_bps=-400.0, btc_log_return_5m=-0.001)
+    result = scorer.score_market(packet)
+    assert result.suggested_side == SuggestedSide.NO
+    assert result.fair_probability < packet.orderbook_midpoint
+    assert result.edge_no == result.edge
+    assert result.edge_yes == 0.0
+
+
+def test_invert_default_false_preserves_reversion_behavior() -> None:
+    """Default constructor remains the original reversion thesis so
+    existing callers don't accidentally flip into momentum."""
+    scorer = OverreactionScorer(overreaction_threshold=0.02, sensitivity=10.0)
+    # Upward overshoot → bet NO under the default (reversion).
+    packet = _packet(recent_price_change_bps=400.0, btc_log_return_5m=0.001)
+    result = scorer.score_market(packet)
+    assert result.suggested_side == SuggestedSide.NO
+
+
+def test_invert_respects_ofi_gate_with_continuation_side() -> None:
+    """OFI gate still fires when flow opposes the inverted side.
+    Inverted: upward overshoot → bet YES; if flow is heavy SELL (−50),
+    the gate must abstain just as it would for a non-inverted YES.
+    """
+    scorer = OverreactionScorer(
+        overreaction_threshold=0.02, sensitivity=10.0, invert=True,
+        ofi_gate_enabled=True, ofi_gate_min_abs_flow=25.0,
+    )
+    packet = _packet(
+        recent_price_change_bps=400.0, btc_log_return_5m=0.001,
+        signed_flow_5s=-50.0,
+    )
+    result = scorer.score_market(packet)
+    assert result.suggested_side == SuggestedSide.ABSTAIN
+    assert any("OFI gate" in r for r in result.reasons_to_abstain)
