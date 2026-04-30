@@ -2277,10 +2277,16 @@ type InfoBarItem = { label: string; value: string | number; tone?: "muted" | "po
 type MarketLookup = Record<string, DaemonTickPayload>;
 
 function buildMarketLookup(ticks: DaemonTickPayload[]): MarketLookup {
+  // The API returns ticks newest-first per (strategy, market), so iterate
+  // and KEEP the first entry seen for each market (= the freshest tick).
+  // Last-write-wins would let an older tick from a different strategy on
+  // the same market shadow the newest one — in particular a cold-start
+  // penny tick with bid_yes=0 was clobbering live fade ticks and blanking
+  // the Mark / Unrealized PnL cells on Open Positions.
   const lookup: MarketLookup = {};
   for (const tick of ticks) {
     if (!tick.market_id) continue;
-    lookup[tick.market_id] = tick;
+    if (!(tick.market_id in lookup)) lookup[tick.market_id] = tick;
   }
   return lookup;
 }
