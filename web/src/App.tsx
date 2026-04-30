@@ -1690,14 +1690,28 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
         // Stable strategy order so the visual grouping matches the rest
         // of the dashboard (fade column first, penny last).
         const STRATEGY_ORDER = ["fade", "adaptive", "penny"];
+        // Drop rows for strategies that are currently disabled in settings —
+        // the lookup keeps the last-known tick for ~5000-event window, which
+        // can persist for several minutes after a strategy is toggled off.
+        // Filtering by current enable-state hides them immediately. Fade is
+        // always on (no enable flag); the others gate on their *_enabled
+        // setting (default true when missing so legacy daemons aren't hidden).
+        const enabledMap = settings?.values ?? {};
+        const strategyEnabled = (s: string): boolean => {
+          if (s === "fade") return true;
+          const flag = enabledMap[`${s}_enabled`];
+          return flag !== false;
+        };
         for (const marketId of activeIds) {
           const perStrategy = marketStrategyLookup[marketId];
           if (!perStrategy) continue;
-          const strategyIds = Object.keys(perStrategy).sort((a, b) => {
-            const ia = STRATEGY_ORDER.indexOf(a);
-            const ib = STRATEGY_ORDER.indexOf(b);
-            return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
-          });
+          const strategyIds = Object.keys(perStrategy)
+            .filter(strategyEnabled)
+            .sort((a, b) => {
+              const ia = STRATEGY_ORDER.indexOf(a);
+              const ib = STRATEGY_ORDER.indexOf(b);
+              return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+            });
           for (const strategyId of strategyIds) {
             const tick = perStrategy[strategyId];
             // Drop pre-market rows outright — they were rendered as a
