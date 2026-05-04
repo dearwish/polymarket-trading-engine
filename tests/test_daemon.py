@@ -3035,6 +3035,41 @@ def test_apply_candidates_orphan_closes_truly_expired_market(tmp_path: Path) -> 
     assert closed[0].close_reason == "paper_orphan_close"
 
 
+def test_apply_candidates_orphan_closes_resolved_market_with_future_end_date(tmp_path: Path) -> None:
+    """The 2026-05-03 bug: a Polymarket market can be ``closed=True``
+    (UMA-resolved) while its nominal ``end_date_iso`` is still days in
+    the future (the contract expiry, not the actual resolution time).
+    Sports markets routinely do this. The orphan-close path must fire
+    on ``closed=True`` even when TTE > 0, otherwise resolved positions
+    sit OPEN in the DB indefinitely until the contract date passes.
+    """
+    from dataclasses import replace as dataclass_replace
+
+    runner, service, candidate, _approved, _btc = _setup_runner_with_open_yes_position(
+        tmp_path,
+        entry_price=0.415,
+        settings_overrides={},
+    )
+    # Resolved, but end_date is 5 days in the future (mirrors the live
+    # MLB market 2077466 from the 2026-05-02 soak).
+    resolved = dataclass_replace(
+        candidate,
+        end_date_iso="2099-01-01T00:00:00Z",
+        closed=True,
+        implied_probability=0.0,  # YES side resolved to 0 — total loss
+    )
+    runner._candidates[candidate.market_id] = resolved
+
+    runner._stop_event = asyncio.Event()
+    asyncio.run(runner._apply_candidates([]))
+
+    # Position must have been orphan-closed even though TTE is positive.
+    assert service.portfolio.list_open_positions() == []
+    closed = service.portfolio.list_closed_positions(limit=5)
+    assert len(closed) == 1
+    assert closed[0].close_reason == "paper_orphan_close"
+
+
 def test_orphan_close_backfills_scoring_fields_from_cached_assessment(tmp_path: Path) -> None:
     """fair_probability_at_close / edge_at_close must come from the most
     recent scorer output for that (strategy, market) when emitted via the

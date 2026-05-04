@@ -143,6 +143,17 @@ class Settings(BaseSettings):
     max_concurrent_positions: int = 1
     max_net_btc_exposure_usd: float = 50.0
     paper_starting_balance_usd: float = 100.0
+    # Per-strategy paper bankroll overrides. Comma-separated
+    # ``strategy_id:amount`` pairs, e.g.
+    # ``"market_maker:10000,fade:200,penny:5"``. Strategies absent from
+    # the map fall back to ``paper_starting_balance_usd``. Hot-reloadable
+    # — unlike the default which is frozen at PortfolioEngine init, this
+    # field is parsed fresh on every ``get_account_state`` call so a
+    # mid-soak edit (via dashboard / CLI / API) takes effect immediately.
+    # Each strategy's paper accounting is fully isolated: MM's
+    # ``available_usd`` derives from its own bankroll + own realised PnL
+    # − own reserved, with no contention against fade/penny/adaptive_v2.
+    paper_starting_balance_per_strategy: str = ""
     paper_position_ttl_seconds: int = 60
     paper_entry_slippage_bps: float = 10.0
     paper_exit_slippage_bps: float = 10.0
@@ -238,6 +249,162 @@ class Settings(BaseSettings):
     # same short-horizon momentum thesis that flipped fade from −16% ROI
     # to break-even should apply here too.
     adaptive_v2_invert: bool = False
+
+    # Market-maker strategy. Posts a two-sided quote (YES-buy + NO-buy)
+    # around the book mid, captures the spread when both legs fill, and
+    # earns Polymarket's daily maker-reward subsidy on markets that pay
+    # them. Inventory-aware skew shifts both legs toward neutralising any
+    # one-sided fill. See engine/market_maker for the full strategy.
+    # Disabled by default; flip on per soak. Runs alongside fade / penny
+    # / adaptive_v2 with its own portfolio slice (strategy_id="market_maker").
+    mm_enabled: bool = False
+    # Notional per leg, USD. Total maximum exposure on a market is
+    # mm_max_inventory_usd; per-fill quote size sets the granularity of
+    # how the strategy fills toward that cap. NB: Polymarket reward-
+    # paying markets carry a ``rewardsMinSize`` floor (frequently 200 or
+    # 1000 USDC); quotes below that floor earn the spread but no daily
+    # subsidy. See ``mm_universe_require_size_eligible``.
+    mm_size_usd: float = 5.0
+    # Half-width of our quoted spread around mid, in price units (cents).
+    # 0.02 → quote ``mid − 0.02`` and ``(1 − mid) − 0.02``. If both legs
+    # fill we book ``2 × half_spread`` of gross spread before costs.
+    mm_target_half_spread: float = 0.02
+    # Don't quote when the market spread is tighter than this — a tighter
+    # market means we'd have to rest INSIDE the existing spread to lead
+    # the book, which sacrifices the spread we're trying to capture.
+    # Lowered 2026-05-01 from 0.01 → 0.005 after live observation: a 1¢
+    # spread is the BEST possible MM target (wide enough to capture,
+    # tight enough to signal liquidity) and should not be excluded.
+    mm_min_market_spread: float = 0.005
+    # Don't quote when the market spread is wider than this — a wide
+    # spread on a binary market is the toxic-flow signature (informed
+    # taker dumping into a thin book). 0 disables the upper gate.
+    mm_max_market_spread: float = 0.10
+    # Don't quote inside the final ``mm_min_tte_seconds`` of TTE — the
+    # book gets thin and one-sided as resolution approaches and the
+    # half-spread can rarely be captured cleanly inside that window.
+    mm_min_tte_seconds: int = 120
+    # Inventory-aware skew strength. 0 disables skew (symmetric quotes
+    # always); 1.0 means a fully-loaded one-sided cap shifts BOTH legs by
+    # exactly ``mm_target_half_spread`` (one leg moves to mid, the other
+    # to mid ± full_spread). Typical 0.3–0.7 range.
+    mm_inventory_skew_strength: float = 0.5
+    # Per-side inventory cap, USD. When YES exposure reaches this we halt
+    # the YES-buy leg (NO-buy keeps quoting to flatten); mirror for NO.
+    # Bounds the strategy's worst-case loss-on-resolution to roughly the
+    # cap times the larger of (1 − yes_quote, 1 − no_quote).
+    mm_max_inventory_usd: float = 5.0
+    # Only quote markets that pay maker-reward subsidies. The MM thesis
+    # assumes the daily yield + captured spread compensates for adverse
+    # selection; without the yield component the math gets thin on
+    # short-horizon markets. Off by default since BTC short-horizon
+    # markets typically pay no rewards — flip on when targeting longer-
+    # horizon families.
+    mm_require_rewards: bool = False
+    # TTL on each resting MM quote, seconds. On expiry the quote is
+    # cancelled and re-placed on the next tick at the then-current
+    # skewed price. Re-placement cadence is also driven by the cancel
+    # thresholds below; the TTL is a safety net for quiet windows.
+    mm_quote_ttl_seconds: int = 60
+    # Cancel/replace hysteresis (mirror of paper_follow_cancel_*). Only
+    # re-quote when the desired price has drifted by more than this many
+    # ticks from the resting quote, OR when the desired size differs
+    # from the resting size by more than this %. Prevents cancel-thrash
+    # that kills queue position when the mid jitters sub-tick.
+    # Lowered 2026-05-01 from 1.0 → 0.5 after live observation: with a
+    # 2.5¢ reward band and a 1-tick (1¢) hysteresis, quotes were sitting
+    # 4-5¢ off the moving mid — outside the reward band 98% of the time.
+    # 0.5 ticks (0.5¢) keeps quotes tracking the mid more aggressively.
+    mm_replace_min_ticks: float = 0.5
+    mm_replace_min_size_pct: float = 0.10
+    # TTE buffer for force-closing accumulated MM legs at resolution.
+    # MM positions don't have a TP/SL/trail — they either flatten via
+    # the opposite-side fill or carry to expiry. This setting closes any
+    # remaining open legs at the current bid when the market reaches
+    # this many seconds before resolution, capping the carry risk.
+    mm_force_exit_tte_seconds: int = 30
+    # Cadence (seconds) for the MM freshness sweep. The MM lifecycle
+    # handler only runs when a Polymarket WS event triggers a tick for
+    # one of the strategy's markets — quiet markets (long-tail political,
+    # off-hours sports) can go minutes without an event, leaving stale
+    # TTL-expired quotes in memory and missing reward-band re-quotes
+    # entirely. This loop invokes ``_handle_market_maker_strategy`` for
+    # every market in ``_mm_market_ids`` on a fixed cadence so quiet
+    # markets still get TTL cleanup, drift re-quotes, and accrual ticks.
+    # 0 disables. Default 5s is a balance between responsiveness and
+    # tick volume — the WS-driven path still handles fast markets
+    # within ``decision_min_interval_seconds``.
+    mm_freshness_interval_seconds: float = 5.0
+    # Pre-fill adverse-selection guard. Refuse to honour a fill on a
+    # resting MM quote if the current YES mid has moved away from the
+    # quote's price by more than ``mm_max_fill_drift_pct / 100``. The
+    # 2026-05-02 soak surfaced two −$985 single-leg fills caused by
+    # zombie quotes catching falling-knife resolutions: our YES bid at
+    # 0.695 stayed in memory while the market crashed to ~0.01, then a
+    # WS event reactivated the handler and our stale quote ate the dump.
+    # Default 5% (5¢ around 0.50 mid) — anything wider than that is
+    # "the market repriced under us" and a fill there is pure adverse
+    # selection. 0 disables the guard.
+    mm_max_fill_drift_pct: float = 5.0
+    # Hard TTE floor on FILLS. The existing ``mm_force_exit_tte_seconds``
+    # floor handles closing already-open positions before resolution; this
+    # mirrors it on the OPEN side — refuse to fill any resting quote when
+    # ``tte_seconds <= mm_no_fill_tte_seconds``. Prevents the
+    # "fill-then-immediately-resolve" failure where we open a position
+    # 30 seconds before the market resolves against us. 0 disables.
+    mm_no_fill_tte_seconds: int = 60
+    # Defense-in-depth: cancel any pending MM quote older than this
+    # regardless of which loop / market state path manages it. Belt-and-
+    # braces against the "market dropped from MM universe but quote is
+    # still in _pending_mm_orders memory" zombie path. 0 disables;
+    # default 600s is well above the 60s TTL so legit re-quote cycles
+    # are never affected.
+    mm_max_quote_age_seconds: int = 600
+    # Market-maker universe selector. The MM strategy needs a different
+    # universe from the BTC short-horizon scorers (politics / sports /
+    # long-duration events that pay daily reward subsidies). When
+    # ``mm_universe_enabled`` is True the daemon scans Polymarket-wide
+    # via ``PolymarketConnector.discover_mm_markets``, ranks by yield-
+    # per-$1k-liquidity, and routes the top-N markets exclusively to the
+    # MM strategy — fade / penny / adaptive_v2 see only the existing BTC
+    # universe and are not invoked on MM markets. Set False to keep MM
+    # piggybacking on the BTC discovery (degenerate but useful for
+    # testing the lifecycle handler in isolation).
+    mm_universe_enabled: bool = True
+    # Filter: minimum daily reward rate (USD/day) for a market to be
+    # MM-eligible. Below this the daily yield can't carry the strategy.
+    mm_universe_min_rewards_daily_usd: float = 1.0
+    # Filter: minimum aggregate book liquidity (USD) — a thin market
+    # invites toxic flow and the spread can't be earned consistently.
+    mm_universe_min_liquidity_usd: float = 5000.0
+    # Filter: minimum time-to-expiry (seconds) — MM accumulates fills
+    # over time, so a market resolving in the next hour can't capture
+    # the spread reliably. Default 1h is conservative.
+    mm_universe_min_tte_seconds: int = 3600
+    # How many top-ranked MM markets to actually subscribe to. Each adds
+    # 2 WS asset subscriptions (YES + NO tokens) so keep this small for
+    # paper soaks.
+    mm_universe_max_markets: int = 5
+    # Cadence in seconds for re-scanning the MM universe. Independent
+    # of the general discovery interval because the MM universe shifts
+    # on a slower timescale (rewards announcements, new markets) than
+    # BTC short-horizon slug rolls.
+    mm_universe_refresh_seconds: int = 300
+    # When True, the scanner drops markets whose ``rewardsMinSize``
+    # exceeds ``mm_size_usd`` — quotes smaller than the reward-pool
+    # eligibility floor earn the spread but no maker subsidy, defeating
+    # the MM thesis (which assumes daily yield is the bulk of the edge).
+    # As of 2026-05-01 every reward-paying market in the live Gamma
+    # snapshot had ``rewardsMinSize >= 200``, so with the V1 default
+    # ``mm_size_usd = 5.0`` this filter eliminates the entire universe.
+    # The right way to soak with this on is to bump ``mm_size_usd`` up
+    # to the floor of the markets you want to target (200 for the long-
+    # tail political markets, 1000 for the daily sports markets) and
+    # ensure ``paper_starting_balance_usd`` can cover the worst case.
+    # Set False to keep quoting reward-paying markets even when the
+    # configured size is below their floor — useful for paper-mode
+    # lifecycle validation but the resulting fills earn no rewards.
+    mm_universe_require_size_eligible: bool = True
 
     fee_bps: float = 0.0
     execution_maker_min_edge: float = 0.04
@@ -394,6 +561,11 @@ EDITABLE_SETTINGS_METADATA: dict[str, dict[str, Any]] = {
         "step": 1,
         "group": "paper",
         "requires_restart": True,
+    },
+    "paper_starting_balance_per_strategy": {
+        "label": "Paper Starting Balance Per Strategy (id:amount,...)",
+        "type": "text",
+        "group": "paper",
     },
     "paper_position_ttl_seconds": {
         "label": "Paper Position TTL Seconds",
@@ -592,6 +764,186 @@ EDITABLE_SETTINGS_METADATA: dict[str, dict[str, Any]] = {
         "label": "Adaptive V2 Invert (continuation instead of reversion)",
         "type": "boolean",
         "group": "thresholds",
+    },
+    "mm_enabled": {
+        "label": "Market Maker Strategy Enabled",
+        "type": "boolean",
+        "group": "paper",
+    },
+    "mm_size_usd": {
+        "label": "MM Size per Leg (USD)",
+        "type": "number",
+        "min": 0.1,
+        "max": 100,
+        "step": 0.1,
+        "group": "paper",
+    },
+    "mm_target_half_spread": {
+        "label": "MM Target Half-Spread",
+        "type": "number",
+        "min": 0.001,
+        "max": 0.5,
+        "step": 0.001,
+        "group": "paper",
+    },
+    "mm_min_market_spread": {
+        "label": "MM Min Market Spread (skip below)",
+        "type": "number",
+        "min": 0.0,
+        "max": 0.5,
+        "step": 0.001,
+        "group": "paper",
+    },
+    "mm_max_market_spread": {
+        "label": "MM Max Market Spread (skip above)",
+        "type": "number",
+        "min": 0.0,
+        "max": 1.0,
+        "step": 0.001,
+        "group": "paper",
+    },
+    "mm_min_tte_seconds": {
+        "label": "MM Min TTE (seconds)",
+        "type": "number",
+        "min": 0,
+        "max": 3600,
+        "step": 5,
+        "group": "paper",
+    },
+    "mm_inventory_skew_strength": {
+        "label": "MM Inventory Skew Strength",
+        "type": "number",
+        "min": 0.0,
+        "max": 2.0,
+        "step": 0.05,
+        "group": "paper",
+    },
+    "mm_max_inventory_usd": {
+        "label": "MM Max Inventory per Side (USD)",
+        "type": "number",
+        "min": 0.0,
+        "max": 1000,
+        "step": 0.5,
+        "group": "paper",
+    },
+    "mm_require_rewards": {
+        "label": "MM Require Reward-Paying Markets",
+        "type": "boolean",
+        "group": "paper",
+    },
+    "mm_quote_ttl_seconds": {
+        "label": "MM Quote TTL (seconds)",
+        "type": "number",
+        "min": 5,
+        "max": 3600,
+        "step": 5,
+        "group": "paper",
+    },
+    "mm_replace_min_ticks": {
+        "label": "MM Replace Min Ticks (hysteresis)",
+        "type": "number",
+        "min": 0.0,
+        "max": 10.0,
+        "step": 0.5,
+        "group": "paper",
+    },
+    "mm_replace_min_size_pct": {
+        "label": "MM Replace Min Size Drift (%)",
+        "type": "number",
+        "min": 0.0,
+        "max": 1.0,
+        "step": 0.01,
+        "group": "paper",
+    },
+    "mm_force_exit_tte_seconds": {
+        "label": "MM Force Exit TTE (seconds)",
+        "type": "number",
+        "min": 0,
+        "max": 600,
+        "step": 5,
+        "group": "paper",
+    },
+    "mm_freshness_interval_seconds": {
+        "label": "MM Freshness Sweep Interval (seconds)",
+        "type": "number",
+        "min": 0,
+        "max": 60,
+        "step": 0.5,
+        "group": "paper",
+    },
+    "mm_max_fill_drift_pct": {
+        "label": "MM Max Fill Drift % (refuse adverse-selection fills)",
+        "type": "number",
+        "min": 0.0,
+        "max": 50.0,
+        "step": 0.5,
+        "group": "paper",
+    },
+    "mm_no_fill_tte_seconds": {
+        "label": "MM No-Fill TTE Floor (seconds)",
+        "type": "number",
+        "min": 0,
+        "max": 600,
+        "step": 5,
+        "group": "paper",
+    },
+    "mm_max_quote_age_seconds": {
+        "label": "MM Max Quote Age (seconds, defense-in-depth)",
+        "type": "number",
+        "min": 0,
+        "max": 7200,
+        "step": 30,
+        "group": "paper",
+    },
+    "mm_universe_enabled": {
+        "label": "MM Universe Scanner Enabled",
+        "type": "boolean",
+        "group": "paper",
+    },
+    "mm_universe_min_rewards_daily_usd": {
+        "label": "MM Min Rewards Daily (USD)",
+        "type": "number",
+        "min": 0.0,
+        "max": 10000.0,
+        "step": 0.5,
+        "group": "paper",
+    },
+    "mm_universe_min_liquidity_usd": {
+        "label": "MM Min Liquidity (USD)",
+        "type": "number",
+        "min": 0.0,
+        "max": 1_000_000.0,
+        "step": 500.0,
+        "group": "paper",
+    },
+    "mm_universe_min_tte_seconds": {
+        "label": "MM Min TTE for Universe (seconds)",
+        "type": "number",
+        "min": 60,
+        "max": 30 * 24 * 3600,
+        "step": 60,
+        "group": "paper",
+    },
+    "mm_universe_max_markets": {
+        "label": "MM Max Markets to Subscribe",
+        "type": "number",
+        "min": 1,
+        "max": 50,
+        "step": 1,
+        "group": "paper",
+    },
+    "mm_universe_refresh_seconds": {
+        "label": "MM Universe Refresh (seconds)",
+        "type": "number",
+        "min": 30,
+        "max": 3600,
+        "step": 30,
+        "group": "paper",
+    },
+    "mm_universe_require_size_eligible": {
+        "label": "MM Require Size-Eligible Markets (rewardsMinSize ≤ mm_size_usd)",
+        "type": "boolean",
+        "group": "paper",
     },
     "paper_take_profit_pct": {
         "label": "Paper Take Profit %",

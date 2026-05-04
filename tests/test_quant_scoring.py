@@ -336,6 +336,47 @@ def test_shadow_session_bias_adds_independently_of_htf_tilt(tmp_path: Path) -> N
     assert abs(eu_session.fair_probability - (no_session.fair_probability + 0.05)) < 1e-6
 
 
+def test_shadow_fade_invert_side_follows_live_abstain_and_flips_side(tmp_path: Path) -> None:
+    """fade_invert_side mirrors live fair_yes (1 − p) and force-flips the
+    chosen side, but inherits the live abstain decision so the chosen-tick
+    Brier delta is computed on the same population."""
+    engine = QuantScoringEngine(
+        _settings(tmp_path, quant_shadow_variant="fade_invert_side")
+    )
+    # Picked side: drift signal big enough that live picks YES.
+    packet = _packet(btc_log_return_since_candle_open=0.001)
+    base = engine.score_market(packet)
+    shadow = engine.score_shadow(packet, live=base)
+    assert shadow is not None
+    assert shadow.raw_model_output == "quant-shadow-fade_invert_side"
+    assert abs(shadow.fair_probability - (1.0 - base.fair_probability)) < 1e-6
+    if base.suggested_side is SuggestedSide.YES:
+        assert shadow.suggested_side is SuggestedSide.NO
+    elif base.suggested_side is SuggestedSide.NO:
+        assert shadow.suggested_side is SuggestedSide.YES
+    else:
+        assert shadow.suggested_side is SuggestedSide.ABSTAIN
+
+
+def test_shadow_fade_invert_side_inherits_live_abstain(tmp_path: Path) -> None:
+    """When live abstains, shadow abstains — preserves the population for
+    apples-to-apples Brier comparison."""
+    # Slippage high enough that no edge survives on either side → ABSTAIN.
+    engine = QuantScoringEngine(
+        _settings(
+            tmp_path,
+            quant_shadow_variant="fade_invert_side",
+            quant_slippage_baseline_bps=2000.0,
+        )
+    )
+    packet = _packet()
+    base = engine.score_market(packet)
+    assert base.suggested_side is SuggestedSide.ABSTAIN
+    shadow = engine.score_shadow(packet, live=base)
+    assert shadow is not None
+    assert shadow.suggested_side is SuggestedSide.ABSTAIN
+
+
 def test_shadow_trades_still_use_base_assessment(tmp_path: Path) -> None:
     """score_shadow() returns a separate object; score_market() must be
     unaffected — same packet produces the same base assessment regardless of

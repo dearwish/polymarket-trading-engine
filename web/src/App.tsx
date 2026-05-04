@@ -156,11 +156,19 @@ type EquityPoint = {
   closed_at: string | null;
   realized_pnl: number;
   equity: number;
+  strategy_id?: string;
+};
+
+type StrategyEquitySeries = {
+  strategy_id: string;
+  points: EquityPoint[];
 };
 
 type EquityCurvePayload = {
   count: number;
   points: EquityPoint[];
+  strategy_id: string | null;
+  per_strategy_series: StrategyEquitySeries[];
 };
 
 type ReportPayload = {
@@ -219,6 +227,15 @@ type PendingMaker = {
   ttl_seconds: number;
   age_seconds: number;
   ttl_remaining_seconds: number;
+  // Live book context (sourced from per-tick MarketState in the daemon
+  // and surfaced via the heartbeat). null when the book is missing or
+  // one-sided. ``current_ask`` is the side-relevant ask whose drop
+  // to-or-below ``limit_price`` would fill us. ``limit_minus_mid`` is
+  // a signed cents-off-mid distance — operators eyeball it to spot
+  // stale quotes before the freshness loop sweeps them.
+  current_mid?: number | null;
+  current_ask?: number | null;
+  limit_minus_mid?: number | null;
 };
 
 type PendingMakersPayload = {
@@ -257,6 +274,11 @@ type PaperActivityEvent = {
     execution_style?: string;
     asset_id?: string;
     detail?: string;
+    // Tagged on the ExecutionResult by the daemon at every log site
+    // so the dashboard can attribute fills to fade / penny / adaptive_v2
+    // / market_maker. Old events (pre-2026-05-01) lack this field; the
+    // table renders ``—`` for those rows.
+    strategy_id?: string;
   };
 };
 
@@ -947,6 +969,91 @@ function PnlChart({ points }: { points: EquityPoint[] }) {
   );
 }
 
+// Stable colour per strategy_id so the legend / lines don't shuffle on
+// re-render. Limited palette — if more than 6 strategies are ever wired
+// up, extend.
+const STRATEGY_COLORS: Record<string, string> = {
+  fade: "#4ade80",
+  adaptive: "#60a5fa",
+  adaptive_v2: "#a78bfa",
+  penny: "#f59e0b",
+  market_maker: "#f87171",
+};
+
+function _colorFor(sid: string): string {
+  return STRATEGY_COLORS[sid] || "#94a3b8";
+}
+
+function PnlChartMulti({ series }: { series: StrategyEquitySeries[] }) {
+  const ranged = useMemo(() => {
+    const allPoints = series.flatMap((s) => s.points);
+    if (!allPoints.length) return null;
+    const max = Math.max(...allPoints.map((p) => p.equity), 0.01);
+    const min = Math.min(...allPoints.map((p) => p.equity), 0);
+    const range = Math.max(max - min, 0.01);
+    const longestSeq = Math.max(...series.map((s) => s.points.length), 1);
+    // Each series is independently sequenced (its own trade-count axis).
+    // Scaling each x to its own length means a strategy with 5 trades
+    // and one with 200 both span the chart width — apples-to-apples on
+    // "trade-number" not on wall-clock time. Operators comparing the
+    // SHAPE of curves want this, not strict time alignment.
+    const lines = series.map((s) => {
+      const pts = s.points
+        .map((p, i) => {
+          const x = s.points.length === 1 ? 0 : (i / (s.points.length - 1)) * 100;
+          const y = 100 - ((p.equity - min) / range) * 100;
+          return `${x},${y}`;
+        })
+        .join(" ");
+      return { sid: s.strategy_id, pts, last: s.points[s.points.length - 1]?.equity ?? 0, count: s.points.length };
+    });
+    // Zero line position
+    const zeroY = 100 - ((0 - min) / range) * 100;
+    return { lines, longestSeq, max, min, zeroY };
+  }, [series]);
+
+  if (!ranged || !ranged.lines.length) {
+    return <div className="empty-state">No closed positions yet.</div>;
+  }
+
+  return (
+    <div>
+      <svg className="chart" viewBox="0 0 100 100" preserveAspectRatio="none">
+        {ranged.zeroY >= 0 && ranged.zeroY <= 100 && (
+          <line
+            x1="0"
+            y1={ranged.zeroY}
+            x2="100"
+            y2={ranged.zeroY}
+            stroke="var(--muted)"
+            strokeWidth="0.3"
+            strokeDasharray="1,1"
+          />
+        )}
+        {ranged.lines.map((l) => (
+          <polyline
+            key={l.sid}
+            fill="none"
+            stroke={_colorFor(l.sid)}
+            strokeWidth="1.5"
+            points={l.pts}
+          />
+        ))}
+      </svg>
+      <div className="multi-legend" style={{ display: "flex", flexWrap: "wrap", gap: "8px 16px", marginTop: "8px", fontSize: "12px" }}>
+        {ranged.lines.map((l) => (
+          <span key={l.sid} style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}>
+            <span style={{ width: "10px", height: "2px", background: _colorFor(l.sid), display: "inline-block" }} />
+            <span style={{ color: "var(--muted)" }}>{l.sid}</span>
+            <span style={{ color: l.last >= 0 ? "var(--positive)" : "var(--negative)" }}>{formatMoney(l.last)}</span>
+            <span style={{ color: "var(--muted)" }}>({l.count})</span>
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function OverviewPage({ state }: { state: DashboardState }) {
   const { auth, status, portfolioSummary, liveActivity, equityCurve } = state;
   return (
@@ -1329,7 +1436,7 @@ function OrdersPage({ liveOrders, liveTrades, liveActivity, paperActivity, tradi
           <span>{pendingMakers.length} resting</span>
         </div>
         {pendingMakers.length === 0 ? (
-          <div className="empty-state">No resting paper-maker limits. Enable <code>fade_post_only</code> to route fade through the maker lifecycle.</div>
+          <div className="empty-state">No resting paper-maker limits. Enable <code>mm_enabled</code> for two-sided MM quotes, or <code>fade_post_only</code>/<code>adaptive_v2_post_only</code> to route a directional scorer through the maker lifecycle.</div>
         ) : (
           <div className="table-wrap">
             <table>
@@ -1339,6 +1446,9 @@ function OrdersPage({ liveOrders, liveTrades, liveActivity, paperActivity, tradi
                   <th>Market</th>
                   <th>Side</th>
                   <th>Limit</th>
+                  <th>Mid</th>
+                  <th>Δ vs Mid</th>
+                  <th>Ask (fills @≤)</th>
                   <th>Size</th>
                   <th>Age</th>
                   <th>TTL Left</th>
@@ -1348,12 +1458,50 @@ function OrdersPage({ liveOrders, liveTrades, liveActivity, paperActivity, tradi
                 {pendingMakers.map((m) => {
                   const sideClass = m.side === "YES" ? "positive" : m.side === "NO" ? "negative" : "";
                   const ttlClass = m.ttl_remaining_seconds < 30 ? "negative" : "";
+                  // Δ vs mid: positive (above mid) shouldn't happen for a
+                  // BUY rest because we always quote below mid by design;
+                  // colour-code so a positive value visually pops as a bug
+                  // signal. Tight magnitude (< 1¢) = quote is tracking
+                  // mid as intended.
+                  const delta = m.limit_minus_mid;
+                  const deltaClass =
+                    delta === null || delta === undefined
+                      ? "muted"
+                      : delta > 0
+                      ? "negative"
+                      : Math.abs(delta) < 0.01
+                      ? "positive"
+                      : "";
+                  // Ask gap: how close are we to filling? When
+                  // current_ask − limit_price ≤ 0 we'd fill on the next
+                  // tick. Highlight when within 1¢ as "imminent fill".
+                  const askGap =
+                    m.current_ask !== null && m.current_ask !== undefined
+                      ? m.current_ask - m.limit_price
+                      : null;
+                  const askClass =
+                    askGap === null
+                      ? "muted"
+                      : askGap <= 0
+                      ? "positive"
+                      : askGap < 0.01
+                      ? ""
+                      : "muted";
                   return (
-                    <tr key={`${m.strategy_id}-${m.market_id}`}>
+                    <tr key={`${m.strategy_id}-${m.market_id}-${m.side}`}>
                       <td style={{ fontSize: "12px", color: "var(--muted)" }}>{m.strategy_id}</td>
                       <td><MarketCell marketId={m.market_id} lookup={marketLookup} timezone={timezone} timeFormat={timeFormat} /></td>
                       <td className={sideClass}>{m.side}</td>
                       <td>{m.limit_price.toFixed(4)}</td>
+                      <td className={m.current_mid === null || m.current_mid === undefined ? "muted" : ""}>
+                        {m.current_mid !== null && m.current_mid !== undefined ? m.current_mid.toFixed(4) : "—"}
+                      </td>
+                      <td className={deltaClass}>
+                        {delta !== null && delta !== undefined ? `${delta >= 0 ? "+" : ""}${(delta * 100).toFixed(2)}¢` : "—"}
+                      </td>
+                      <td className={askClass}>
+                        {m.current_ask !== null && m.current_ask !== undefined ? m.current_ask.toFixed(4) : "—"}
+                      </td>
                       <td>{formatMoney(m.size_usd)}</td>
                       <td>{formatDuration(m.age_seconds)}</td>
                       <td className={ttlClass}>{formatDuration(m.ttl_remaining_seconds)}</td>
@@ -1379,6 +1527,7 @@ function OrdersPage({ liveOrders, liveTrades, liveActivity, paperActivity, tradi
               <thead>
                 <tr>
                   <th>Time</th>
+                  <th>Strategy</th>
                   <th>Market</th>
                   <th>Side</th>
                   <th>Status</th>
@@ -1398,9 +1547,11 @@ function OrdersPage({ liveOrders, liveTrades, liveActivity, paperActivity, tradi
                   const price = typeof p.fill_price === "number" && p.fill_price > 0 ? p.fill_price.toFixed(4) : "n/a";
                   const shares = typeof p.filled_size_shares === "number" ? p.filled_size_shares.toFixed(2) : "n/a";
                   const detail = p.detail ?? "";
+                  const strategyId = p.strategy_id;
                   return (
                     <tr key={`${event.logged_at}-${index}`}>
                       <td style={{ whiteSpace: "nowrap", color: "var(--muted)", fontSize: "12px" }}>{formatInstant(event.logged_at, timezone, timeFormat, "time")}</td>
+                      <td style={{ fontSize: "12px", color: "var(--muted)" }}>{strategyId ?? "—"}</td>
                       <td>{p.market_id ? <MarketCell marketId={p.market_id} lookup={marketLookup} timezone={timezone} timeFormat={timeFormat} /> : "n/a"}</td>
                       <td className={sideClass}>{side || "n/a"}</td>
                       <td className={statusClass}>{status || "n/a"}</td>
@@ -1610,18 +1761,48 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
   // is a 3rd-party page we can't message, so a URL-level cache-bust is the
   // only reliable way to refresh it on demand.
   const [embedReloadKey, setEmbedReloadKey] = useState(0);
+  // Strategy filter for the equity curve. ``"all"`` overlays every
+  // strategy's curve; a specific id renders just that one. The list is
+  // derived from the per-strategy series the API already returns, so
+  // strategies with zero closed positions don't appear (they have no
+  // curve to draw anyway).
+  const [equityStrategy, setEquityStrategy] = useState<string>("all");
+  const equityStrategies = (equityCurve?.per_strategy_series ?? []).map((s) => s.strategy_id);
+  const selectedSeries = equityCurve?.per_strategy_series?.find((s) => s.strategy_id === equityStrategy);
+  const selectedSeriesPoints = selectedSeries?.points ?? [];
   return (
     <section className="grid detail-grid">
       <article className="panel">
         <div className="panel-header">
           <h2>Equity Curve</h2>
-          <span>{equityCurve?.count ?? 0} closed points</span>
+          <span style={{ display: "inline-flex", gap: "8px", alignItems: "center" }}>
+            <label style={{ fontSize: "12px", color: "var(--muted)" }}>
+              Strategy:&nbsp;
+              <select
+                value={equityStrategy}
+                onChange={(e) => setEquityStrategy(e.target.value)}
+                style={{ fontSize: "12px" }}
+              >
+                <option value="all">all (overlay)</option>
+                {equityStrategies.map((sid) => (
+                  <option key={sid} value={sid}>{sid}</option>
+                ))}
+              </select>
+            </label>
+            <span>{equityStrategy === "all" ? (equityCurve?.count ?? 0) : selectedSeriesPoints.length} closed points</span>
+          </span>
         </div>
-        <PnlChart points={equityCurve?.points ?? []} />
-        <div className="axis-labels">
-          <span>{formatInstant(equityCurve?.points[0]?.closed_at, timezone, timeFormat, "date") || "start"}</span>
-          <span>{formatInstant(equityCurve?.points[equityCurve.points.length - 1]?.closed_at, timezone, timeFormat, "date") || "latest"}</span>
-        </div>
+        {equityStrategy === "all" ? (
+          <PnlChartMulti series={equityCurve?.per_strategy_series ?? []} />
+        ) : (
+          <PnlChart points={selectedSeriesPoints} />
+        )}
+        {equityStrategy !== "all" && (
+          <div className="axis-labels">
+            <span>{formatInstant(selectedSeriesPoints[0]?.closed_at, timezone, timeFormat, "date") || "start"}</span>
+            <span>{formatInstant(selectedSeriesPoints[selectedSeriesPoints.length - 1]?.closed_at, timezone, timeFormat, "date") || "latest"}</span>
+          </div>
+        )}
       </article>
 
       <article className="panel">

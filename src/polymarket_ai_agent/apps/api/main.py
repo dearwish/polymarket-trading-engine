@@ -316,7 +316,7 @@ def create_app(
             "portfolio_summary": portfolio_summary(service=service),
             "open_positions": open_positions(service=service),
             "closed_positions": closed_positions(limit=100, service=service),
-            "equity_curve": equity_curve(limit=200, service=service),
+            "equity_curve": equity_curve(limit=200, strategy_id=None, service=service),
             "report": _cached("report", 60.0, lambda: report(session_id=None, service=service)),
             "recent_events": recent_events(limit=12, service=service),
             "recent_decisions": recent_decisions(limit=500, window_seconds=600, service=service),
@@ -705,25 +705,60 @@ def create_app(
         # once the soak passed that mark.
         closed_stats = service.portfolio.get_closed_position_stats()
         per_strategy: dict[str, dict] = {}
+
+        def _empty_bucket(sid: str) -> dict:
+            return {
+                "strategy_id": sid,
+                "open_positions": 0,
+                "closed_positions": 0,
+                "total_realized_pnl": 0.0,
+                "open_notional": 0.0,
+                "wins": 0,
+                "losses": 0,
+                "reward_accrued_usd": 0.0,
+            }
+
+        # Seed buckets for every currently-enabled strategy so freshly-
+        # enabled strategies (notably ``market_maker``) appear in the
+        # dashboard before their first fill / close. The fade scorer is
+        # always enabled — see the daemon's ``_build_strategies`` for the
+        # canonical wiring.
+        settings = service.settings
+        enabled_strategy_ids: list[str] = ["fade"]
+        if getattr(settings, "adaptive_enabled", False):
+            enabled_strategy_ids.append("adaptive")
+        if getattr(settings, "penny_enabled", False):
+            enabled_strategy_ids.append("penny")
+        if getattr(settings, "adaptive_v2_enabled", False):
+            enabled_strategy_ids.append("adaptive_v2")
+        if getattr(settings, "mm_enabled", False):
+            enabled_strategy_ids.append("market_maker")
+        for sid in enabled_strategy_ids:
+            per_strategy[sid] = _empty_bucket(sid)
+
         for stats in closed_stats:
             sid = stats["strategy_id"] or "fade"
-            per_strategy[sid] = {
-                "strategy_id": sid,
-                "open_positions": 0, "closed_positions": stats["closed_positions"],
-                "total_realized_pnl": stats["total_realized_pnl"],
-                "open_notional": 0.0,
-                "wins": stats["wins"], "losses": stats["losses"],
-            }
+            bucket = per_strategy.setdefault(sid, _empty_bucket(sid))
+            bucket["closed_positions"] = stats["closed_positions"]
+            bucket["total_realized_pnl"] = stats["total_realized_pnl"]
+            bucket["wins"] = stats["wins"]
+            bucket["losses"] = stats["losses"]
         for pos in open_positions:
             sid = getattr(pos, "strategy_id", "fade") or "fade"
-            bucket = per_strategy.setdefault(sid, {
-                "strategy_id": sid,
-                "open_positions": 0, "closed_positions": 0,
-                "total_realized_pnl": 0.0, "open_notional": 0.0,
-                "wins": 0, "losses": 0,
-            })
+            bucket = per_strategy.setdefault(sid, _empty_bucket(sid))
             bucket["open_positions"] += 1
             bucket["open_notional"] += pos.size_usd
+        # MM strategy earns continuous reward income that doesn't appear
+        # in the fill-based PnL. Surface it as a separate field per
+        # strategy so the dashboard can show "MM has $0 fill PnL but
+        # $X in accrued maker rewards" without confusing the two.
+        for sid in list(per_strategy.keys()):
+            try:
+                per_strategy[sid]["reward_accrued_usd"] = round(
+                    service.portfolio.total_reward_accrued(sid), 6
+                )
+            except Exception:
+                per_strategy[sid]["reward_accrued_usd"] = 0.0
         for bucket in per_strategy.values():
             decided = bucket["wins"] + bucket["losses"]
             bucket["win_rate"] = (bucket["wins"] / decided) if decided else None
@@ -788,8 +823,29 @@ def create_app(
         return {"count": len(items), "positions": items}
 
     @app.get("/api/portfolio/equity-curve")
-    def equity_curve(limit: int = Query(200, ge=1, le=1000), service: AgentService = Depends(service_factory)) -> dict:
-        positions = list(reversed(service.portfolio.list_closed_positions(limit=limit)))
+    def equity_curve(
+        limit: int = Query(200, ge=1, le=1000),
+        strategy_id: str | None = Query(default=None),
+        service: AgentService = Depends(service_factory),
+    ) -> dict:
+        """Cumulative realised PnL across closed positions.
+
+        ``strategy_id=None`` (default) returns the cross-strategy curve;
+        passing a specific ``strategy_id`` filters to that scorer's
+        slice — the dashboard's per-strategy selector uses this.
+
+        ``per_strategy_series`` is always returned alongside the chosen
+        ``points`` so the front-end can render multiple curves at once
+        without a second round-trip. Each series is independently
+        sequenced so curves of different lengths can be overlaid on a
+        shared "trade-number" x-axis.
+        """
+        # Single-curve view (filtered by strategy_id when supplied).
+        positions = list(
+            reversed(service.portfolio.list_closed_positions(
+                limit=limit, strategy_id=strategy_id
+            ))
+        )
         points = []
         cumulative = 0.0
         for index, position in enumerate(positions, start=1):
@@ -798,12 +854,47 @@ def create_app(
                 {
                     "sequence": index,
                     "market_id": position.market_id,
+                    "strategy_id": getattr(position, "strategy_id", "fade") or "fade",
                     "closed_at": position.closed_at.isoformat() if position.closed_at else None,
                     "realized_pnl": position.realized_pnl,
                     "equity": round(cumulative, 6),
                 }
             )
-        return {"count": len(points), "points": points}
+
+        # Per-strategy series — one independent equity curve per strategy
+        # that has any closed positions. Lets the dashboard overlay
+        # fade vs adaptive_v2 vs market_maker on a single chart for
+        # honest side-by-side comparison.
+        all_closed = list(reversed(service.portfolio.list_closed_positions(limit=limit)))
+        per_strategy: dict[str, list[dict]] = {}
+        cumulative_by_strategy: dict[str, float] = {}
+        sequence_by_strategy: dict[str, int] = {}
+        for position in all_closed:
+            sid = getattr(position, "strategy_id", "fade") or "fade"
+            sequence_by_strategy[sid] = sequence_by_strategy.get(sid, 0) + 1
+            cumulative_by_strategy[sid] = (
+                cumulative_by_strategy.get(sid, 0.0) + position.realized_pnl
+            )
+            per_strategy.setdefault(sid, []).append(
+                {
+                    "sequence": sequence_by_strategy[sid],
+                    "market_id": position.market_id,
+                    "strategy_id": sid,
+                    "closed_at": position.closed_at.isoformat() if position.closed_at else None,
+                    "realized_pnl": position.realized_pnl,
+                    "equity": round(cumulative_by_strategy[sid], 6),
+                }
+            )
+
+        return {
+            "count": len(points),
+            "points": points,
+            "strategy_id": strategy_id,
+            "per_strategy_series": [
+                {"strategy_id": sid, "points": pts}
+                for sid, pts in sorted(per_strategy.items())
+            ],
+        }
 
     @app.get("/api/dashboard")
     def dashboard(service: AgentService = Depends(service_factory)) -> dict:

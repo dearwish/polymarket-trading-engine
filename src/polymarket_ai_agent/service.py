@@ -61,6 +61,7 @@ class AgentService:
             settings.paper_starting_balance_usd,
             exit_slippage_bps=settings.paper_exit_slippage_bps,
             fee_bps=settings.fee_bps,
+            settings=settings,
         )
         self.settings_store = SettingsStore(settings.db_path)
         # Seed the order-id counter from the DB so paper-order IDs remain

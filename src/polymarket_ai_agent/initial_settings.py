@@ -57,6 +57,11 @@ INITIAL_SETTINGS_BASELINE: dict[str, Any] = {
     "min_candle_elapsed_seconds": 60,
     "max_candle_elapsed_seconds": 660,
     "paper_starting_balance_usd": 100.0,
+    # Empty by default → every strategy uses ``paper_starting_balance_usd``.
+    # Operator can flip this to e.g. ``"market_maker:10000,fade:200"`` to
+    # give each paper strategy an independent bankroll for honest
+    # side-by-side soak comparison.
+    "paper_starting_balance_per_strategy": "",
     "paper_position_ttl_seconds": 60,
     "paper_entry_slippage_bps": 10.0,
     "paper_exit_slippage_bps": 10.0,
@@ -110,6 +115,42 @@ INITIAL_SETTINGS_BASELINE: dict[str, Any] = {
     "adaptive_v2_post_only": True,
     "adaptive_v2_stop_loss_pct": 0.10,
     "adaptive_v2_invert": True,
+    # Market-maker strategy (V1). Off by default; flip ``mm_enabled`` true
+    # to soak it side-by-side with the directional scorers. Defaults are
+    # the conservative starting point: $1 per leg, 2¢ half-spread, 10¢
+    # toxic-spread cutoff, $5 inventory cap per side.
+    "mm_enabled": False,
+    "mm_size_usd": 5.0,
+    "mm_target_half_spread": 0.02,
+    "mm_min_market_spread": 0.01,
+    "mm_max_market_spread": 0.10,
+    "mm_min_tte_seconds": 120,
+    "mm_inventory_skew_strength": 0.5,
+    "mm_max_inventory_usd": 5.0,
+    "mm_require_rewards": False,
+    "mm_quote_ttl_seconds": 60,
+    "mm_replace_min_ticks": 1.0,
+    "mm_replace_min_size_pct": 0.10,
+    "mm_force_exit_tte_seconds": 30,
+    "mm_freshness_interval_seconds": 5.0,
+    # Adverse-selection guards (added 2026-05-03 after the soak surfaced
+    # two −$985 single-leg fills caused by stale-quote-on-resolution).
+    "mm_max_fill_drift_pct": 5.0,
+    "mm_no_fill_tte_seconds": 60,
+    "mm_max_quote_age_seconds": 600,
+    # MM universe scanner (Phase 2 — yield-based market selection).
+    # Enabled by default whenever ``mm_enabled`` is true; the scanner
+    # itself is a no-op if mm_enabled is false.
+    "mm_universe_enabled": True,
+    "mm_universe_min_rewards_daily_usd": 1.0,
+    "mm_universe_min_liquidity_usd": 5000.0,
+    "mm_universe_min_tte_seconds": 3600,
+    "mm_universe_max_markets": 5,
+    "mm_universe_refresh_seconds": 300,
+    # ON by default: don't quote markets where our $5 size is below the
+    # reward-pool min. The filter is a no-op until ``mm_enabled`` flips
+    # on, so this default doesn't affect non-MM soaks.
+    "mm_universe_require_size_eligible": True,
     "fee_bps": 0.0,
     # --- Quant scorer gates ---
     "quant_invert_drift": True,

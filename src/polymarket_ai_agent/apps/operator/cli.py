@@ -640,6 +640,90 @@ def simulate_loop(
         _handle_operator_error(exc)
 
 
+@app.command("mm-stats")
+def mm_stats() -> None:
+    """Print market-maker strategy stats: persisted reward income, in-memory
+    pending accrual, time-in-band, currently-resting quotes.
+
+    Persisted total comes from the ``reward_accruals`` SQL table — that's
+    every quote that has ended (cancelled / filled / TTL-expired). Pending
+    + per-quote rates come from the daemon heartbeat — that's the in-flight
+    accrual on quotes that are still resting in the book. Sum them for the
+    current strategy-level reward income.
+    """
+    try:
+        from polymarket_ai_agent.apps.daemon.heartbeat import HeartbeatReader
+
+        settings = get_settings()
+        service = _service()
+        persisted = service.portfolio.total_reward_accrued("market_maker")
+        reader = HeartbeatReader(settings.heartbeat_path)
+        payload = reader.read() or {}
+        hb_age = reader.age_seconds()
+        pending = float(payload.get("mm_reward_pending_usd", 0.0) or 0.0)
+        in_band_s = float(payload.get("mm_reward_in_band_seconds", 0.0) or 0.0)
+        out_band_s = float(payload.get("mm_reward_out_band_seconds", 0.0) or 0.0)
+        # The pending_makers heartbeat list contains both follow-maker
+        # (single-rest) and MM (two-sided) entries; filter on strategy_id
+        # so we only show the MM legs here.
+        all_pending = payload.get("pending_makers") or []
+        mm_pending_quotes = [
+            q for q in all_pending if q.get("strategy_id") == "market_maker"
+        ]
+
+        # Top-level summary as a Rich table.
+        summary = Table(title="MM strategy reward summary", show_header=False)
+        summary.add_column("metric")
+        summary.add_column("value", justify="right")
+        summary.add_row("Persisted (reward_accruals SUM)", f"${persisted:.4f}")
+        summary.add_row("Pending in-memory (heartbeat)", f"${pending:.4f}")
+        summary.add_row("Total reward income", f"${persisted + pending:.4f}")
+        summary.add_row(
+            "In-band time (across resting quotes)",
+            f"{in_band_s:.0f}s ({in_band_s / 60:.1f}m)",
+        )
+        summary.add_row(
+            "Out-of-band time",
+            f"{out_band_s:.0f}s ({out_band_s / 60:.1f}m)",
+        )
+        if in_band_s + out_band_s > 0:
+            in_band_pct = in_band_s / (in_band_s + out_band_s) * 100
+            summary.add_row("In-band ratio", f"{in_band_pct:.1f}%")
+        summary.add_row(
+            "Heartbeat age",
+            f"{hb_age:.1f}s" if hb_age is not None else "no heartbeat",
+        )
+        console.print(summary)
+
+        # Per-quote table.
+        if mm_pending_quotes:
+            quotes = Table(title="MM resting quotes")
+            quotes.add_column("market", overflow="fold")
+            quotes.add_column("side")
+            quotes.add_column("limit", justify="right")
+            quotes.add_column("size $", justify="right")
+            quotes.add_column("age", justify="right")
+            quotes.add_column("ttl left", justify="right")
+            for q in mm_pending_quotes:
+                quotes.add_row(
+                    str(q.get("market_id", ""))[:20],
+                    str(q.get("side", "")),
+                    f"{float(q.get('limit_price', 0.0)):.4f}",
+                    f"{float(q.get('size_usd', 0.0)):.0f}",
+                    f"{float(q.get('age_seconds', 0.0)):.0f}s",
+                    f"{float(q.get('ttl_remaining_seconds', 0.0)):.0f}s",
+                )
+            console.print(quotes)
+        else:
+            console.print(
+                "(no MM quotes currently resting — strategy may be disabled, "
+                "abstaining, or the heartbeat is stale)",
+                style="yellow",
+            )
+    except Exception as exc:
+        _handle_operator_error(exc)
+
+
 # ---------------------------------------------------------------------------
 # settings — DB-backed runtime-override management
 #

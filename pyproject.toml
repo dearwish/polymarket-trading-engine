@@ -16,6 +16,7 @@ dependencies = [
   "python-dotenv>=1.0.1",
   "py-clob-client>=0.25.0",
   "rich>=13.7.1",
+  "sortedcontainers>=2.4.0",
   "typer>=0.12.3",
   "uvicorn>=0.30.0",
   "websockets>=15.0.0",

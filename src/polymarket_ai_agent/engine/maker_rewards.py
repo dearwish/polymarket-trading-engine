@@ -34,26 +34,39 @@ from a :class:`MarketCandidate` + :class:`OrderBookSnapshot`.
 from __future__ import annotations
 
 
-def estimate_reward_per_100(
+def estimate_reward_for_size(
+    *,
     target_price: float,
     midpoint: float,
     book_levels: list[tuple[float, float]],
     max_spread_pct: float,
     daily_reward_usd: float,
+    size_usd: float,
 ) -> float:
-    """Return the expected daily USDC reward for posting $100 at ``target_price``.
+    """Return the expected daily USDC reward for posting ``size_usd`` at
+    ``target_price``.
 
-    ``book_levels`` is the list of existing ``(price, size)`` tuples on the
-    SAME side as ``target_price`` — bids if we'd rest a buy, asks for a sell.
-    Levels outside the reward band are silently ignored; the caller can pass
-    the full side without pre-filtering.
+    Same shape function as :func:`estimate_reward_per_100`, parametric on
+    quote size. Used by the market-maker strategy where leg sizes can be
+    $5 (paper-soak validation) up to $1000+ (live, sports markets where
+    Polymarket's ``rewardsMinSize`` is 1000 USDC).
+
+    ``book_levels`` is the list of existing ``(price, size)`` tuples on
+    the SAME side as ``target_price`` — bids if we'd rest a buy, asks
+    for a sell. Levels outside the reward band are silently ignored;
+    the caller can pass the full side without pre-filtering.
 
     Returns ``0.0`` when the market pays no rewards, the spread parameter
     is non-positive, the target sits outside the reward band, or the
-    target price is implausible (``<= 0``). The caller should treat those
-    as "abstain, not fallback" — a zero here is never "we don't know".
+    target price is implausible (``<= 0``).
     """
-    if daily_reward_usd <= 0.0 or max_spread_pct <= 0.0 or target_price <= 0.0 or midpoint <= 0.0:
+    if (
+        daily_reward_usd <= 0.0
+        or max_spread_pct <= 0.0
+        or target_price <= 0.0
+        or midpoint <= 0.0
+        or size_usd <= 0.0
+    ):
         return 0.0
 
     v = max_spread_pct / 100.0
@@ -62,8 +75,8 @@ def estimate_reward_per_100(
     if abs(target_price - midpoint) > v:
         return 0.0
 
-    # My contribution: $100 / price shares at this level.
-    added_shares = 100.0 / target_price
+    # My contribution: ``size_usd / price`` shares at this level.
+    added_shares = size_usd / target_price
 
     # Existing size at the target level (so we share the level's reward
     # pool rather than dominating it).
@@ -102,3 +115,24 @@ def estimate_reward_per_100(
     level_payout = (q_target / q_total) * side_pool
     my_share_of_level = added_shares / target_total_size
     return level_payout * my_share_of_level
+
+
+def estimate_reward_per_100(
+    target_price: float,
+    midpoint: float,
+    book_levels: list[tuple[float, float]],
+    max_spread_pct: float,
+    daily_reward_usd: float,
+) -> float:
+    """Compatibility wrapper around :func:`estimate_reward_for_size` at
+    the historical $100 quote size. Existing callers (daemon journal
+    instrumentation, tests) keep working unchanged.
+    """
+    return estimate_reward_for_size(
+        target_price=target_price,
+        midpoint=midpoint,
+        book_levels=book_levels,
+        max_spread_pct=max_spread_pct,
+        daily_reward_usd=daily_reward_usd,
+        size_usd=100.0,
+    )

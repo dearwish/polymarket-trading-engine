@@ -23,6 +23,36 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def parse_strategy_balance_overrides(raw: str) -> dict[str, float]:
+    """Parse a comma-separated ``strategy_id:amount`` string into a map.
+
+    Used by :meth:`PortfolioEngine.resolve_starting_balance` so each
+    paper strategy can run on its own bankroll without sharing a pool
+    with the others — fade soaks at $200, MM soaks at $10k, the
+    accounting stays honest in both directions.
+
+    Format: ``"market_maker:10000,fade:200,penny:50"``. Whitespace around
+    keys and values is stripped. Malformed pairs are silently skipped so
+    a typo on one entry doesn't blow up the whole override map.
+    """
+    overrides: dict[str, float] = {}
+    if not raw:
+        return overrides
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if not chunk or ":" not in chunk:
+            continue
+        key, _, value = chunk.partition(":")
+        key = key.strip()
+        if not key:
+            continue
+        try:
+            overrides[key] = float(value.strip())
+        except (TypeError, ValueError):
+            continue
+    return overrides
+
+
 class PortfolioEngine:
     TERMINAL_LIVE_ORDER_STATUSES = {"CANCELED", "CANCELLED", "MATCHED", "FILLED", "EXECUTED", "REJECTED"}
 
@@ -32,6 +62,7 @@ class PortfolioEngine:
         starting_balance_usd: float,
         exit_slippage_bps: float = 0.0,
         fee_bps: float = 0.0,
+        settings: "object | None" = None,
     ):
         self.db_path = db_path
         self.starting_balance_usd = starting_balance_usd
@@ -42,8 +73,35 @@ class PortfolioEngine:
         # pre-trade edge calculation.
         self.exit_slippage_bps = max(0.0, float(exit_slippage_bps))
         self.fee_bps = max(0.0, float(fee_bps))
+        # Settings ref so :meth:`resolve_starting_balance` can read live
+        # ``paper_starting_balance_per_strategy`` overrides on every call.
+        # The daemon's reload loop replaces ``self.settings`` when settings
+        # change, so per-strategy bankrolls are hot-reloadable without a
+        # daemon restart.
+        self.settings = settings
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
+
+    def resolve_starting_balance(self, strategy_id: str | None) -> float:
+        """Per-strategy bankroll, falling back to the shared default.
+
+        ``paper_starting_balance_per_strategy`` is parsed fresh on each
+        call so live edits via the SettingsStore take effect immediately
+        — same hot-reload pattern as the rest of the daemon's tunables.
+
+        Returns ``self.starting_balance_usd`` when:
+        - ``strategy_id`` is ``None`` (callers asking for the default pool),
+        - the settings ref isn't bound (older constructor call sites),
+        - the override string is empty / malformed,
+        - the specific strategy isn't in the override map.
+        """
+        if strategy_id is None or self.settings is None:
+            return self.starting_balance_usd
+        raw = getattr(self.settings, "paper_starting_balance_per_strategy", "") or ""
+        if not raw:
+            return self.starting_balance_usd
+        overrides = parse_strategy_balance_overrides(raw)
+        return overrides.get(strategy_id, self.starting_balance_usd)
 
     # --- maintenance --------------------------------------------------
 
@@ -149,9 +207,10 @@ class PortfolioEngine:
         rejected_orders = self.get_rejected_orders(now=now, strategy_id=strategy_id)
         reserved = sum(position.size_usd for position in open_positions)
         exposure = self._compute_exposure(open_positions)
+        starting_balance = self.resolve_starting_balance(strategy_id)
         return AccountState(
             mode=mode,
-            available_usd=self.starting_balance_usd + realized_pnl - reserved,
+            available_usd=starting_balance + realized_pnl - reserved,
             open_positions=len(open_positions),
             daily_realized_pnl=daily_realized_pnl,
             rejected_orders=rejected_orders,
@@ -542,6 +601,101 @@ class PortfolioEngine:
     ) -> PositionRecord | None:
         return self._get_open_position(market_id, strategy_id=strategy_id)
 
+    def record_reward_accrual(
+        self,
+        *,
+        strategy_id: str,
+        market_id: str,
+        side: str,
+        amount_usd: float,
+        period_seconds: float,
+        accrued_at: datetime | None = None,
+        in_band: bool = True,
+    ) -> None:
+        """Persist one MM reward-accrual row.
+
+        Called by the daemon when a resting MM quote ends (cancelled,
+        filled, force-exited) or when its in-memory pending balance
+        crosses the periodic flush threshold. Append-only — never
+        updates existing rows. ``amount_usd`` is the period accrual,
+        not the running total; the running total is reconstructed by
+        ``SUM`` queries downstream.
+        """
+        if amount_usd <= 0.0:
+            return
+        timestamp = accrued_at or _utc_now()
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            conn.execute(
+                """
+                INSERT INTO reward_accruals(
+                    strategy_id, market_id, side, accrued_at,
+                    period_seconds, amount_usd, in_band
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    strategy_id,
+                    market_id,
+                    side,
+                    timestamp.isoformat(),
+                    float(period_seconds),
+                    float(amount_usd),
+                    1 if in_band else 0,
+                ),
+            )
+
+    def total_reward_accrued(
+        self,
+        strategy_id: str | None = None,
+        since: datetime | None = None,
+    ) -> float:
+        """Return the cumulative reward USD for ``strategy_id``.
+
+        ``since`` filters rows by ``accrued_at >= since``; ``None`` returns
+        the lifetime total. ``strategy_id=None`` returns the cross-strategy
+        total — useful for the dashboard's aggregate "MM reward income"
+        widget.
+        """
+        clauses: list[str] = []
+        params: list = []
+        if strategy_id is not None:
+            clauses.append("strategy_id = ?")
+            params.append(strategy_id)
+        if since is not None:
+            clauses.append("accrued_at >= ?")
+            params.append(since.isoformat())
+        sql = "SELECT COALESCE(SUM(amount_usd), 0.0) FROM reward_accruals"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            row = conn.execute(sql, params).fetchone()
+        return float(row[0] or 0.0)
+
+    def list_open_positions_for_market(
+        self,
+        market_id: str,
+        strategy_id: str,
+    ) -> list[PositionRecord]:
+        """Return every open position for ``(market_id, strategy_id)``.
+
+        Most strategies maintain a single open position per ``(market,
+        strategy)`` pair and use :meth:`get_open_position`. The market-
+        maker strategy holds multiple legs simultaneously (a YES position
+        from the YES-buy fill and a NO position from the NO-buy fill) and
+        needs to enumerate both, so it uses this helper instead.
+        """
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            rows = conn.execute(
+                """
+                select market_id, side, size_usd, entry_price, order_id, opened_at, status,
+                       close_reason, closed_at, exit_price, realized_pnl, strategy_id
+                from positions
+                where market_id = ? and status = 'OPEN' and strategy_id = ?
+                order by opened_at asc
+                """,
+                (market_id, strategy_id),
+            ).fetchall()
+        return [self._row_to_position(row) for row in rows]
+
     def list_closed_tranches_for_order(self, base_order_id: str) -> list[PositionRecord]:
         """Return CLOSED tranche rows whose order_id starts with
         ``{base_order_id}-T``.
@@ -594,6 +748,59 @@ class PortfolioEngine:
             )
             conn.commit()
         return PositionAction(market_id=market_id, action="CLOSE", reason=reason)
+
+    def close_position_by_order_id(
+        self,
+        order_id: str,
+        exit_price: float,
+        reason: str,
+        now: datetime | None = None,
+    ) -> PositionAction:
+        """Close one specific open position identified by its ``order_id``.
+
+        :meth:`close_position` closes any open row matching ``(market_id,
+        strategy_id)``, which works for the single-position-per-strategy
+        scorers but not for the market-maker, which holds a YES leg and a
+        NO leg on the same market under the same ``strategy_id``. Closing
+        by ``order_id`` lets the MM lifecycle handler retire one leg
+        without touching the other.
+        """
+        if not order_id:
+            return PositionAction(market_id="", action="NOOP", reason="missing order_id")
+        current = now or _utc_now()
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            row = conn.execute(
+                """
+                select market_id, side, size_usd, entry_price, order_id, opened_at, status,
+                       close_reason, closed_at, exit_price, realized_pnl, strategy_id
+                from positions where order_id = ? and status = 'OPEN'
+                """,
+                (order_id,),
+            ).fetchone()
+            if row is None:
+                return PositionAction(
+                    market_id="", action="NOOP", reason="Position not open."
+                )
+            position = self._row_to_position(row)
+            pnl = self._compute_pnl(position, exit_price) - self._round_trip_fee(
+                position.size_usd
+            )
+            conn.execute(
+                """
+                update positions
+                set status = 'CLOSED',
+                    close_reason = ?,
+                    closed_at = ?,
+                    exit_price = ?,
+                    realized_pnl = ?
+                where order_id = ? and status = 'OPEN'
+                """,
+                (reason, current.isoformat(), exit_price, pnl, order_id),
+            )
+            conn.commit()
+        return PositionAction(
+            market_id=position.market_id, action="CLOSE", reason=reason
+        )
 
     def partial_close_position(
         self,

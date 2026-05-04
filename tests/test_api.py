@@ -134,7 +134,7 @@ class StubService:
                 )()
             ]
 
-        def list_closed_positions(self, limit=100):
+        def list_closed_positions(self, limit=100, strategy_id=None):
             return [
                 type(
                     "Position",

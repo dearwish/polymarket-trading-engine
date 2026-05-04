@@ -57,6 +57,14 @@ class MarketCandidate:
     rewards_max_spread_pct: float = 0.0
     rewards_min_size: float = 0.0
     tick_size: float = 0.01
+    # Resolution status from Gamma's ``closed`` field. ``True`` means the
+    # market has resolved (UMA-confirmed); the ``end_date_iso`` may still
+    # be in the future (it's the contract-expiry date, not the actual
+    # resolution time). The orphan-close path treats ``closed=True`` as
+    # an immediate force-close trigger regardless of TTE — without this
+    # signal, resolved sports markets stay "open" indefinitely because
+    # their nominal end_date is days/weeks ahead of the actual game.
+    closed: bool = False
 
 
 @dataclass(slots=True)
@@ -209,6 +217,7 @@ class ExecutionResult:
     order_side: OrderSide = OrderSide.BUY
     asset_id: str = ""
     executed_at: datetime = field(default_factory=utc_now)
+    strategy_id: str = "fade"
 
 
 @dataclass(slots=True)

@@ -39,6 +39,7 @@ from py_clob_client.clob_types import AssetType, BalanceAllowanceParams, OpenOrd
 from py_clob_client.order_builder.constants import BUY, SELL
 
 from polymarket_ai_agent.config import Settings
+from polymarket_ai_agent.engine.market_maker.scanner import score_mm_market
 from polymarket_ai_agent.types import (
     AuthStatus,
     ExecutionMode,
@@ -137,9 +138,21 @@ class PolymarketConnector:
         return markets[0] if markets else None
 
     def get_market(self, market_id: str) -> MarketCandidate:
+        """Fetch one specific market by id, bypassing the family filter.
+
+        Direct lookups (orphan-close reconciliation, MM positions on
+        non-BTC markets) need this to succeed even when the requested
+        market doesn't match the operator-configured ``market_family``.
+        Without ``apply_family_filter=False`` the parser silently
+        returned ``None`` for any non-BTC market and the orphan-close
+        path swallowed the resulting ``ValueError`` — which left
+        resolved-but-still-OPEN MM positions in the DB indefinitely
+        (observed 2026-05-03 on the MLB SF/TB position that resolved
+        2 days earlier but never got force-closed).
+        """
         response = self.client.get(f"{self.settings.polymarket_gamma_url}/markets/{market_id}")
         response.raise_for_status()
-        candidate = self._parse_market(response.json())
+        candidate = self._parse_market(response.json(), apply_family_filter=False)
         if not candidate:
             raise ValueError(f"Unable to parse market {market_id}")
         return candidate
@@ -406,15 +419,28 @@ class PolymarketConnector:
             return -1
         return int((expiry - datetime.now(timezone.utc)).total_seconds())
 
-    def _parse_market(self, item: dict[str, Any]) -> MarketCandidate | None:
+    def _parse_market(
+        self, item: dict[str, Any], apply_family_filter: bool = True
+    ) -> MarketCandidate | None:
         token_ids = self._parse_token_ids(item.get("clobTokenIds"))
         if len(token_ids) < 2:
             return None
         question = item.get("question") or ""
-        if not self._matches_market_family(item):
+        if apply_family_filter and not self._matches_market_family(item):
             return None
         yes_price, no_price = self._parse_outcome_prices(item.get("outcomePrices"))
-        implied = yes_price if yes_price else 0.5
+        # Falsy-zero bug fix (2026-05-03): for a RESOLVED market with
+        # YES outcome=0 (the YES side lost), ``outcomePrices = ["0", "1"]``
+        # → yes_price = 0.0. The previous ``if yes_price`` test treated
+        # 0.0 as "missing" and fell back to 0.5, which made the orphan-
+        # close path mark a $1000 YES position as a $204 spurious WIN
+        # instead of the −$1000 loss. Use sum-check instead: if the
+        # outcomes don't sum to ~1.0, the market hasn't been parsed and
+        # we use 0.5 as a neutral default.
+        if abs(yes_price + no_price - 1.0) < 0.01:
+            implied = yes_price
+        else:
+            implied = 0.5
         rewards_rate, rewards_max_spread, rewards_min_size = self._parse_rewards(item)
         tick_size = self._parse_tick_size(item)
         return MarketCandidate(
@@ -433,53 +459,193 @@ class PolymarketConnector:
             rewards_max_spread_pct=rewards_max_spread,
             rewards_min_size=rewards_min_size,
             tick_size=tick_size,
+            closed=bool(item.get("closed", False)),
         )
+
+    def discover_mm_markets(
+        self,
+        *,
+        min_rewards_daily_usd: float = 1.0,
+        min_liquidity_usd: float = 5000.0,
+        min_tte_seconds: int = 3600,
+        max_markets: int = 5,
+        fetch_limit: int = 200,
+        max_eligible_min_size_usd: float | None = None,
+    ) -> list[MarketCandidate]:
+        """Scan Polymarket for the best MM-suitable markets, ranked by yield.
+
+        The market-maker strategy needs a fundamentally different universe
+        from the BTC short-horizon scorers: reward-paying, liquid, slow-
+        moving markets where passive yield + spread capture compensates
+        for adverse selection. This bypasses the family-filter slug
+        prediction path and pulls the bulk ``/markets`` endpoint.
+
+        Filters applied client-side:
+
+        - ``rewards_daily_rate >= min_rewards_daily_usd`` (must pay maker
+          subsidies — the MM thesis assumes the daily yield is the bulk
+          of the edge, not the spread).
+        - ``liquidity_usd >= min_liquidity_usd`` (thin books invite toxic
+          flow and the spread can't be earned consistently).
+        - ``end_date_iso`` parseable AND time-to-expiry ≥ ``min_tte_seconds``
+          (a market resolving in the next hour can't accumulate enough
+          fills to capture the spread reliably).
+        - ``rewards_min_size <= max_eligible_min_size_usd`` (when supplied):
+          drop markets whose reward-eligibility minimum order size exceeds
+          our per-leg quote notional. Polymarket only counts a quote toward
+          the daily reward pool if it meets ``rewards_min_size``; posting
+          smaller is legal but earns the bare spread, defeating the strategy
+          thesis. ``None`` skips this filter so paper-mode soaks can still
+          exercise the lifecycle handler against real markets that the
+          configured size won't actually qualify on.
+
+        Ranking score (descending): ``daily_rate × 1000 / max(liquidity, 1000)``.
+        This is yield per $1k of competing liquidity — boosts markets
+        where the daily pool isn't already crowded with makers, dampens
+        markets where everyone is already MM-ing. The pure-math scoring
+        helper :func:`score_mm_market` is exposed so the daemon's reload
+        loop can re-rank without re-fetching from the API.
+
+        Returns up to ``max_markets`` candidates. Empty list if the API
+        is unavailable, no markets pay rewards, or every candidate fails
+        the filters — caller must treat empty as "skip the MM pipeline
+        this cycle", not "all markets disqualified" (those are the same
+        from the daemon's perspective).
+        """
+        params = {
+            "closed": "false",
+            "active": "true",
+            "limit": int(fetch_limit),
+            "order": "liquidityNum",
+            "ascending": "false",
+        }
+        try:
+            response = self.client.get(
+                f"{self.settings.polymarket_gamma_url}/markets", params=params
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.HTTPError, ValueError):
+            return []
+        if not isinstance(payload, list):
+            return []
+
+        scored: list[tuple[float, MarketCandidate]] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            candidate = self._parse_market(item, apply_family_filter=False)
+            if candidate is None:
+                continue
+            if candidate.rewards_daily_rate < min_rewards_daily_usd:
+                continue
+            if candidate.liquidity_usd < min_liquidity_usd:
+                continue
+            tte = self._seconds_to_expiry(candidate.end_date_iso)
+            if tte < min_tte_seconds:
+                continue
+            if (
+                max_eligible_min_size_usd is not None
+                and candidate.rewards_min_size > max_eligible_min_size_usd
+            ):
+                # Reward-pool eligibility minimum exceeds our per-leg
+                # quote size; posting here is legal but earns no subsidy.
+                continue
+            score = score_mm_market(candidate)
+            if score <= 0.0:
+                continue
+            scored.append((score, candidate))
+
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return [candidate for _score, candidate in scored[:max_markets]]
 
     @staticmethod
     def _parse_rewards(item: dict[str, Any]) -> tuple[float, float, float]:
         """Extract (daily_rate, max_spread_pct, min_size) from a Polymarket
-        market item. Returns zeros when rewards aren't exposed — the BTC
-        short-horizon markets we trade today rarely carry maker subsidies,
-        so "no rewards" is a valid state.
+        market item. Returns zeros when rewards aren't exposed.
 
-        Tolerant to multiple shapes seen across gamma and CLOB responses:
-        - ``rewards.rates[]`` array with ``asset_address`` matching USDC
-        - flat ``rewardsDailyRate`` / ``rewardsMinSize`` / ``rewardsMaxSpread``
+        Live Gamma shape verified 2026-05-01:
+
+        - ``clobRewards``: top-level list of ``{rewardsDailyRate, assetAddress,
+          startDate, endDate, ...}`` entries. USDC entries are the ones we want.
+        - ``rewardsMaxSpread``: top-level number (cents around mid, e.g. 2.5).
+        - ``rewardsMinSize``: top-level number (e.g. 100).
+
+        Older nested-``rewards.rates[]`` and flat ``rewardsDailyRate`` shapes
+        are kept as fallbacks for resilience against shape drift, but the
+        live API does NOT use them — every reward-paying market in the
+        2026-05-01 sweep had ``clobRewards`` populated and no nested ``rewards``
+        object at all.
         """
-        rewards = item.get("rewards") if isinstance(item.get("rewards"), dict) else None
         daily_rate = 0.0
         max_spread = 0.0
         min_size = 0.0
-        if rewards:
-            rates = rewards.get("rates") if isinstance(rewards.get("rates"), list) else []
-            for rate in rates:
-                if not isinstance(rate, dict):
-                    continue
-                # USDC is the only collateral on Polygon Polymarket; match by
-                # address (case-insensitive) so a stray bytes32 or reformatted
-                # string still resolves.
-                address = str(rate.get("asset_address") or rate.get("assetAddress") or "").lower()
-                if address and "2791bca1f2de4661ed88a30c99a7a9449aa84174" not in address:
-                    continue
-                try:
-                    daily_rate = float(rate.get("rewards_daily_rate") or rate.get("rewardsDailyRate") or 0.0)
-                    break
-                except (TypeError, ValueError):
-                    continue
+
+        # Primary path: top-level ``clobRewards`` list.
+        clob_rewards = item.get("clobRewards") if isinstance(item.get("clobRewards"), list) else []
+        for entry in clob_rewards:
+            if not isinstance(entry, dict):
+                continue
+            address = str(
+                entry.get("assetAddress") or entry.get("asset_address") or ""
+            ).lower()
+            # USDC is the only collateral on Polygon Polymarket; if no
+            # address matches we still take the first nonzero rate as a
+            # last-resort fallback.
+            if address and "2791bca1f2de4661ed88a30c99a7a9449aa84174" not in address:
+                continue
             try:
-                max_spread = float(rewards.get("max_spread") or rewards.get("maxSpread") or 0.0)
+                rate_value = float(
+                    entry.get("rewardsDailyRate")
+                    or entry.get("rewards_daily_rate")
+                    or 0.0
+                )
             except (TypeError, ValueError):
-                max_spread = 0.0
-            try:
-                min_size = float(rewards.get("min_size") or rewards.get("minSize") or 0.0)
-            except (TypeError, ValueError):
-                min_size = 0.0
-        # Fallback to flat fields that some gamma responses expose directly.
+                continue
+            if rate_value > 0.0:
+                daily_rate = rate_value
+                break
+
+        # Fallback: legacy nested ``rewards.rates[]`` shape (not seen in
+        # current Gamma traffic but kept for resilience).
         if daily_rate == 0.0:
-            try:
-                daily_rate = float(item.get("rewardsDailyRate") or 0.0)
-            except (TypeError, ValueError):
-                daily_rate = 0.0
+            rewards = item.get("rewards") if isinstance(item.get("rewards"), dict) else None
+            if rewards:
+                for rate in (rewards.get("rates") or []):
+                    if not isinstance(rate, dict):
+                        continue
+                    address = str(
+                        rate.get("asset_address") or rate.get("assetAddress") or ""
+                    ).lower()
+                    if address and "2791bca1f2de4661ed88a30c99a7a9449aa84174" not in address:
+                        continue
+                    try:
+                        daily_rate = float(
+                            rate.get("rewards_daily_rate")
+                            or rate.get("rewardsDailyRate")
+                            or 0.0
+                        )
+                        if daily_rate > 0.0:
+                            break
+                    except (TypeError, ValueError):
+                        continue
+                if max_spread == 0.0:
+                    try:
+                        max_spread = float(
+                            rewards.get("max_spread") or rewards.get("maxSpread") or 0.0
+                        )
+                    except (TypeError, ValueError):
+                        max_spread = 0.0
+                if min_size == 0.0:
+                    try:
+                        min_size = float(
+                            rewards.get("min_size") or rewards.get("minSize") or 0.0
+                        )
+                    except (TypeError, ValueError):
+                        min_size = 0.0
+
+        # Fallback: top-level scalar fields (the live shape — current Gamma
+        # exposes max_spread / min_size at the root, not inside clobRewards).
         if max_spread == 0.0:
             try:
                 max_spread = float(item.get("rewardsMaxSpread") or 0.0)
@@ -490,6 +656,11 @@ class PolymarketConnector:
                 min_size = float(item.get("rewardsMinSize") or 0.0)
             except (TypeError, ValueError):
                 min_size = 0.0
+        if daily_rate == 0.0:
+            try:
+                daily_rate = float(item.get("rewardsDailyRate") or 0.0)
+            except (TypeError, ValueError):
+                daily_rate = 0.0
         return daily_rate, max_spread, min_size
 
     @staticmethod

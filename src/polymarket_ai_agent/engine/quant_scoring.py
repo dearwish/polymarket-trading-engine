@@ -342,8 +342,12 @@ class QuantScoringEngine:
             return "MEDIUM"
         return "LOW"
 
-    def score_shadow(self, packet: EvidencePacket) -> MarketAssessment | None:
-        """Compute a shadow assessment for the configured HTF-tilt variant.
+    def score_shadow(
+        self,
+        packet: EvidencePacket,
+        live: MarketAssessment | None = None,
+    ) -> MarketAssessment | None:
+        """Compute a shadow assessment for the configured shadow variant.
 
         Returns None when quant_shadow_variant is empty (disabled). Trades
         continue to use score_market() exclusively; this output is logged
@@ -352,6 +356,43 @@ class QuantScoringEngine:
         variant = str(self.settings.quant_shadow_variant)
         if not variant:
             return None
+        if variant == "fade_invert_side":
+            # Side-flip A/B: mirror live fair_yes (1−p) and flip the chosen
+            # side. Inherits the live abstain decision so the chosen-tick
+            # Brier delta is computed on the same population — only the
+            # side mapping changes.
+            if live is None:
+                live = self.score_market(packet)
+            if live.suggested_side is SuggestedSide.ABSTAIN:
+                flipped_side = SuggestedSide.ABSTAIN
+            elif live.suggested_side is SuggestedSide.YES:
+                flipped_side = SuggestedSide.NO
+            else:
+                flipped_side = SuggestedSide.YES
+            fair_yes = max(0.01, min(0.99, 1.0 - live.fair_probability))
+            breakdown = self._edge_breakdown(packet, fair_yes)
+            chosen_edge = (
+                0.0
+                if flipped_side is SuggestedSide.ABSTAIN
+                else breakdown.edge_yes
+                if flipped_side is SuggestedSide.YES
+                else breakdown.edge_no
+            )
+            return MarketAssessment(
+                market_id=packet.market_id,
+                fair_probability=round(fair_yes, 6),
+                confidence=live.confidence,
+                suggested_side=flipped_side,
+                expiry_risk=live.expiry_risk,
+                reasons_for_trade=[],
+                reasons_to_abstain=[],
+                edge=round(chosen_edge, 6),
+                raw_model_output=f"quant-shadow-{variant}",
+                edge_yes=round(breakdown.edge_yes, 6),
+                edge_no=round(breakdown.edge_no, 6),
+                fair_probability_no=round(1.0 - fair_yes, 6),
+                slippage_bps=round(breakdown.slippage_bps, 4),
+            )
         base_fair, _ = self._fair_value(packet)
         tilt = 0.0
         if variant == "htf_tilt":
