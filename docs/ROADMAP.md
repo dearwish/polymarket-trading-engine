@@ -1,4 +1,4 @@
-# Optimizing the Polymarket AI Agent for Real btc_1h / btc_15m / btc_5m Trading
+# Optimizing the Polymarket Trading Engine for Real btc_1h / btc_15m / btc_5m Trading
 
 ## Context
 
@@ -15,7 +15,7 @@ Note on btc_15m: the existing code ships family scorers for `btc_1h`, `btc_5m`, 
 
 ## What the Repo Gets Right (keep)
 
-- Clear module boundaries (`src/polymarket_ai_agent/` — connectors, engine, service, apps).
+- Clear module boundaries (`src/polymarket_trading_engine/` — connectors, engine, service, apps).
 - Strong test coverage on paper paths (`tests/`).
 - Hard-gated live mode: `TRADING_MODE=live` + `LIVE_TRADING_ENABLED=true` + `--confirm-live` + preflight blockers.
 - Rich runtime settings surface (`config.py`) with editable overrides — trivial to extend for per-family knobs.
@@ -186,11 +186,11 @@ Verification:
 **Tests landing with the phase:** `tests/test_risk_profiles.py`, `tests/test_btc_15m_family.py`, `tests/test_journal_retention.py` — full suite at 224 green.
 
 ### Phase 5 — Operational readiness (daemon, metrics, reconciliation) ✅
-- `/api/healthz` aggregates DB/heartbeat/auth/safety-stop checks; `/api/metrics` emits JSON + Prometheus text. Both endpoints live in [apps/api/main.py](../src/polymarket_ai_agent/apps/api/main.py).
-- Cross-process `HeartbeatWriter` + `HeartbeatReader` ([apps/daemon/heartbeat.py](../src/polymarket_ai_agent/apps/daemon/heartbeat.py)) lets the API expose the daemon's in-memory counters without an IPC channel.
+- `/api/healthz` aggregates DB/heartbeat/auth/safety-stop checks; `/api/metrics` emits JSON + Prometheus text. Both endpoints live in [apps/api/main.py](../src/polymarket_trading_engine/apps/api/main.py).
+- Cross-process `HeartbeatWriter` + `HeartbeatReader` ([apps/daemon/heartbeat.py](../src/polymarket_trading_engine/apps/daemon/heartbeat.py)) lets the API expose the daemon's in-memory counters without an IPC channel.
 - `safety_stop_reason` extended with `auth_not_ready` and `daemon_heartbeat_stale`; the daemon journals a `safety_stop` event the first time each reason fires and skips new decision callbacks while it's hot.
 - Daemon gains `_heartbeat_loop` and `_maintenance_loop` tasks: retention (closed positions + counted rejections + terminal live orders older than `DAEMON_PRUNE_HISTORY_DAYS`), events.jsonl auto-prune, WAL checkpoint, and size gauges run every `DAEMON_MAINTENANCE_INTERVAL_SECONDS` without blocking decisions.
-- Operator CLI + Makefile shortcuts: `polymarket-ai-agent maintenance [--vacuum]`, `backup <dest>`, `heartbeat`.
+- Operator CLI + Makefile shortcuts: `polymarket-trading-engine maintenance [--vacuum]`, `backup <dest>`, `heartbeat`.
 - `PortfolioEngine.prune_history`, `vacuum`, `wal_checkpoint`, `backup` (VACUUM INTO), and `row_counts` + `Journal.vacuum` / `db_size_bytes` / `events_jsonl_size_bytes` back the above.
 - [docs/DEPLOYMENT.md](DEPLOYMENT.md) ships systemd units for the daemon and a nightly `VACUUM INTO` + rsync backup timer, a `logrotate` rule for events.jsonl, and a kill-switch alerting guide tied to `/api/healthz` and `polymarket_agent_safety_stop_triggered`.
 
@@ -209,8 +209,8 @@ persistence layers can quietly become a bomb if left alone. This is the
 audit we did before Phase 5.
 
 ### What the existing writers look like
-- [engine/portfolio.py](../src/polymarket_ai_agent/engine/portfolio.py) inserts into three tables every trade cycle: `positions` (on paper fill or live fill bridge), `order_attempts` (every execute call, success or failure), and `live_orders` (each submitted live order, plus status updates on reconciliation).
-- [engine/journal.py](../src/polymarket_ai_agent/engine/journal.py) persists `reports` rows via `save_report`, and appends every event to `events.jsonl` via `log_event`. The daemon fires a `daemon_tick` event on every quant decision — at `DAEMON_DECISION_MIN_INTERVAL_SECONDS=1.0` that's ~86k rows/day per active market before Phase 1 rate-limits.
+- [engine/portfolio.py](../src/polymarket_trading_engine/engine/portfolio.py) inserts into three tables every trade cycle: `positions` (on paper fill or live fill bridge), `order_attempts` (every execute call, success or failure), and `live_orders` (each submitted live order, plus status updates on reconciliation).
+- [engine/journal.py](../src/polymarket_trading_engine/engine/journal.py) persists `reports` rows via `save_report`, and appends every event to `events.jsonl` via `log_event`. The daemon fires a `daemon_tick` event on every quant decision — at `DAEMON_DECISION_MIN_INTERVAL_SECONDS=1.0` that's ~86k rows/day per active market before Phase 1 rate-limits.
 
 ### Concrete blow-up risks (ranked)
 
@@ -231,7 +231,7 @@ Covered in Phase 4: WAL, indexes, bounded `events.jsonl` reads, auto-prune, inde
 Covered in Phase 5:
 - `PortfolioEngine.prune_history(max_age_days)` drops old `order_attempts`, closed `positions`, and terminal `live_orders` rows; the daemon runs it every `DAEMON_MAINTENANCE_INTERVAL_SECONDS` (default 1 hour).
 - `PortfolioEngine.vacuum` + `Journal.vacuum` do a full VACUUM + `pragma wal_checkpoint(TRUNCATE)`; the maintenance loop always runs a WAL checkpoint, and `make maintenance-vacuum` + the weekly `systemd` timer in `docs/DEPLOYMENT.md` handle the heavier pass.
-- `PortfolioEngine.backup(destination)` writes a standalone compacted database via `VACUUM INTO`; the CLI command `polymarket-ai-agent backup <dir>` timestamps each snapshot and is driven by a nightly `systemd` timer that rsyncs off-host.
+- `PortfolioEngine.backup(destination)` writes a standalone compacted database via `VACUUM INTO`; the CLI command `polymarket-trading-engine backup <dir>` timestamps each snapshot and is driven by a nightly `systemd` timer that rsyncs off-host.
 - `/api/metrics` exposes `polymarket_agent_db_size_bytes`, `polymarket_agent_events_jsonl_size_bytes`, per-table row counts, exposure gauges, and the daemon's heartbeat counters in both JSON and Prometheus text.
 - `/api/healthz` surfaces heartbeat freshness, auth readiness, DB access, and the kill-switch reason so uptime monitors can alert without scraping Prometheus.
 - WAL checkpoint loop runs every maintenance tick and reports `(busy, log_pages, checkpointed_pages)` through the metrics.

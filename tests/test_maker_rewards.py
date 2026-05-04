@@ -5,7 +5,7 @@ is the $100 quote's share of the side's (daily_reward / 2) pool.
 """
 from __future__ import annotations
 
-from polymarket_ai_agent.engine.maker_rewards import estimate_reward_per_100
+from polymarket_trading_engine.engine.maker_rewards import estimate_reward_per_100
 
 
 def test_empty_book_gets_entire_side_pool() -> None:

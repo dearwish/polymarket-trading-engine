@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "polymarket-ai-agent"
+name = "polymarket-trading-engine"
 version = "0.1.0"
-description = "Event-driven Polymarket BTC trading agent. Deterministic quant scoring (Black-Scholes + GBM + microstructure) over Polymarket CLOB + Binance websockets, paper-first execution, hard-gated live trading, operator dashboard."
+description = "Event-driven Polymarket trading system. Deterministic multi-strategy scoring (quant / adaptive / overreaction / penny / maker-rewards) over Polymarket CLOB + Binance websockets, paper-first execution with a maker-first router, hard-gated live trading, runtime-tunable settings, and an operator CLI + FastAPI + React dashboard."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -32,11 +32,11 @@ dev = [
 ]
 
 [project.scripts]
-polymarket-ai-agent = "polymarket_ai_agent.apps.operator.cli:app"
-polymarket-ai-agent-api = "polymarket_ai_agent.apps.api.main:run"
+polymarket-trading-engine = "polymarket_trading_engine.apps.operator.cli:app"
+polymarket-trading-engine-api = "polymarket_trading_engine.apps.api.main:run"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/polymarket_ai_agent"]
+packages = ["src/polymarket_trading_engine"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

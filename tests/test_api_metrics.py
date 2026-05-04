@@ -6,11 +6,11 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from polymarket_ai_agent.apps.api.main import create_app
-from polymarket_ai_agent.apps.daemon.heartbeat import HeartbeatWriter
-from polymarket_ai_agent.apps.daemon.run import DaemonMetrics
-from polymarket_ai_agent.config import Settings
-from polymarket_ai_agent.service import AgentService
+from polymarket_trading_engine.apps.api.main import create_app
+from polymarket_trading_engine.apps.daemon.heartbeat import HeartbeatWriter
+from polymarket_trading_engine.apps.daemon.run import DaemonMetrics
+from polymarket_trading_engine.config import Settings
+from polymarket_trading_engine.service import AgentService
 
 
 def _settings(tmp_path: Path, **overrides) -> Settings:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from polymarket_ai_agent.engine.regime import Regime, RegimeThresholds, classify_regime
-from polymarket_ai_agent.types import EvidencePacket
+from polymarket_trading_engine.engine.regime import Regime, RegimeThresholds, classify_regime
+from polymarket_trading_engine.types import EvidencePacket
 
 
 def _packet(**overrides) -> EvidencePacket:

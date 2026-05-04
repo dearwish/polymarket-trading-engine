@@ -3,14 +3,14 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
-from polymarket_ai_agent.config import Settings
-from polymarket_ai_agent.engine.quant_scoring import (
+from polymarket_trading_engine.config import Settings
+from polymarket_trading_engine.engine.quant_scoring import (
     FADE_POST_ONLY_TAG,
     QuantScoringEngine,
     _normal_cdf,
 )
-from polymarket_ai_agent.engine.research import ResearchEngine
-from polymarket_ai_agent.types import EvidencePacket, SuggestedSide
+from polymarket_trading_engine.engine.research import ResearchEngine
+from polymarket_trading_engine.types import EvidencePacket, SuggestedSide
 
 
 def _settings(tmp_path: Path, **overrides) -> Settings:
@@ -578,8 +578,8 @@ def test_vol_regime_gate_high_raises_edge_bar(tmp_path: Path) -> None:
 
 
 def test_research_from_features_populates_btc_fields(tmp_path: Path, market_candidate) -> None:
-    from polymarket_ai_agent.engine.btc_state import BtcSnapshot
-    from polymarket_ai_agent.engine.market_state import MarketFeatures
+    from polymarket_trading_engine.engine.btc_state import BtcSnapshot
+    from polymarket_trading_engine.engine.market_state import MarketFeatures
 
     features = MarketFeatures(
         market_id="m1",

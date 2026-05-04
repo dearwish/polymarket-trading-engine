@@ -5,10 +5,10 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from polymarket_ai_agent.engine.journal import Journal
-from polymarket_ai_agent.engine.migrations import MigrationRunner
-from polymarket_ai_agent.engine.portfolio import PortfolioEngine
-from polymarket_ai_agent.types import (
+from polymarket_trading_engine.engine.journal import Journal
+from polymarket_trading_engine.engine.migrations import MigrationRunner
+from polymarket_trading_engine.engine.portfolio import PortfolioEngine
+from polymarket_trading_engine.types import (
     DecisionStatus,
     ExecutionMode,
     ExecutionResult,

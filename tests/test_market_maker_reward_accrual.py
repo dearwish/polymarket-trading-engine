@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from polymarket_ai_agent.engine.market_maker.reward_accrual import (
+from polymarket_trading_engine.engine.market_maker.reward_accrual import (
     QuoteAccrualState,
     accrue,
     take_pending,

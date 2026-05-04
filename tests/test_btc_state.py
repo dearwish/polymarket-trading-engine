@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from datetime import datetime, timedelta, timezone
 
-from polymarket_ai_agent.engine.btc_state import BtcState, session_bucket
+from polymarket_trading_engine.engine.btc_state import BtcState, session_bucket
 
 
 def _ts(seconds: float) -> datetime:

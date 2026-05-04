@@ -4,7 +4,7 @@ import json
 
 import httpx
 
-from polymarket_ai_agent.connectors.binance_ws import BinanceBtcFeed
+from polymarket_trading_engine.connectors.binance_ws import BinanceBtcFeed
 
 
 def test_stream_url_combines_both_streams() -> None:

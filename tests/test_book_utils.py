@@ -1,7 +1,7 @@
 """Tests for shared order-book helpers."""
 from __future__ import annotations
 
-from polymarket_ai_agent.engine.execution.book_utils import first_level_with_size
+from polymarket_trading_engine.engine.execution.book_utils import first_level_with_size
 
 
 def test_empty_book_returns_none() -> None:

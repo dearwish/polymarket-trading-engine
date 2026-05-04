@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from polymarket_ai_agent.engine.execution import ExecutionEngine
-from polymarket_ai_agent.types import DecisionStatus, ExecutionMode, ExecutionResult, SuggestedSide, TradeDecision
+from polymarket_trading_engine.engine.execution import ExecutionEngine
+from polymarket_trading_engine.types import DecisionStatus, ExecutionMode, ExecutionResult, SuggestedSide, TradeDecision
 
 
 def test_execution_engine_skips_non_approved_trade() -> None:
@@ -21,7 +21,7 @@ def test_execution_engine_skips_non_approved_trade() -> None:
 
 
 def test_execution_engine_executes_paper_trade() -> None:
-    from polymarket_ai_agent.types import OrderBookSnapshot
+    from polymarket_trading_engine.types import OrderBookSnapshot
 
     engine = ExecutionEngine(ExecutionMode.PAPER, paper_entry_slippage_bps=10)
     decision = TradeDecision(
@@ -53,7 +53,7 @@ def test_execution_engine_fills_no_side_in_no_token_frame() -> None:
     Before the fix, NO-side trades walked YES asks and stored entry_price in the
     YES frame, which then inverted PnL in Portfolio._compute_pnl.
     """
-    from polymarket_ai_agent.types import OrderBookSnapshot
+    from polymarket_trading_engine.types import OrderBookSnapshot
 
     engine = ExecutionEngine(ExecutionMode.PAPER, paper_entry_slippage_bps=0)
     decision = TradeDecision(

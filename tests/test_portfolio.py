@@ -3,8 +3,8 @@ from __future__ import annotations
 import sqlite3
 from datetime import timedelta
 
-from polymarket_ai_agent.engine.portfolio import PortfolioEngine
-from polymarket_ai_agent.types import DecisionStatus, ExecutionMode, ExecutionResult, SuggestedSide, TradeDecision, utc_now
+from polymarket_trading_engine.engine.portfolio import PortfolioEngine
+from polymarket_trading_engine.types import DecisionStatus, ExecutionMode, ExecutionResult, SuggestedSide, TradeDecision, utc_now
 
 
 def test_portfolio_records_paper_execution(settings) -> None:
@@ -255,7 +255,7 @@ def test_portfolio_no_side_pnl_sign_is_correct(settings) -> None:
 
 
 def test_portfolio_estimates_exit_price_for_yes(settings) -> None:
-    from polymarket_ai_agent.types import OrderBookSnapshot, PositionRecord
+    from polymarket_trading_engine.types import OrderBookSnapshot, PositionRecord
 
     orderbook = OrderBookSnapshot(
         bid=0.60,

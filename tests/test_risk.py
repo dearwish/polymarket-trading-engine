@@ -1,8 +1,8 @@
 from datetime import timedelta
 
-from polymarket_ai_agent.config import Settings
-from polymarket_ai_agent.engine.risk import RiskEngine
-from polymarket_ai_agent.types import (
+from polymarket_trading_engine.config import Settings
+from polymarket_trading_engine.engine.risk import RiskEngine
+from polymarket_trading_engine.types import (
     AccountState,
     ExecutionMode,
     MarketAssessment,

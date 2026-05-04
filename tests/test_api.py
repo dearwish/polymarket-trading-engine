@@ -4,8 +4,8 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from polymarket_ai_agent.apps.api.main import create_app
-from polymarket_ai_agent.config import Settings
+from polymarket_trading_engine.apps.api.main import create_app
+from polymarket_trading_engine.config import Settings
 
 
 class StubService:
@@ -117,7 +117,7 @@ class StubService:
     class Portfolio:
         def list_open_positions(self):
             from datetime import datetime, timezone
-            from polymarket_ai_agent.types import SuggestedSide
+            from polymarket_trading_engine.types import SuggestedSide
             return [
                 type(
                     "Position",
@@ -368,9 +368,9 @@ def test_api_live_activity_returns_404_when_active_market_missing() -> None:
 
 
 def test_api_settings_round_trip(tmp_path: Path) -> None:
-    from polymarket_ai_agent.engine.migrations import MigrationRunner
-    from polymarket_ai_agent.engine.settings_store import SettingsStore
-    from polymarket_ai_agent.config import load_runtime_overrides
+    from polymarket_trading_engine.engine.migrations import MigrationRunner
+    from polymarket_trading_engine.engine.settings_store import SettingsStore
+    from polymarket_trading_engine.config import load_runtime_overrides
 
     db_path = tmp_path / "data" / "agent.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -403,7 +403,7 @@ def test_api_settings_round_trip(tmp_path: Path) -> None:
     # After migration, every editable field is overridden by the baseline
     # seed row — effective value = INITIAL_SETTINGS_BASELINE, not the
     # pydantic default on base_settings.
-    from polymarket_ai_agent.initial_settings import INITIAL_SETTINGS_BASELINE
+    from polymarket_trading_engine.initial_settings import INITIAL_SETTINGS_BASELINE
     assert response.json()["values"]["market_family"] == INITIAL_SETTINGS_BASELINE["market_family"]
 
     updated = client.put("/api/settings", json={"values": {"market_family": "btc_daily_threshold", "min_edge": 0.02}})

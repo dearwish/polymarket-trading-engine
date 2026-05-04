@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from polymarket_ai_agent.config import Settings
-from polymarket_ai_agent.engine.execution import ExecutionEngine, ExecutionRouter
-from polymarket_ai_agent.types import (
+from polymarket_trading_engine.config import Settings
+from polymarket_trading_engine.engine.execution import ExecutionEngine, ExecutionRouter
+from polymarket_trading_engine.types import (
     DecisionStatus,
     ExecutionMode,
     ExecutionStyle,

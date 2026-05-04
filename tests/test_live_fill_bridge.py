@@ -3,9 +3,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
-from polymarket_ai_agent.engine.migrations import MigrationRunner
-from polymarket_ai_agent.engine.portfolio import PortfolioEngine
-from polymarket_ai_agent.types import (
+from polymarket_trading_engine.engine.migrations import MigrationRunner
+from polymarket_trading_engine.engine.portfolio import PortfolioEngine
+from polymarket_trading_engine.types import (
     DecisionStatus,
     ExecutionMode,
     ExecutionResult,

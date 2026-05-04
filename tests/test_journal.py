@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from polymarket_ai_agent.engine.journal import Journal
+from polymarket_trading_engine.engine.journal import Journal
 
 
 def test_journal_logs_event_and_reads_reports(settings) -> None:

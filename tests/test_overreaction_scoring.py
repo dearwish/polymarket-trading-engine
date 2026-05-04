@@ -6,12 +6,12 @@ flip the decision surface.
 """
 from __future__ import annotations
 
-from polymarket_ai_agent.engine.overreaction_scoring import (
+from polymarket_trading_engine.engine.overreaction_scoring import (
     OVERREACTION_POST_ONLY_TAG,
     OVERREACTION_TAG,
     OverreactionScorer,
 )
-from polymarket_ai_agent.types import EvidencePacket, SuggestedSide
+from polymarket_trading_engine.types import EvidencePacket, SuggestedSide
 
 
 def _packet(**overrides) -> EvidencePacket:

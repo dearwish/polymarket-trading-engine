@@ -1,0 +1,2 @@
+"""Polymarket Trading Engine package."""
+

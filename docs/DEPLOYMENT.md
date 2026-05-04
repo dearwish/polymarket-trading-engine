@@ -122,11 +122,11 @@ stack on a VPS is `systemd` for the daemon, `systemd` timers (or `cron`) for
 backups, `logrotate` for the event journal, and the operator API behind
 `uvicorn` or a local reverse proxy.
 
-### polymarket-ai-agent.service
+### polymarket-trading-engine.service
 
 ```ini
 [Unit]
-Description=Polymarket AI Agent daemon
+Description=Polymarket Trading Engine daemon
 After=network-online.target
 Wants=network-online.target
 
@@ -134,34 +134,34 @@ Wants=network-online.target
 Type=simple
 User=polymarket
 Group=polymarket
-WorkingDirectory=/opt/polymarket-ai-agent
-EnvironmentFile=/opt/polymarket-ai-agent/.env
-ExecStart=/opt/polymarket-ai-agent/.venv/bin/polymarket-ai-agent daemon
+WorkingDirectory=/opt/polymarket-trading-engine
+EnvironmentFile=/opt/polymarket-trading-engine/.env
+ExecStart=/opt/polymarket-trading-engine/.venv/bin/polymarket-trading-engine daemon
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
 # Tighten the sandbox if systemd version supports it:
 ProtectSystem=strict
-ReadWritePaths=/opt/polymarket-ai-agent/data /opt/polymarket-ai-agent/logs
+ReadWritePaths=/opt/polymarket-trading-engine/data /opt/polymarket-trading-engine/logs
 NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-Drop that into `/etc/systemd/system/polymarket-ai-agent.service`, then:
+Drop that into `/etc/systemd/system/polymarket-trading-engine.service`, then:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now polymarket-ai-agent.service
-sudo systemctl status polymarket-ai-agent.service
-journalctl -u polymarket-ai-agent -f   # live log tail
+sudo systemctl enable --now polymarket-trading-engine.service
+sudo systemctl status polymarket-trading-engine.service
+journalctl -u polymarket-trading-engine -f   # live log tail
 ```
 
-### polymarket-ai-agent-api.service (optional)
+### polymarket-trading-engine-api.service (optional)
 
-Mirror the daemon unit but with `ExecStart=.../polymarket-ai-agent-api` and
+Mirror the daemon unit but with `ExecStart=.../polymarket-trading-engine-api` and
 expose it over a local loopback (or via an HTTPS reverse proxy) for the
 dashboard to poll `/api/metrics` and `/api/healthz`.
 
@@ -181,8 +181,8 @@ Description=Polymarket agent SQLite backup
 [Service]
 Type=oneshot
 User=polymarket
-EnvironmentFile=/opt/polymarket-ai-agent/.env
-ExecStart=/opt/polymarket-ai-agent/.venv/bin/polymarket-ai-agent backup /var/backups/polymarket/
+EnvironmentFile=/opt/polymarket-trading-engine/.env
+ExecStart=/opt/polymarket-trading-engine/.venv/bin/polymarket-trading-engine backup /var/backups/polymarket/
 ExecStartPost=/usr/bin/rsync -a /var/backups/polymarket/ backup@off-host:/srv/polymarket-agent-backups/
 ```
 
@@ -225,8 +225,8 @@ The daemon's auto-prune is the primary defence, but `logrotate` also works
 as a belt-and-suspenders rotation:
 
 ```text
-# /etc/logrotate.d/polymarket-ai-agent
-/opt/polymarket-ai-agent/logs/events.jsonl {
+# /etc/logrotate.d/polymarket-trading-engine
+/opt/polymarket-trading-engine/logs/events.jsonl {
     daily
     rotate 7
     size 200M

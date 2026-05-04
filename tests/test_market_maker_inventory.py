@@ -8,8 +8,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from polymarket_ai_agent.engine.market_maker.inventory import compute_inventory
-from polymarket_ai_agent.types import PositionRecord, SuggestedSide
+from polymarket_trading_engine.engine.market_maker.inventory import compute_inventory
+from polymarket_trading_engine.types import PositionRecord, SuggestedSide
 
 
 def _pos(

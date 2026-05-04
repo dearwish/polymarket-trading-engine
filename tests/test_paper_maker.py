@@ -3,13 +3,13 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from polymarket_ai_agent.engine.execution.paper_maker import (
+from polymarket_trading_engine.engine.execution.paper_maker import (
     PaperMakerOrder,
     check_fill,
     is_expired,
     maker_limit_price,
 )
-from polymarket_ai_agent.types import SuggestedSide
+from polymarket_trading_engine.types import SuggestedSide
 
 
 def _now() -> datetime:

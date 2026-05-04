@@ -8,7 +8,7 @@ Locks in:
 """
 from __future__ import annotations
 
-from polymarket_ai_agent.engine.market_maker.quoter import (
+from polymarket_trading_engine.engine.market_maker.quoter import (
     QuotePair,
     compute_quote_pair,
     in_reward_band,

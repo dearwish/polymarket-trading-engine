@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from polymarket_ai_agent.engine.journal import Journal
-from polymarket_ai_agent.engine.migrations import MigrationRunner
+from polymarket_trading_engine.engine.journal import Journal
+from polymarket_trading_engine.engine.migrations import MigrationRunner
 
 
 def _journal(tmp_path: Path, **kwargs) -> Journal:

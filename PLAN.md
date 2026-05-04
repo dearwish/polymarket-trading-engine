@@ -1,4 +1,4 @@
-# Polymarket AI Agent Plan (Revised With Repo Foundations)
+# Polymarket Trading Engine Plan (Revised With Repo Foundations)
 
 ## Summary
 

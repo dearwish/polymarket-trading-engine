@@ -2940,7 +2940,7 @@ export default function App() {
             <header className="hero">
               <div className="hero-left">
                 <div>
-                  <p className="eyebrow">Polymarket AI Agent</p>
+                  <p className="eyebrow">Polymarket Trading Engine</p>
                   <h1>Operator Dashboard</h1>
                 </div>
                 <div className="hero-kpis">

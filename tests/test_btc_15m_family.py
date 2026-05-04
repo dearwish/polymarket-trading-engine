@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from polymarket_ai_agent.config import Settings
-from polymarket_ai_agent.connectors.polymarket import PolymarketConnector
+from polymarket_trading_engine.config import Settings
+from polymarket_trading_engine.connectors.polymarket import PolymarketConnector
 
 
 def _settings(tmp_path: Path, family: str) -> Settings:

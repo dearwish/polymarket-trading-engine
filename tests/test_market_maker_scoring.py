@@ -7,11 +7,11 @@ can dispatch into the MM lifecycle handler.
 """
 from __future__ import annotations
 
-from polymarket_ai_agent.engine.market_maker.scorer import (
+from polymarket_trading_engine.engine.market_maker.scorer import (
     MARKET_MAKER_STRATEGY_TAG,
     MarketMakerScorer,
 )
-from polymarket_ai_agent.types import EvidencePacket, SuggestedSide
+from polymarket_trading_engine.types import EvidencePacket, SuggestedSide
 
 
 def _packet(**overrides) -> EvidencePacket:

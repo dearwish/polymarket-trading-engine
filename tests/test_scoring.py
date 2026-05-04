@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import json
 
-from polymarket_ai_agent.engine.research import ResearchEngine
-from polymarket_ai_agent.engine.scoring import ScoringEngine
-from polymarket_ai_agent.types import SuggestedSide
+from polymarket_trading_engine.engine.research import ResearchEngine
+from polymarket_trading_engine.engine.scoring import ScoringEngine
+from polymarket_trading_engine.types import SuggestedSide
 
 
 class DummyResponse:

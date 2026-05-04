@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from polymarket_ai_agent.service import AgentService
-from polymarket_ai_agent.types import (
+from polymarket_trading_engine.service import AgentService
+from polymarket_trading_engine.types import (
     AccountState,
     DecisionStatus,
     ExecutionMode,
@@ -146,7 +146,7 @@ def test_agent_service_manage_open_positions(settings, market_snapshot) -> None:
     actions_seen = []
 
     def close_position(market_id: str, exit_price: float, reason: str):
-        from polymarket_ai_agent.types import PositionAction
+        from polymarket_trading_engine.types import PositionAction
 
         action = PositionAction(market_id=market_id, action="CLOSE", reason=reason)
         actions_seen.append((market_id, exit_price, reason))
@@ -166,7 +166,7 @@ def test_agent_service_close_position(settings, market_snapshot) -> None:
     seen = {}
 
     def close_position(market_id: str, exit_price: float, reason: str):
-        from polymarket_ai_agent.types import PositionAction
+        from polymarket_trading_engine.types import PositionAction
 
         seen["call"] = (market_id, exit_price, reason)
         return PositionAction(market_id=market_id, action="CLOSE", reason=reason)

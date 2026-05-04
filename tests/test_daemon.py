@@ -5,12 +5,12 @@ from collections.abc import AsyncIterator, Iterable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from polymarket_ai_agent.apps.daemon.run import DaemonConfig, DaemonMetrics, DaemonRunner
-from polymarket_ai_agent.config import Settings
-from polymarket_ai_agent.connectors.binance_ws import BtcTick
-from polymarket_ai_agent.connectors.polymarket_ws import MarketStreamEvent
-from polymarket_ai_agent.service import AgentService
-from polymarket_ai_agent.types import MarketCandidate
+from polymarket_trading_engine.apps.daemon.run import DaemonConfig, DaemonMetrics, DaemonRunner
+from polymarket_trading_engine.config import Settings
+from polymarket_trading_engine.connectors.binance_ws import BtcTick
+from polymarket_trading_engine.connectors.polymarket_ws import MarketStreamEvent
+from polymarket_trading_engine.service import AgentService
+from polymarket_trading_engine.types import MarketCandidate
 
 
 class FakeMarketStream:
@@ -87,7 +87,7 @@ def _candidate(market_id: str, yes: str, no: str) -> MarketCandidate:
 
 
 def _settings(tmp_path: Path) -> Settings:
-    from polymarket_ai_agent.engine.migrations import MigrationRunner
+    from polymarket_trading_engine.engine.migrations import MigrationRunner
 
     s = Settings(
         openrouter_api_key="",
@@ -308,10 +308,10 @@ def test_daemon_paper_execute_callback_opens_and_closes_position(tmp_path: Path)
     assessment, invokes the callback, and asserts that a paper position is
     opened. A second invocation with TTE inside the exit buffer must close it.
     """
-    from polymarket_ai_agent.apps.daemon.run import DecisionContext
-    from polymarket_ai_agent.engine.btc_state import BtcSnapshot
-    from polymarket_ai_agent.engine.market_state import MarketState
-    from polymarket_ai_agent.types import MarketAssessment, SuggestedSide
+    from polymarket_trading_engine.apps.daemon.run import DecisionContext
+    from polymarket_trading_engine.engine.btc_state import BtcSnapshot
+    from polymarket_trading_engine.engine.market_state import MarketState
+    from polymarket_trading_engine.types import MarketAssessment, SuggestedSide
 
     settings = _settings(tmp_path).model_copy(update={
         "daemon_auto_paper_execute": True,
@@ -412,10 +412,10 @@ def test_daemon_paper_execute_callback_opens_and_closes_position(tmp_path: Path)
 
 def _setup_runner_with_open_yes_position(tmp_path, entry_price: float, settings_overrides: dict):
     """Shared setup for TP / SL tests: opens a YES position at entry_price."""
-    from polymarket_ai_agent.apps.daemon.run import DecisionContext
-    from polymarket_ai_agent.engine.btc_state import BtcSnapshot
-    from polymarket_ai_agent.engine.market_state import MarketState
-    from polymarket_ai_agent.types import MarketAssessment, SuggestedSide
+    from polymarket_trading_engine.apps.daemon.run import DecisionContext
+    from polymarket_trading_engine.engine.btc_state import BtcSnapshot
+    from polymarket_trading_engine.engine.market_state import MarketState
+    from polymarket_trading_engine.types import MarketAssessment, SuggestedSide
 
     base_overrides = {
         "daemon_auto_paper_execute": True,
@@ -477,8 +477,8 @@ def _setup_runner_with_open_yes_position(tmp_path, entry_price: float, settings_
 
 
 def test_paper_take_profit_closes_position_when_mid_rises(tmp_path) -> None:
-    from polymarket_ai_agent.apps.daemon.run import DecisionContext
-    from polymarket_ai_agent.engine.market_state import MarketState
+    from polymarket_trading_engine.apps.daemon.run import DecisionContext
+    from polymarket_trading_engine.engine.market_state import MarketState
 
     runner, service, candidate, approved, btc = _setup_runner_with_open_yes_position(
         tmp_path, entry_price=0.50, settings_overrides={"paper_take_profit_pct": 0.20},
@@ -614,8 +614,8 @@ def test_paper_sl_limit_out_cancels_when_book_empty_and_price_recovered(tmp_path
     assert extras_key in runner._pending_sl_exits
     # Snapshot with NO bid levels and a high ask — fallback uses mid (high),
     # so sl_triggered becomes false; limit can't fill (empty book) → cancel.
-    from polymarket_ai_agent.apps.daemon.run import DecisionContext
-    from polymarket_ai_agent.engine.market_state import MarketState
+    from polymarket_trading_engine.apps.daemon.run import DecisionContext
+    from polymarket_trading_engine.engine.market_state import MarketState
     state = MarketState(
         market_id=candidate.market_id, yes_token_id="yes-tok", no_token_id="no-tok",
     )
@@ -654,8 +654,8 @@ def test_paper_sl_limit_out_disabled_uses_legacy_walk(tmp_path) -> None:
 
 
 def test_paper_stop_loss_closes_position_when_mid_drops(tmp_path) -> None:
-    from polymarket_ai_agent.apps.daemon.run import DecisionContext
-    from polymarket_ai_agent.engine.market_state import MarketState
+    from polymarket_trading_engine.apps.daemon.run import DecisionContext
+    from polymarket_trading_engine.engine.market_state import MarketState
 
     runner, service, candidate, approved, btc = _setup_runner_with_open_yes_position(
         tmp_path, entry_price=0.50, settings_overrides={"paper_stop_loss_pct": 0.15},
@@ -680,8 +680,8 @@ def test_paper_stop_loss_closes_position_when_mid_drops(tmp_path) -> None:
 
 
 def test_paper_trailing_stop_rides_up_then_exits_on_reversal(tmp_path) -> None:
-    from polymarket_ai_agent.apps.daemon.run import DecisionContext
-    from polymarket_ai_agent.engine.market_state import MarketState
+    from polymarket_trading_engine.apps.daemon.run import DecisionContext
+    from polymarket_trading_engine.engine.market_state import MarketState
 
     runner, service, candidate, approved, btc = _setup_runner_with_open_yes_position(
         tmp_path, entry_price=0.50, settings_overrides={"paper_trailing_stop_pct": 0.10},
@@ -726,8 +726,8 @@ def test_paper_trailing_stop_rides_up_then_exits_on_reversal(tmp_path) -> None:
 
 def _tick_with_book(runner, candidate, approved, btc, bid: float, ask: float):
     """Apply a fresh book snapshot and run one decision-callback tick."""
-    from polymarket_ai_agent.apps.daemon.run import DecisionContext
-    from polymarket_ai_agent.engine.market_state import MarketState
+    from polymarket_trading_engine.apps.daemon.run import DecisionContext
+    from polymarket_trading_engine.engine.market_state import MarketState
 
     state = MarketState(
         market_id=candidate.market_id, yes_token_id="yes-tok", no_token_id="no-tok",
@@ -822,8 +822,8 @@ def test_paper_trail_confirmation_ticks_default_zero_fires_immediately(tmp_path)
 
 
 def test_paper_tp_ladder_closes_position_in_tranches(tmp_path) -> None:
-    from polymarket_ai_agent.apps.daemon.run import DecisionContext
-    from polymarket_ai_agent.engine.market_state import MarketState
+    from polymarket_trading_engine.apps.daemon.run import DecisionContext
+    from polymarket_trading_engine.engine.market_state import MarketState
 
     # Ladder: close 50% at +15%, close another 25% at +30%. Remainder (25%)
     # sits open unless another exit fires.
@@ -877,8 +877,8 @@ def test_paper_tp_ladder_three_tranches_each_one_third_of_original(tmp_path) -> 
     tranche should close ~$3.33 (1/3 of ORIGINAL), leaving ~$3.33 for the
     trail to manage. Regression for user-observed issue where second tranche
     only took 33% of the already-shrunk remainder."""
-    from polymarket_ai_agent.apps.daemon.run import DecisionContext
-    from polymarket_ai_agent.engine.market_state import MarketState
+    from polymarket_trading_engine.apps.daemon.run import DecisionContext
+    from polymarket_trading_engine.engine.market_state import MarketState
 
     runner, service, candidate, approved, btc = _setup_runner_with_open_yes_position(
         tmp_path, entry_price=0.50,
@@ -923,8 +923,8 @@ def test_fixed_tp_skipped_after_ladder_tranche_fires(tmp_path) -> None:
     where ladder_1 then ladder_2 then paper_take_profit all fired on the
     same position.
     """
-    from polymarket_ai_agent.apps.daemon.run import DecisionContext
-    from polymarket_ai_agent.engine.market_state import MarketState
+    from polymarket_trading_engine.apps.daemon.run import DecisionContext
+    from polymarket_trading_engine.engine.market_state import MarketState
 
     runner, service, candidate, approved, btc = _setup_runner_with_open_yes_position(
         tmp_path, entry_price=0.50, settings_overrides={
@@ -981,8 +981,8 @@ def test_ladder_state_rehydrates_from_db_after_daemon_restart(tmp_path) -> None:
     $1.48 instead of $3.33 → $3.33 → $3.33). After restart the daemon must
     reconstruct tranches_closed + original_size_usd from closed-tranche rows.
     """
-    from polymarket_ai_agent.apps.daemon.run import DaemonRunner, DaemonConfig
-    from polymarket_ai_agent.types import (
+    from polymarket_trading_engine.apps.daemon.run import DaemonRunner, DaemonConfig
+    from polymarket_trading_engine.types import (
         DecisionStatus, ExecutionMode, ExecutionResult, SuggestedSide, TradeDecision,
     )
 
@@ -1035,9 +1035,9 @@ def test_paper_exit_fill_walks_bid_book_for_yes_position(tmp_path) -> None:
     consumed notional, and return that instead of just applying slippage
     to mid. This captures the full spread cost that real Polymarket
     executions pay but the old mid±slippage model missed."""
-    from polymarket_ai_agent.apps.daemon.run import DecisionContext
-    from polymarket_ai_agent.engine.market_state import MarketState
-    from polymarket_ai_agent.types import SuggestedSide
+    from polymarket_trading_engine.apps.daemon.run import DecisionContext
+    from polymarket_trading_engine.engine.market_state import MarketState
+    from polymarket_trading_engine.types import SuggestedSide
 
     runner, service, candidate, approved, btc = _setup_runner_with_open_yes_position(
         tmp_path, entry_price=0.50, settings_overrides={
@@ -1074,8 +1074,8 @@ def test_paper_trail_arm_threshold_blocks_premature_trail_exit(tmp_path) -> None
     the position at a loss. With paper_trail_arm_pct=0.05 the trail stays
     disarmed below +5% peak.
     """
-    from polymarket_ai_agent.apps.daemon.run import DecisionContext
-    from polymarket_ai_agent.engine.market_state import MarketState
+    from polymarket_trading_engine.apps.daemon.run import DecisionContext
+    from polymarket_trading_engine.engine.market_state import MarketState
 
     runner, service, candidate, approved, btc = _setup_runner_with_open_yes_position(
         tmp_path, entry_price=0.50, settings_overrides={
@@ -1120,8 +1120,8 @@ def test_paper_trail_floor_clamps_to_entry_when_arm_below_invariant(tmp_path) ->
     realised loss on the first pullback. Mirrors the production config that
     fired a −7.4% trail on market 2013005.
     """
-    from polymarket_ai_agent.apps.daemon.run import DecisionContext
-    from polymarket_ai_agent.engine.market_state import MarketState
+    from polymarket_trading_engine.apps.daemon.run import DecisionContext
+    from polymarket_trading_engine.engine.market_state import MarketState
 
     runner, service, candidate, approved, btc = _setup_runner_with_open_yes_position(
         tmp_path, entry_price=0.37, settings_overrides={
@@ -1170,8 +1170,8 @@ def test_paper_trail_floor_clamps_to_entry_when_arm_below_invariant(tmp_path) ->
 
 
 def test_paper_entry_cooldown_blocks_immediate_reentry(tmp_path) -> None:
-    from polymarket_ai_agent.apps.daemon.run import DecisionContext
-    from polymarket_ai_agent.engine.market_state import MarketState
+    from polymarket_trading_engine.apps.daemon.run import DecisionContext
+    from polymarket_trading_engine.engine.market_state import MarketState
 
     runner, service, candidate, approved, btc = _setup_runner_with_open_yes_position(
         tmp_path, entry_price=0.50, settings_overrides={
@@ -1214,7 +1214,7 @@ def test_paper_entry_cooldown_blocks_immediate_reentry(tmp_path) -> None:
 
 
 def test_tp_ladder_parser_ignores_malformed_pairs() -> None:
-    from polymarket_ai_agent.apps.daemon.run import DaemonRunner
+    from polymarket_trading_engine.apps.daemon.run import DaemonRunner
     assert DaemonRunner._parse_tp_ladder("") == []
     assert DaemonRunner._parse_tp_ladder("0.15:0.5") == [(0.15, 0.5)]
     # Malformed pieces skipped; valid ones sorted ascending by pct.
@@ -1235,10 +1235,10 @@ def test_min_candle_elapsed_blocks_early_entry(tmp_path: Path) -> None:
     Verifies that setting min_candle_elapsed_seconds=60 prevents a new position
     from opening at t=30s, and allows one at t=90s — for a candle-style family.
     """
-    from polymarket_ai_agent.apps.daemon.run import DecisionContext
-    from polymarket_ai_agent.engine.btc_state import BtcSnapshot
-    from polymarket_ai_agent.engine.market_state import MarketState
-    from polymarket_ai_agent.types import EvidencePacket, MarketAssessment, SuggestedSide
+    from polymarket_trading_engine.apps.daemon.run import DecisionContext
+    from polymarket_trading_engine.engine.btc_state import BtcSnapshot
+    from polymarket_trading_engine.engine.market_state import MarketState
+    from polymarket_trading_engine.types import EvidencePacket, MarketAssessment, SuggestedSide
 
     settings = _settings(tmp_path).model_copy(update={
         "daemon_auto_paper_execute": True,
@@ -1444,10 +1444,10 @@ def test_daemon_multi_strategy_opens_per_strategy_positions(tmp_path: Path) -> N
     scorer delegates to fade unchanged. Both strategies score the same
     packet and both decide to trade.
     """
-    from polymarket_ai_agent.apps.daemon.run import DecisionContext
-    from polymarket_ai_agent.engine.btc_state import BtcSnapshot
-    from polymarket_ai_agent.engine.market_state import MarketState
-    from polymarket_ai_agent.types import EvidencePacket
+    from polymarket_trading_engine.apps.daemon.run import DecisionContext
+    from polymarket_trading_engine.engine.btc_state import BtcSnapshot
+    from polymarket_trading_engine.engine.market_state import MarketState
+    from polymarket_trading_engine.types import EvidencePacket
 
     settings = _settings(tmp_path).model_copy(update={
         "daemon_auto_paper_execute": True,
@@ -1548,10 +1548,10 @@ def test_daemon_multi_strategy_adaptive_delegates_in_trend(tmp_path: Path) -> No
     should open positions on the same trending setup — fade via its own
     taker path and adaptive via the delegated fade assessment.
     """
-    from polymarket_ai_agent.apps.daemon.run import DecisionContext
-    from polymarket_ai_agent.engine.btc_state import BtcSnapshot
-    from polymarket_ai_agent.engine.market_state import MarketState
-    from polymarket_ai_agent.types import EvidencePacket
+    from polymarket_trading_engine.apps.daemon.run import DecisionContext
+    from polymarket_trading_engine.engine.btc_state import BtcSnapshot
+    from polymarket_trading_engine.engine.market_state import MarketState
+    from polymarket_trading_engine.types import EvidencePacket
 
     settings = _settings(tmp_path).model_copy(update={
         "daemon_auto_paper_execute": True,
@@ -1651,7 +1651,7 @@ def _follow_packet(market_id: str, bid_yes: float = 0.66, ask_yes: float = 0.68)
     """Trending-up packet with a liquid YES book — triggers adaptive
     follow-with-maker on a YES buy.
     """
-    from polymarket_ai_agent.types import EvidencePacket
+    from polymarket_trading_engine.types import EvidencePacket
     return EvidencePacket(
         market_id=market_id,
         question="test",
@@ -1705,7 +1705,7 @@ def _follow_settings(tmp_path: Path):
 
 
 def _follow_runner_and_state(tmp_path: Path, candidate_id: str = "m-follow"):
-    from polymarket_ai_agent.engine.market_state import MarketState
+    from polymarket_trading_engine.engine.market_state import MarketState
 
     settings = _follow_settings(tmp_path)
     service = AgentService(settings)
@@ -1732,8 +1732,8 @@ def _apply_book(state, bid_yes: float, ask_yes: float) -> None:
 
 
 def _context_for_follow(state, candidate, packet):
-    from polymarket_ai_agent.apps.daemon.run import DecisionContext
-    from polymarket_ai_agent.engine.btc_state import BtcSnapshot
+    from polymarket_trading_engine.apps.daemon.run import DecisionContext
+    from polymarket_trading_engine.engine.btc_state import BtcSnapshot
     btc = BtcSnapshot(
         price=70000.0,
         observed_at=datetime.now(timezone.utc),
@@ -1757,8 +1757,8 @@ def _follow_assessment(market_id: str) -> "MarketAssessment":
     doesn't need to run the full scorer. Matches what AdaptiveScorer
     returns in TRENDING_UP regime.
     """
-    from polymarket_ai_agent.engine.adaptive_scoring import ADAPTIVE_FOLLOW_MAKER_TAG
-    from polymarket_ai_agent.types import MarketAssessment, SuggestedSide
+    from polymarket_trading_engine.engine.adaptive_scoring import ADAPTIVE_FOLLOW_MAKER_TAG
+    from polymarket_trading_engine.types import MarketAssessment, SuggestedSide
     return MarketAssessment(
         market_id=market_id,
         fair_probability=0.65,
@@ -1780,7 +1780,7 @@ def _post_only_assessment(market_id: str, side, tag: str):
     """Build an APPROVED assessment carrying a maker-routing tag. Used to
     drive ``_paper_execute_for_strategy`` without running a real scorer.
     """
-    from polymarket_ai_agent.types import MarketAssessment
+    from polymarket_trading_engine.types import MarketAssessment
     return MarketAssessment(
         market_id=market_id,
         fair_probability=0.55,
@@ -1804,8 +1804,8 @@ def test_overreaction_post_only_tag_routes_to_maker_lifecycle(tmp_path: Path) ->
     that fade_post_only and adaptive-follow already use.
     """
     from dataclasses import replace
-    from polymarket_ai_agent.engine.overreaction_scoring import OVERREACTION_POST_ONLY_TAG
-    from polymarket_ai_agent.types import SuggestedSide
+    from polymarket_trading_engine.engine.overreaction_scoring import OVERREACTION_POST_ONLY_TAG
+    from polymarket_trading_engine.types import SuggestedSide
     runner, service, candidate, state = _follow_runner_and_state(tmp_path)
     _apply_book(state, bid_yes=0.66, ask_yes=0.68)
     base_ctx = _context_for_follow(state, candidate, _follow_packet(candidate.market_id))
@@ -1828,9 +1828,9 @@ def test_fade_and_adaptive_v2_maker_orders_are_independent(tmp_path: Path) -> No
     disturb fade's existing routing.
     """
     from dataclasses import replace
-    from polymarket_ai_agent.engine.overreaction_scoring import OVERREACTION_POST_ONLY_TAG
-    from polymarket_ai_agent.engine.quant_scoring import FADE_POST_ONLY_TAG
-    from polymarket_ai_agent.types import SuggestedSide
+    from polymarket_trading_engine.engine.overreaction_scoring import OVERREACTION_POST_ONLY_TAG
+    from polymarket_trading_engine.engine.quant_scoring import FADE_POST_ONLY_TAG
+    from polymarket_trading_engine.types import SuggestedSide
     runner, service, candidate, state = _follow_runner_and_state(tmp_path)
     _apply_book(state, bid_yes=0.66, ask_yes=0.68)
     base_ctx = _context_for_follow(state, candidate, _follow_packet(candidate.market_id))
@@ -1865,7 +1865,7 @@ def test_follow_maker_blocked_by_thin_exit_book(tmp_path: Path) -> None:
     on the exit side has less than ``size × multiplier`` of dollar depth.
     Filters the doomed setups where SL would expire to a deep fallback.
     """
-    from polymarket_ai_agent.engine.market_state import MarketState
+    from polymarket_trading_engine.engine.market_state import MarketState
     settings = _follow_settings(tmp_path).model_copy(update={
         "min_exit_depth_multiplier": 2.0,
         "max_position_usd": 2.0,
@@ -1899,7 +1899,7 @@ def test_follow_maker_passes_thick_exit_book(tmp_path: Path) -> None:
     """A healthy book (depth × multiplier covered) does NOT trip the gate.
     Sanity check that the gate is calibrated, not blanket-blocking.
     """
-    from polymarket_ai_agent.engine.market_state import MarketState
+    from polymarket_trading_engine.engine.market_state import MarketState
     settings = _follow_settings(tmp_path).model_copy(update={
         "min_exit_depth_multiplier": 2.0,
         "max_position_usd": 2.0,
@@ -1947,8 +1947,8 @@ def test_adaptive_v2_uses_per_strategy_stop_loss_override(tmp_path) -> None:
     conn.close()
     runner._position_extras.pop(("fade", candidate.market_id), None)
 
-    from polymarket_ai_agent.apps.daemon.run import DecisionContext
-    from polymarket_ai_agent.engine.market_state import MarketState
+    from polymarket_trading_engine.apps.daemon.run import DecisionContext
+    from polymarket_trading_engine.engine.market_state import MarketState
     # Drop bid to 0.45 — pnl_pct ≈ -12%. Under global SL (-20%) the position
     # would HOLD. Under adaptive_v2 override (-10%) the SL fires.
     state = MarketState(market_id=candidate.market_id, yes_token_id="yes-tok", no_token_id="no-tok")
@@ -1975,7 +1975,7 @@ def test_follow_maker_blocked_by_min_entry_price_gate(tmp_path: Path) -> None:
     """The maker-follow path must respect ``quant_min_entry_price`` — used
     to bypass it, allowing falling-knife re-entries on crashing markets.
     """
-    from polymarket_ai_agent.engine.market_state import MarketState
+    from polymarket_trading_engine.engine.market_state import MarketState
     settings = _follow_settings(tmp_path).model_copy(update={
         "quant_min_entry_price": 0.40,
     })
@@ -2005,7 +2005,7 @@ def test_follow_maker_blocked_by_max_entry_price_gate(tmp_path: Path) -> None:
     """Maker placements must also respect ``quant_max_entry_price`` so the
     mid-band veto applies symmetrically to fade and adaptive_v2 maker entries.
     """
-    from polymarket_ai_agent.engine.market_state import MarketState
+    from polymarket_trading_engine.engine.market_state import MarketState
     settings = _follow_settings(tmp_path).model_copy(update={
         "quant_max_entry_price": 0.50,
     })
@@ -2035,7 +2035,7 @@ def test_follow_maker_blocked_by_cooldown_after_recent_close(tmp_path: Path) -> 
     placement on the same (strategy, market). Reproduces the falling-knife
     re-entry pattern observed on 29 Apr market 2104140.
     """
-    from polymarket_ai_agent.engine.market_state import MarketState
+    from polymarket_trading_engine.engine.market_state import MarketState
     settings = _follow_settings(tmp_path).model_copy(update={
         "paper_entry_cooldown_seconds": 60,
     })
@@ -2064,7 +2064,7 @@ def test_follow_maker_placed_on_first_tick(tmp_path: Path) -> None:
     """First tick of a trending regime with no existing maker → daemon
     parks a new paper-maker at the discounted mid. No position opens.
     """
-    from polymarket_ai_agent.types import SuggestedSide
+    from polymarket_trading_engine.types import SuggestedSide
     runner, service, candidate, state = _follow_runner_and_state(tmp_path)
     _apply_book(state, bid_yes=0.66, ask_yes=0.68)
     ctx = _context_for_follow(state, candidate, _follow_packet(candidate.market_id))
@@ -2114,9 +2114,9 @@ def test_follow_maker_cancelled_when_regime_flips(tmp_path: Path) -> None:
     """A parked maker is dropped when the subsequent tick's assessment
     is not follow-with-maker (regime returned to RANGING or abstained).
     """
-    from polymarket_ai_agent.apps.daemon.run import DecisionContext
-    from polymarket_ai_agent.engine.btc_state import BtcSnapshot
-    from polymarket_ai_agent.types import MarketAssessment, SuggestedSide
+    from polymarket_trading_engine.apps.daemon.run import DecisionContext
+    from polymarket_trading_engine.engine.btc_state import BtcSnapshot
+    from polymarket_trading_engine.types import MarketAssessment, SuggestedSide
 
     runner, service, candidate, state = _follow_runner_and_state(tmp_path)
     _apply_book(state, bid_yes=0.66, ask_yes=0.68)
@@ -2145,7 +2145,7 @@ def test_follow_maker_cancelled_when_regime_flips(tmp_path: Path) -> None:
         log_return_10s=0.0, log_return_1m=0.0, log_return_5m=0.0,
         log_return_15m=0.0, realized_vol_30m=0.002, sample_count=50,
     )
-    from polymarket_ai_agent.types import EvidencePacket
+    from polymarket_trading_engine.types import EvidencePacket
     packet = EvidencePacket(
         market_id=candidate.market_id,
         question="test",
@@ -2476,8 +2476,8 @@ def test_paper_exit_fill_target_shares_use_entry_price_not_current_mid(
     loss exceeds the SL threshold unrealistically. Fix: use entry_price
     so the walk matches actual holdings.
     """
-    from polymarket_ai_agent.engine.market_state import MarketState
-    from polymarket_ai_agent.types import SuggestedSide
+    from polymarket_trading_engine.engine.market_state import MarketState
+    from polymarket_trading_engine.types import SuggestedSide
 
     runner, _, candidate, _, _ = _setup_runner_with_open_yes_position(
         tmp_path, entry_price=0.50, settings_overrides={"paper_exit_slippage_bps": 0.0},
@@ -2520,8 +2520,8 @@ def test_sl_does_not_fire_when_exit_vwap_is_above_threshold(tmp_path: Path) -> N
     VWAP as the trigger, so if most of our holdings would actually fill at
     0.46 (above threshold), the SL stays dormant.
     """
-    from polymarket_ai_agent.apps.daemon.run import DecisionContext
-    from polymarket_ai_agent.engine.market_state import MarketState
+    from polymarket_trading_engine.apps.daemon.run import DecisionContext
+    from polymarket_trading_engine.engine.market_state import MarketState
 
     runner, service, candidate, approved, btc = _setup_runner_with_open_yes_position(
         tmp_path, entry_price=0.50, settings_overrides={
@@ -2558,8 +2558,8 @@ def test_sl_fires_when_exit_vwap_crosses_threshold(tmp_path: Path) -> None:
     threshold, the position closes. And critically, the CLOSED position's
     exit_price matches the trigger price — no surprise gap.
     """
-    from polymarket_ai_agent.apps.daemon.run import DecisionContext
-    from polymarket_ai_agent.engine.market_state import MarketState
+    from polymarket_trading_engine.apps.daemon.run import DecisionContext
+    from polymarket_trading_engine.engine.market_state import MarketState
 
     runner, service, candidate, approved, btc = _setup_runner_with_open_yes_position(
         tmp_path, entry_price=0.50, settings_overrides={
@@ -2630,7 +2630,7 @@ def _penny_runner(tmp_path: Path, ask_yes: float = 0.98, ask_no: float = 0.02):
     the two books must agree on that invariant for the test's entry
     price to land where we expect.
     """
-    from polymarket_ai_agent.engine.market_state import MarketState
+    from polymarket_trading_engine.engine.market_state import MarketState
 
     settings = _settings(tmp_path).model_copy(update={
         "daemon_auto_paper_execute": True,
@@ -2676,9 +2676,9 @@ def _penny_runner(tmp_path: Path, ask_yes: float = 0.98, ask_no: float = 0.02):
 
 def _penny_context(runner, candidate, state, ask_yes: float, ask_no: float, seconds_to_expiry: int):
     from dataclasses import replace as _replace
-    from polymarket_ai_agent.apps.daemon.run import DecisionContext
-    from polymarket_ai_agent.engine.btc_state import BtcSnapshot
-    from polymarket_ai_agent.types import EvidencePacket
+    from polymarket_trading_engine.apps.daemon.run import DecisionContext
+    from polymarket_trading_engine.engine.btc_state import BtcSnapshot
+    from polymarket_trading_engine.types import EvidencePacket
     btc = BtcSnapshot(
         price=70000.0, observed_at=datetime.now(timezone.utc),
         log_return_10s=0.0, log_return_1m=0.0, log_return_5m=0.0, log_return_15m=0.0,
@@ -2738,7 +2738,7 @@ def test_penny_enters_on_cheap_side_with_sufficient_tte(tmp_path: Path) -> None:
     """Penny ask ≤ threshold + TTE above min → open paper position on
     the cheap side under strategy_id='penny'.
     """
-    from polymarket_ai_agent.types import SuggestedSide
+    from polymarket_trading_engine.types import SuggestedSide
     runner, service, candidate, state = _penny_runner(tmp_path, ask_no=0.02)
     ctx = _penny_context(runner, candidate, state, ask_yes=0.98, ask_no=0.02, seconds_to_expiry=500)
 
@@ -2778,7 +2778,7 @@ def test_penny_take_profit_closes_at_tp_multiple(tmp_path: Path) -> None:
     """Tick 1 opens penny on NO at 2¢. Tick 2 has bid_no = 4¢ (2x entry).
     Must close with ``penny_take_profit`` reason.
     """
-    from polymarket_ai_agent.engine.market_state import MarketState
+    from polymarket_trading_engine.engine.market_state import MarketState
 
     runner, service, candidate, state = _penny_runner(tmp_path, ask_no=0.02)
     ctx_open = _penny_context(runner, candidate, state, ask_yes=0.98, ask_no=0.02, seconds_to_expiry=500)
@@ -2857,7 +2857,7 @@ def test_penny_force_exit_triggers_when_tte_expires(tmp_path: Path) -> None:
     """Open penny position + TTE drops to 90s (< force_exit_tte=120s) →
     close at current bid regardless of TP, reason = penny_force_exit.
     """
-    from polymarket_ai_agent.engine.market_state import MarketState
+    from polymarket_trading_engine.engine.market_state import MarketState
 
     runner, service, candidate, state = _penny_runner(tmp_path, ask_no=0.02)
     ctx_open = _penny_context(runner, candidate, state, ask_yes=0.98, ask_no=0.02, seconds_to_expiry=500)
@@ -2964,7 +2964,7 @@ def test_nest_position_extras_groups_by_strategy_then_market() -> None:
     the dashboard can render trail state for non-fade strategies (a
     long-standing phase-1 bug previously emitted only fade extras).
     """
-    from polymarket_ai_agent.apps.daemon.run import _nest_position_extras
+    from polymarket_trading_engine.apps.daemon.run import _nest_position_extras
 
     flat = {
         ("fade", "m1"): {"peak_price": 0.6, "tranches_closed": 0.0},
@@ -3076,7 +3076,7 @@ def test_orphan_close_backfills_scoring_fields_from_cached_assessment(tmp_path: 
     orphan-close path.
     """
     from dataclasses import replace as dataclass_replace
-    from polymarket_ai_agent.types import MarketAssessment, SuggestedSide
+    from polymarket_trading_engine.types import MarketAssessment, SuggestedSide
 
     runner, service, candidate, _approved, _btc = _setup_runner_with_open_yes_position(
         tmp_path,
@@ -3157,7 +3157,7 @@ def test_daemon_skips_decision_when_prior_tick_still_running(tmp_path: Path) -> 
 
     # Manually drive _maybe_fire_decision twice — the daemon's normal WS loop
     # would interleave these via the same event loop tick.
-    from polymarket_ai_agent.engine.market_state import MarketState
+    from polymarket_trading_engine.engine.market_state import MarketState
 
     state = MarketState(market_id="m1", yes_token_id="yes-1", no_token_id="no-1")
     state.apply_book_snapshot({

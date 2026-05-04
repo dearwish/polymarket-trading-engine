@@ -14,11 +14,11 @@ Locks in:
 """
 from __future__ import annotations
 
-from polymarket_ai_agent.engine.portfolio import (
+from polymarket_trading_engine.engine.portfolio import (
     PortfolioEngine,
     parse_strategy_balance_overrides,
 )
-from polymarket_ai_agent.types import (
+from polymarket_trading_engine.types import (
     DecisionStatus,
     ExecutionMode,
     ExecutionResult,

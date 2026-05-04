@@ -1,0 +1,3574 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections.abc import AsyncIterator, Iterable
+from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timedelta, timezone
+from typing import Any, Awaitable, Callable, Protocol
+
+from polymarket_trading_engine.apps.daemon.heartbeat import HeartbeatWriter
+from polymarket_trading_engine.config import (
+    EDITABLE_SETTINGS_METADATA,
+    Settings,
+    diff_editable,
+    editable_values_snapshot,
+    get_effective_settings,
+)
+from polymarket_trading_engine.connectors.binance_ws import BinanceBtcFeed, BtcTick
+from polymarket_trading_engine.connectors.polymarket_ws import MarketStreamEvent, PolymarketMarketStream
+from polymarket_trading_engine.engine.adaptive_scoring import (
+    ADAPTIVE_FOLLOW_MAKER_TAG,
+    AdaptiveScorer,
+)
+from polymarket_trading_engine.engine.btc_state import BtcSnapshot, BtcState
+from polymarket_trading_engine.engine.execution.book_utils import first_level_with_size
+from polymarket_trading_engine.engine.execution.paper_maker import (
+    PaperMakerOrder,
+    check_fill,
+    is_expired,
+    maker_limit_price,
+)
+from polymarket_trading_engine.engine.maker_rewards import (
+    estimate_reward_for_size,
+    estimate_reward_per_100,
+)
+from polymarket_trading_engine.engine.market_maker import (
+    MARKET_MAKER_STRATEGY_TAG,
+    MarketMakerScorer,
+    QuoteAccrualState,
+    accrue,
+    compute_inventory,
+    compute_quote_pair,
+    take_pending,
+)
+from polymarket_trading_engine.engine.overreaction_scoring import (
+    OVERREACTION_POST_ONLY_TAG,
+    OverreactionScorer,
+)
+from polymarket_trading_engine.engine.penny_scoring import PENNY_STRATEGY_TAG, PennyScorer
+from polymarket_trading_engine.engine.market_state import MarketFeatures, MarketState
+from polymarket_trading_engine.engine.quant_scoring import FADE_POST_ONLY_TAG, QuantScoringEngine
+from polymarket_trading_engine.engine.regime import Regime, classify_regime
+from polymarket_trading_engine.engine.research import ResearchEngine
+from polymarket_trading_engine.service import AgentService
+from polymarket_trading_engine.types import (
+    DecisionStatus,
+    EvidencePacket,
+    ExecutionMode,
+    ExecutionResult,
+    ExecutionStyle,
+    MarketAssessment,
+    MarketCandidate,
+    MarketSnapshot,
+    OrderBookSnapshot,
+    OrderSide,
+    SuggestedSide,
+    TradeDecision,
+)
+
+logger = logging.getLogger(__name__)
+
+# Window length (in seconds) of each "Up or Down" candle-style family. Used to
+# reconstruct the candle-open timestamp from a market's end_date_iso so the
+# scorer can compute log(BTC_now / BTC_at_candle_open) — the drift the GBM
+# model actually needs for a close > open binary outcome. Threshold markets
+# (btc_daily_threshold) use ln(S/K) instead and are not in this map.
+_FAMILY_WINDOW_SECONDS: dict[str, int] = {
+    "btc_5m": 5 * 60,
+    "btc_15m": 15 * 60,
+    "btc_1h": 60 * 60,
+}
+
+# Name of the legacy GBM-fade strategy that used to be the only scorer.
+# Phase 1 of the adaptive-regime branch keeps this as the sole active
+# strategy so behaviour on branch merge matches main; phase 2 will append
+# an adaptive strategy to run alongside it. Keep this in sync with the
+# default on ``TradeDecision.strategy_id`` and the schema default.
+_DEFAULT_STRATEGY_ID = "fade"
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _serialize_pending_makers(
+    pending: dict[tuple[str, str], "PaperMakerOrder"],
+    now: datetime,
+    mm_pending: dict[tuple[str, str, str], "PaperMakerOrder"] | None = None,
+    market_states: dict[str, "MarketState"] | None = None,
+) -> list[dict[str, Any]]:
+    """Render ``_pending_makers`` (and optionally ``_pending_mm_orders``)
+    for the dashboard heartbeat.
+
+    Resting limits aren't persisted to SQLite (they live only in daemon
+    memory until they fill, expire, or get cancelled), so the heartbeat
+    is the only operator-facing surface for them. Each row carries the
+    placement details the operator needs to judge "why hasn't this
+    filled?": limit_price, age, ttl_remaining_seconds.
+
+    When ``market_states`` is supplied each row also carries the
+    side-relevant live book prices — ``current_mid`` (mid of the side
+    we're resting on, used to judge "are we still in the reward band?"),
+    ``current_ask`` (ask of the side we're resting on; the price that
+    must drop to-or-below our limit to fill us), and ``limit_minus_mid``
+    (signed distance from mid in price units). Operators eyeball these
+    to spot stale quotes before the freshness loop sweeps them.
+
+    The MM strategy holds two simultaneous resting orders per market
+    (YES-buy + NO-buy) under a 3-tuple key; we flatten both dicts into
+    one list so the dashboard's existing renderer doesn't need to change.
+    """
+    rows: list[dict[str, Any]] = []
+
+    def _attach_book(row: dict[str, Any], market_id: str, side: SuggestedSide) -> None:
+        """Populate ``current_mid`` / ``current_ask`` / ``limit_minus_mid`` on
+        ``row`` from the live market state. No-op when state is missing
+        or the side's book is empty — the caller's defaults of None / 0
+        stay in place so the React renderer can show a "—" placeholder.
+        """
+        if market_states is None:
+            return
+        state = market_states.get(market_id)
+        if state is None:
+            return
+        features = state.features(now=now)
+        if side is SuggestedSide.YES:
+            mid = features.mid_yes
+            ask = features.ask_yes
+        elif side is SuggestedSide.NO:
+            mid = features.mid_no
+            ask = features.ask_no
+        else:
+            return
+        row["current_mid"] = round(float(mid or 0.0), 6) or None
+        row["current_ask"] = round(float(ask or 0.0), 6) or None
+        if mid:
+            row["limit_minus_mid"] = round(row["limit_price"] - float(mid), 6)
+
+    for (strategy_id, market_id), order in pending.items():
+        age_seconds = (now - order.placed_at).total_seconds()
+        row = {
+            "strategy_id": strategy_id,
+            "market_id": market_id,
+            "side": order.side.value,
+            "limit_price": order.limit_price,
+            "size_usd": order.size_usd,
+            "placed_at": order.placed_at.isoformat(),
+            "ttl_seconds": order.ttl_seconds,
+            "age_seconds": round(age_seconds, 2),
+            "ttl_remaining_seconds": round(
+                max(0.0, order.ttl_seconds - age_seconds), 2
+            ),
+            "current_mid": None,
+            "current_ask": None,
+            "limit_minus_mid": None,
+        }
+        _attach_book(row, market_id, order.side)
+        rows.append(row)
+    if mm_pending:
+        for (strategy_id, market_id, _side_label), order in mm_pending.items():
+            age_seconds = (now - order.placed_at).total_seconds()
+            row = {
+                "strategy_id": strategy_id,
+                "market_id": market_id,
+                "side": order.side.value,
+                "limit_price": order.limit_price,
+                "size_usd": order.size_usd,
+                "placed_at": order.placed_at.isoformat(),
+                "ttl_seconds": order.ttl_seconds,
+                "age_seconds": round(age_seconds, 2),
+                "ttl_remaining_seconds": round(
+                    max(0.0, order.ttl_seconds - age_seconds), 2
+                ),
+                "current_mid": None,
+                "current_ask": None,
+                "limit_minus_mid": None,
+            }
+            _attach_book(row, market_id, order.side)
+            rows.append(row)
+    return rows
+
+
+def _nest_position_extras(
+    extras_by_pair: dict[tuple[str, str], dict[str, float]],
+) -> dict[str, dict[str, dict[str, float]]]:
+    """Group ``self._position_extras`` (keyed on ``(strategy_id, market_id)``)
+    into the nested ``{strategy_id: {market_id: extras}}`` shape that the
+    dashboard expects, so every strategy's trail state survives the heartbeat
+    serialisation (not just ``fade``).
+    """
+    nested: dict[str, dict[str, dict[str, float]]] = {}
+    for (strategy_id, market_id), extras in extras_by_pair.items():
+        nested.setdefault(strategy_id, {})[market_id] = dict(extras)
+    return nested
+
+
+@dataclass(slots=True)
+class DaemonMetrics:
+    started_at: datetime = field(default_factory=_utc_now)
+    discovery_cycles: int = 0
+    discovery_errors: int = 0
+    active_market_count: int = 0
+    polymarket_events: int = 0
+    polymarket_reconnects: int = 0
+    btc_ticks: int = 0
+    btc_reconnects: int = 0
+    decision_ticks: int = 0
+    # Number of would-be decision ticks dropped because the prior tick was
+    # still running (re-entrant guard). A non-zero counter under load is the
+    # signal that ``decision_min_interval_seconds`` is shorter than callback
+    # latency — operators tune from there.
+    decision_skips_busy: int = 0
+    # Trigger-reason histogram for decision ticks that actually fired. Lets
+    # the operator stratify "why did we score then?" — book updates vs. price
+    # changes vs. trade prints — without joining the journal. Keys are the
+    # raw Polymarket WS event types plus "btc_tick" for BTC-driven re-scoring.
+    decision_triggers: dict[str, int] = field(default_factory=dict)
+    last_polymarket_event_at: datetime | None = None
+    last_btc_tick_at: datetime | None = None
+    last_decision_at: datetime | None = None
+    last_decision_latency_ms: float = 0.0
+    maintenance_runs: int = 0
+    last_maintenance_at: datetime | None = None
+    last_maintenance_summary: dict[str, Any] | None = None
+    safety_stop_reason: str | None = None
+    safety_stop_at: datetime | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        for key in (
+            "started_at",
+            "last_polymarket_event_at",
+            "last_btc_tick_at",
+            "last_decision_at",
+            "last_maintenance_at",
+            "safety_stop_at",
+        ):
+            value = payload.get(key)
+            if isinstance(value, datetime):
+                payload[key] = value.isoformat()
+        return payload
+
+
+@dataclass(slots=True)
+class DaemonConfig:
+    market_family: str
+    discovery_interval_seconds: float = 60.0
+    decision_min_interval_seconds: float = 1.0
+    max_active_markets: int = 4
+    heartbeat_interval_seconds: float = 5.0
+    maintenance_interval_seconds: float = 3600.0
+    # Re-evaluate resting paper-maker limits against current book state
+    # on this cadence, independent of WS event triggers. Closes the
+    # quiet-window gap where a maker can sit at a stale price for
+    # minutes between events and then fill at the bad price when the
+    # next tick finally fires. Setting to 0 disables the loop entirely.
+    maker_freshness_interval_seconds: float = 1.0
+    prune_history_days: int = 14
+
+
+class MarketStreamFactory(Protocol):
+    def __call__(self, url: str) -> PolymarketMarketStream: ...
+
+
+class BtcFeedFactory(Protocol):
+    def __call__(self) -> BinanceBtcFeed: ...
+
+
+@dataclass(slots=True)
+class DecisionContext:
+    market_id: str
+    candidate: MarketCandidate
+    features: MarketFeatures
+    btc_snapshot: BtcSnapshot | None
+    assessment: MarketAssessment
+    metrics: "DaemonMetrics"
+    packet: "EvidencePacket | None" = None
+    shadow_assessment: "MarketAssessment | None" = None
+    # Why this decision tick fired — Polymarket WS event types ("book",
+    # "price_change", "last_trade_price") or "btc_tick" / "manual". Surfaced
+    # on the ``daemon_tick`` journal event so post-hoc analysis can stratify
+    # adverse-selection by trigger.
+    trigger_reason: str = "unknown"
+
+
+# Minimal protocol satisfied by both QuantScoringEngine and AdaptiveScorer —
+# per-tick scoring is the only hook the daemon needs for strategy routing.
+# Kept structural (not an ABC) so plugin-style scorers don't need a base
+# class import just to register.
+class _ScorerProtocol(Protocol):
+    def score_market(self, packet: "EvidencePacket") -> MarketAssessment: ...
+
+
+@dataclass(slots=True, frozen=True)
+class StrategyConfig:
+    """A scorer registered in the daemon's side-by-side loop.
+
+    Each StrategyConfig owns an independent slice of the portfolio keyed
+    on ``strategy_id``; multiple configs can run concurrently against the
+    same market feed without interfering with each other's open-position
+    state or paper PnL.
+
+    ``universe_filter`` (when set) is called with each market_id before
+    dispatch — strategies whose filter returns False are skipped on that
+    market. Used by the MM-universe wiring so the market-maker scorer
+    only fires on markets sourced from its yield-based scanner, and the
+    BTC scorers (fade / penny / adaptive_v2) only fire on the BTC
+    discovery slugs. ``None`` means "run on every active market" (the
+    legacy behaviour, preserved when ``mm_universe_enabled`` is False).
+    """
+
+    strategy_id: str
+    scorer: _ScorerProtocol
+    universe_filter: "Callable[[str], bool] | None" = None
+
+
+DecisionCallback = Callable[[DecisionContext], Awaitable[None]]
+
+
+class DaemonRunner:
+    """Asyncio runner for event-driven Polymarket + BTC market state.
+
+    Phase 1 scope: subscribe to both feeds, keep per-market :class:`MarketState`
+    + shared :class:`BtcState` up to date, fire a decision callback at most
+    every ``decision_min_interval_seconds``. No orders are placed here — the
+    callback (defaults to journaling a `daemon_tick`) is where future phases
+    hook in a real strategy.
+    """
+
+    def __init__(
+        self,
+        settings: Settings,
+        service: AgentService,
+        config: DaemonConfig | None = None,
+        market_stream_factory: MarketStreamFactory | None = None,
+        btc_feed_factory: BtcFeedFactory | None = None,
+        decision_callback: DecisionCallback | None = None,
+    ):
+        self.settings = settings
+        self.service = service
+        self.config = config or DaemonConfig(
+            market_family=settings.market_family,
+            discovery_interval_seconds=float(settings.daemon_discovery_interval_seconds),
+            decision_min_interval_seconds=float(settings.daemon_decision_min_interval_seconds),
+            heartbeat_interval_seconds=float(settings.daemon_heartbeat_interval_seconds),
+            maintenance_interval_seconds=float(settings.daemon_maintenance_interval_seconds),
+            maker_freshness_interval_seconds=float(settings.daemon_maker_freshness_interval_seconds),
+            prune_history_days=int(settings.daemon_prune_history_days),
+        )
+        self._market_stream_factory = market_stream_factory or (
+            lambda url: PolymarketMarketStream(
+                url,
+                reconnect_backoff_seconds=settings.ws_reconnect_backoff_seconds,
+                reconnect_backoff_max_seconds=settings.ws_reconnect_backoff_max_seconds,
+                ssl_verify=settings.ws_ssl_verify,
+            )
+        )
+        self._btc_feed_factory = btc_feed_factory or (
+            lambda: BinanceBtcFeed(
+                ws_url=settings.btc_ws_url,
+                rest_url=settings.btc_rest_fallback_url,
+                symbol=settings.btc_symbol,
+                reconnect_backoff_seconds=settings.ws_reconnect_backoff_seconds,
+                reconnect_backoff_max_seconds=settings.ws_reconnect_backoff_max_seconds,
+                ssl_verify=settings.ws_ssl_verify,
+            )
+        )
+        if decision_callback is not None:
+            self._decision_callback = decision_callback
+        elif settings.daemon_auto_paper_execute:
+            self._decision_callback = self._paper_execute_decision_callback
+        else:
+            self._decision_callback = self._default_decision_callback
+        self.metrics = DaemonMetrics()
+        self.btc_state = BtcState()
+        self.research = ResearchEngine()
+        self.quant = QuantScoringEngine(settings)
+        # Adaptive scorer wraps the fade scorer and gates it on the regime
+        # classifier. Phase 2 runs both side-by-side; each gets its own
+        # paper portfolio slice via the strategy_id dimension added in
+        # phase 1.
+        self.adaptive = AdaptiveScorer(self.quant)
+        # PennyScorer is constructed from current settings so parameter
+        # changes via the reload loop take effect on the next
+        # ``_refresh_penny_scorer`` call rather than requiring a restart.
+        self.penny = PennyScorer(
+            entry_thresh=float(settings.penny_entry_thresh),
+            min_entry_tte_seconds=int(settings.penny_min_entry_tte_seconds),
+            min_favorable_move_bps=float(settings.penny_min_favorable_move_bps),
+        )
+        self.adaptive_v2 = OverreactionScorer(
+            overreaction_threshold=float(settings.adaptive_v2_overreaction_threshold),
+            sensitivity=float(settings.adaptive_v2_sensitivity),
+            cost_floor=float(settings.adaptive_v2_cost_floor),
+            min_seconds_to_expiry=int(settings.adaptive_v2_min_seconds_to_expiry),
+            max_abs_edge=float(settings.adaptive_v2_max_abs_edge),
+            post_only=bool(settings.adaptive_v2_post_only),
+            ofi_gate_enabled=bool(settings.quant_ofi_gate_enabled),
+            ofi_gate_min_abs_flow=float(settings.quant_ofi_gate_min_abs_flow),
+            invert=bool(settings.adaptive_v2_invert),
+        )
+        self.market_maker = MarketMakerScorer(
+            min_tte_seconds=int(settings.mm_min_tte_seconds),
+            min_market_spread=float(settings.mm_min_market_spread),
+            max_market_spread=float(settings.mm_max_market_spread),
+            require_rewards=bool(settings.mm_require_rewards),
+        )
+        # Track which markets came from the MM universe scanner. Populated
+        # by ``_apply_candidates`` when ``mm_universe_enabled`` is True;
+        # empty otherwise. Used as the source of truth for the per-
+        # strategy ``universe_filter`` predicates so MM and BTC strategies
+        # see disjoint slices of the active market set.
+        self._mm_market_ids: set[str] = set()
+        # Last wall-clock UTC time we re-scanned the MM universe. The
+        # discovery loop calls the scanner only when the elapsed time
+        # exceeds ``mm_universe_refresh_seconds`` so each general
+        # discovery cycle (60 s) doesn't re-fetch the broad /markets
+        # listing on every cycle.
+        self._last_mm_scan_at: datetime | None = None
+        # Map of MM market_id → MarketCandidate. Populated by the
+        # scanner so the discovery merge code can rebuild MarketState
+        # without re-hitting the API. Keys must equal
+        # ``self._mm_market_ids`` at all times.
+        self._mm_candidate_cache: dict[str, MarketCandidate] = {}
+        self._strategies: list[StrategyConfig] = self._build_strategies(settings)
+        self.heartbeat = HeartbeatWriter(settings.heartbeat_path)
+        self._market_states: dict[str, MarketState] = {}
+        self._candidates: dict[str, MarketCandidate] = {}
+        self._asset_to_market: dict[str, str] = {}
+        self._active_asset_ids: set[str] = set()
+        self._market_subscriber_task: asyncio.Task[None] | None = None
+        self._stop_event: asyncio.Event | None = None
+        self._last_decision_at: datetime | None = None
+        # Re-entrant guard: bursty WS events can fire ``_maybe_fire_decision``
+        # faster than a paper-pipeline tick can complete (multi-strategy +
+        # SQLite writes can exceed ``decision_min_interval_seconds`` under
+        # load). Mirroring the official ``Lifecycle.AsyncCallback.trigger``
+        # pattern, we *skip* — not queue — any tick attempted while the prior
+        # one is still running, and bump ``decision_skips_busy`` so operators
+        # can see the pressure. Lazily allocated on first use to avoid binding
+        # to a loop in ``__init__`` (constructed off-loop in some tests).
+        self._decision_lock: asyncio.Lock | None = None
+        # Per-(strategy_id, market_id) snapshot of the most recent scorer
+        # output. Used to backfill ``fair_probability_at_close`` and
+        # ``edge_at_close`` on orphan-closes, which previously emitted nulls
+        # because the close path doesn't re-score. Bounded implicitly by the
+        # active set + open-position count; pruned alongside ``_position_extras``.
+        self._last_assessment: dict[tuple[str, str], MarketAssessment] = {}
+        # Per-open-position state used by trailing stop / tranche ladder logic.
+        # Paper-mode only: lives in memory, reset if the daemon restarts.
+        # Per-(strategy_id, market_id) extras. Keyed on a tuple so multiple
+        # scorers running side-by-side (phase 2+) keep independent TP-ladder
+        # and trailing-stop state on the same market.
+        self._position_extras: dict[tuple[str, str], dict[str, float]] = {}
+        # Pending stop-loss limit-out exits keyed on (strategy_id, market_id).
+        # When SL triggers and ``paper_sl_limit_ttl_ticks > 0`` the daemon posts
+        # a passive limit at threshold (− slippage) and stores the request here.
+        # Subsequent ticks check the live bid book for a limit-or-better fill;
+        # when the TTL expires unfilled we fall back to the legacy walk close.
+        self._pending_sl_exits: dict[tuple[str, str], dict[str, float]] = {}
+        self._tp_ladder: list[tuple[float, float]] = self._parse_tp_ladder(settings.paper_tp_ladder)
+        # Last close timestamp per (strategy_id, market_id), used to enforce
+        # an entry cooldown that blocks whipsaw re-entries on the same
+        # (strategy, market) pair. In-memory only.
+        self._last_close_at: dict[tuple[str, str], datetime] = {}
+        # Pending paper-maker orders keyed on (strategy_id, market_id).
+        # Phase 3 adaptive-follow: when the adaptive scorer picks a
+        # follow-with-maker side, the daemon parks a resting limit here
+        # until the book crosses it or the TTL expires. In-memory only —
+        # unfilled makers don't survive a daemon restart, which matches
+        # the operator-friendly "restart = clean slate" expectation for
+        # paper mode.
+        self._pending_makers: dict[tuple[str, str], PaperMakerOrder] = {}
+        # Pending market-maker quotes — distinct from ``_pending_makers``
+        # because the MM strategy posts BOTH a YES-buy and a NO-buy on the
+        # same market simultaneously, breaking the one-rest-per-pair
+        # assumption in the follow-maker dict. Keyed on
+        # ``(strategy_id, market_id, side_label)`` where side_label is
+        # "YES" or "NO". In-memory only — restarts re-derive from the
+        # next tick.
+        self._pending_mm_orders: dict[tuple[str, str, str], PaperMakerOrder] = {}
+        # Per-quote reward-accrual trackers keyed identically to
+        # ``_pending_mm_orders``. Populated when a quote is placed,
+        # advanced on every tick the quote rests, drained + persisted to
+        # ``reward_accruals`` on cancel / fill / force-exit. The threshold
+        # for periodic flushes for long-resting quotes is
+        # ``mm_reward_flush_threshold_usd``.
+        self._mm_quote_accrual: dict[tuple[str, str, str], QuoteAccrualState] = {}
+        # Cursor into settings_changes for the reload loop. Set to the table's
+        # MAX(id) at startup so the loop only reacts to *subsequent* changes;
+        # the baseline seed that landed during migration isn't replayed as a
+        # "settings_changed" event.
+        try:
+            self._last_settings_id: int = self.service.settings_store.get_max_id()
+        except Exception:  # noqa: BLE001 — DB may not exist in unit tests
+            self._last_settings_id = 0
+
+    @property
+    def active_asset_ids(self) -> list[str]:
+        return sorted(self._active_asset_ids)
+
+    @property
+    def active_market_ids(self) -> list[str]:
+        return sorted(self._market_states.keys())
+
+    def features_snapshot(self) -> dict[str, MarketFeatures]:
+        return {market_id: state.features() for market_id, state in self._market_states.items()}
+
+    async def run(self, stop_event: asyncio.Event | None = None) -> None:
+        self._stop_event = stop_event or asyncio.Event()
+        # Emit the baseline snapshot + migration record BEFORE starting other
+        # loops so analyze_soak always has a "state-at-t0" reference point
+        # that precedes every trade_decision / daemon_tick event.
+        await self._emit_startup_settings_events()
+        discovery_task = asyncio.create_task(self._discovery_loop(self._stop_event))
+        btc_task = asyncio.create_task(self._btc_loop(self._stop_event))
+        heartbeat_task = asyncio.create_task(self._heartbeat_loop(self._stop_event))
+        maintenance_task = asyncio.create_task(self._maintenance_loop(self._stop_event))
+        reload_task = asyncio.create_task(self._settings_reload_loop(self._stop_event))
+        maker_freshness_task = asyncio.create_task(
+            self._maker_freshness_loop(self._stop_event)
+        )
+        mm_freshness_task = asyncio.create_task(
+            self._mm_freshness_loop(self._stop_event)
+        )
+        try:
+            await self._stop_event.wait()
+        finally:
+            await self._shutdown_tasks(
+                [
+                    discovery_task,
+                    btc_task,
+                    heartbeat_task,
+                    maintenance_task,
+                    reload_task,
+                    maker_freshness_task,
+                    mm_freshness_task,
+                    self._market_subscriber_task,
+                ]
+            )
+
+    async def run_for(self, duration_seconds: float) -> None:
+        stop_event = asyncio.Event()
+
+        async def stopper() -> None:
+            await asyncio.sleep(duration_seconds)
+            stop_event.set()
+
+        stopper_task = asyncio.create_task(stopper())
+        try:
+            await self.run(stop_event)
+        finally:
+            stopper_task.cancel()
+            try:
+                await stopper_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    # --- Discovery -----------------------------------------------------
+
+    async def _discovery_loop(self, stop_event: asyncio.Event) -> None:
+        while not stop_event.is_set():
+            try:
+                candidates = await asyncio.to_thread(self._discover_candidates)
+                await self._apply_candidates(candidates)
+                self.metrics.discovery_cycles += 1
+            except Exception as exc:
+                self.metrics.discovery_errors += 1
+                logger.warning("daemon discovery failed: %s", exc)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=self.config.discovery_interval_seconds)
+            except asyncio.TimeoutError:
+                continue
+
+    def _discover_candidates(self) -> list[MarketCandidate]:
+        markets = self.service.discover_markets()
+        return markets[: self.config.max_active_markets]
+
+    async def _apply_candidates(self, candidates: Iterable[MarketCandidate]) -> None:
+        new_states: dict[str, MarketState] = {}
+        new_candidates: dict[str, MarketCandidate] = {}
+        asset_to_market: dict[str, str] = {}
+        asset_ids: set[str] = set()
+        for candidate in candidates:
+            state = self._market_states.get(candidate.market_id) or MarketState(
+                market_id=candidate.market_id,
+                yes_token_id=candidate.yes_token_id,
+                no_token_id=candidate.no_token_id,
+            )
+            new_states[candidate.market_id] = state
+            new_candidates[candidate.market_id] = candidate
+            if candidate.yes_token_id:
+                asset_to_market[candidate.yes_token_id] = candidate.market_id
+                asset_ids.add(candidate.yes_token_id)
+            if candidate.no_token_id:
+                asset_to_market[candidate.no_token_id] = candidate.market_id
+                asset_ids.add(candidate.no_token_id)
+        # Reconcile open paper positions against the new active set.
+        # Two cases for a market that's open but absent from discovery:
+        #
+        #   (a) market has truly expired (TTE ≤ 0) — orphan-close it; the
+        #       position lifecycle can never run on a market past resolution.
+        #   (b) market just dropped below ``family_min_tte`` (e.g. 60 s for
+        #       btc_15m) — *pin* it back into the active set so the WS
+        #       subscription stays live and the exit ladder
+        #       (TP / trail / SL / force-exit / TTE buffer) controls the close.
+        #
+        # Previously every drop fell through to (a), which short-circuited
+        # the exit ladder at exactly the moment positions were most likely
+        # to resolve. Pinning lets the ladder do its job; orphan-close is now
+        # a true safety net for resolved markets only.
+        # Only runs in paper mode — live positions are managed by the live executor.
+        if self.settings.daemon_auto_paper_execute:
+            all_open = await asyncio.to_thread(self.service.portfolio.list_open_positions)
+            for open_pos in all_open:
+                mid = open_pos.market_id
+                if mid in new_candidates:
+                    continue
+                cand = self._candidates.get(mid)
+                if cand is None:
+                    try:
+                        cand = await asyncio.to_thread(self.service.polymarket.get_market, mid)
+                    except Exception as exc:
+                        logger.warning("Orphan close: could not fetch candidate for %s: %s", mid, exc)
+                if cand is None:
+                    continue
+                tte = self._seconds_to_expiry(cand.end_date_iso)
+                # ``closed=True`` is the authoritative resolution signal:
+                # UMA has confirmed an outcome and the market is no longer
+                # tradeable. The nominal ``end_date_iso`` may still be in
+                # the future (it's the contract expiry date, not the
+                # actual resolution time — sports markets often have an
+                # endDate days after the game ends), so the TTE check
+                # alone misses resolved markets. Orphan-close on either
+                # signal.
+                if cand.closed or tte <= 0:
+                    await self._close_orphaned_position(mid, open_pos, cand)
+                    continue
+                # Pin: re-add to the active set, reusing any existing in-memory
+                # MarketState so the rolling features survive the discovery cycle.
+                pinned_state = self._market_states.get(mid) or MarketState(
+                    market_id=mid,
+                    yes_token_id=cand.yes_token_id,
+                    no_token_id=cand.no_token_id,
+                )
+                new_states[mid] = pinned_state
+                new_candidates[mid] = cand
+                if cand.yes_token_id:
+                    asset_to_market[cand.yes_token_id] = mid
+                    asset_ids.add(cand.yes_token_id)
+                if cand.no_token_id:
+                    asset_to_market[cand.no_token_id] = mid
+                    asset_ids.add(cand.no_token_id)
+                logger.info(
+                    "Pinned market %s (open position, TTE=%ds) — exit ladder owns the close.",
+                    mid,
+                    tte,
+                )
+
+        # Merge in the MM-universe scan when enabled. Yield-based scan
+        # runs on its own cadence (``mm_universe_refresh_seconds``); we
+        # reuse the previously-cached MM market id set on cycles in
+        # between so the WS subscription doesn't churn just because the
+        # general discovery loop ticked.
+        mm_market_ids = await self._refresh_mm_universe()
+
+        # CRITICAL adverse-selection guard: cancel ALL pending MM quotes
+        # for any market that just dropped from the MM universe. Without
+        # this, a quote placed during the market's MM tenure stays in
+        # ``_pending_mm_orders`` indefinitely — the freshness loop only
+        # iterates ``_mm_market_ids``, so a removed market's quote never
+        # gets TTL-cleaned. The 2026-05-02 soak surfaced two −$985 fills
+        # where exactly this scenario played out: the market dropped
+        # from rotation, our YES bid sat at 0.695 for ~9h while the
+        # underlying mid crashed to 0.01, then a stray WS event re-
+        # invoked the handler and our stale bid caught the falling
+        # knife. By cancelling on universe-exit we guarantee no zombie
+        # quote can survive long enough to be adversely selected.
+        dropped_mm_markets = self._mm_market_ids - mm_market_ids
+        for dropped in dropped_mm_markets:
+            for side_label in ("YES", "NO"):
+                key = ("market_maker", dropped, side_label)
+                pending = self._pending_mm_orders.pop(key, None)
+                if pending is None:
+                    continue
+                await self._persist_mm_accrual(key, pending)
+                await asyncio.to_thread(
+                    self.service.journal.log_event,
+                    "mm_quote_cancelled",
+                    {
+                        "strategy_id": "market_maker",
+                        "market_id": dropped,
+                        "side": pending.side.value,
+                        "limit_price": pending.limit_price,
+                        "reason": "universe_exit",
+                    },
+                )
+
+        for mid in list(mm_market_ids):
+            if mid in new_candidates:
+                # Same market_id appearing in both BTC discovery and MM
+                # universe is implausible (BTC slugs aren't reward-paying
+                # today) but if it ever happens, MM ownership wins so the
+                # universe filter for fade/penny/adaptive_v2 stays clean.
+                continue
+            cand = self._mm_candidate_cache.get(mid)
+            if cand is None:
+                continue
+            state = self._market_states.get(mid) or MarketState(
+                market_id=mid,
+                yes_token_id=cand.yes_token_id,
+                no_token_id=cand.no_token_id,
+            )
+            new_states[mid] = state
+            new_candidates[mid] = cand
+            if cand.yes_token_id:
+                asset_to_market[cand.yes_token_id] = mid
+                asset_ids.add(cand.yes_token_id)
+            if cand.no_token_id:
+                asset_to_market[cand.no_token_id] = mid
+                asset_ids.add(cand.no_token_id)
+        self._mm_market_ids = mm_market_ids
+
+        self._market_states = new_states
+        self._candidates = new_candidates
+        self._asset_to_market = asset_to_market
+        self.metrics.active_market_count = len(new_states)
+        if asset_ids == self._active_asset_ids:
+            return
+        self._active_asset_ids = asset_ids
+        await self._restart_market_subscriber()
+
+    async def _refresh_mm_universe(self) -> set[str]:
+        """Re-scan the MM universe if the refresh interval has elapsed.
+
+        Returns the set of market_ids the MM strategy should cover. When
+        the scanner is disabled (``mm_universe_enabled=False`` or
+        ``mm_enabled=False``) returns the current set unchanged — typically
+        empty, but if the operator just flipped the flag we let the next
+        cycle clear it cleanly.
+
+        Caches each scanned candidate in ``self._mm_candidate_cache`` so
+        the merging code in ``_apply_candidates`` can rebuild MarketState
+        without re-fetching.
+        """
+        settings = self.settings
+        if not settings.mm_enabled or not settings.mm_universe_enabled:
+            self._mm_candidate_cache.clear()
+            return set()
+        now = _utc_now()
+        refresh_interval = max(30.0, float(settings.mm_universe_refresh_seconds))
+        if (
+            self._last_mm_scan_at is not None
+            and (now - self._last_mm_scan_at).total_seconds() < refresh_interval
+        ):
+            # Reuse the cached set; cache map is also unchanged.
+            return set(self._mm_candidate_cache.keys())
+
+        max_eligible_min_size = (
+            float(settings.mm_size_usd)
+            if settings.mm_universe_require_size_eligible
+            else None
+        )
+        try:
+            candidates = await asyncio.to_thread(
+                self.service.polymarket.discover_mm_markets,
+                min_rewards_daily_usd=float(settings.mm_universe_min_rewards_daily_usd),
+                min_liquidity_usd=float(settings.mm_universe_min_liquidity_usd),
+                min_tte_seconds=int(settings.mm_universe_min_tte_seconds),
+                max_markets=int(settings.mm_universe_max_markets),
+                max_eligible_min_size_usd=max_eligible_min_size,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("MM universe scan failed: %s", exc)
+            return set(self._mm_candidate_cache.keys())
+
+        self._last_mm_scan_at = now
+        self._mm_candidate_cache = {cand.market_id: cand for cand in candidates}
+        await asyncio.to_thread(
+            self.service.journal.log_event,
+            "mm_universe_scanned",
+            {
+                "scanned_at": now.isoformat(),
+                "candidate_count": len(candidates),
+                "candidates": [
+                    {
+                        "market_id": cand.market_id,
+                        "slug": cand.slug,
+                        "rewards_daily_rate": cand.rewards_daily_rate,
+                        "liquidity_usd": cand.liquidity_usd,
+                        "rewards_max_spread_pct": cand.rewards_max_spread_pct,
+                        "end_date_iso": cand.end_date_iso,
+                    }
+                    for cand in candidates
+                ],
+            },
+        )
+        return set(self._mm_candidate_cache.keys())
+
+    async def _restart_market_subscriber(self) -> None:
+        assert self._stop_event is not None
+        if self._market_subscriber_task is not None:
+            self._market_subscriber_task.cancel()
+            try:
+                await self._market_subscriber_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._market_subscriber_task = None
+        if not self._active_asset_ids:
+            return
+        self._market_subscriber_task = asyncio.create_task(
+            self._polymarket_loop(self._stop_event, list(self._active_asset_ids))
+        )
+
+    # --- Polymarket WS -------------------------------------------------
+
+    async def _polymarket_loop(self, stop_event: asyncio.Event, asset_ids: list[str]) -> None:
+        stream = self._market_stream_factory(self.settings.polymarket_ws_market_url)
+        iterator = stream.run(asset_ids, stop_event=stop_event)
+        async for event in iterator:
+            if stop_event.is_set():
+                break
+            await self._on_polymarket_event(event)
+
+    async def _on_polymarket_event(self, event: MarketStreamEvent) -> None:
+        self.metrics.polymarket_events += 1
+        self.metrics.last_polymarket_event_at = _utc_now()
+        payload = event.payload
+        asset_id = str(payload.get("asset_id") or "")
+        market_id = self._asset_to_market.get(asset_id)
+        if market_id is None:
+            return
+        state = self._market_states.get(market_id)
+        if state is None:
+            return
+        if event.event_type == "book":
+            state.apply_book_snapshot(payload)
+        elif event.event_type == "price_change":
+            state.apply_price_change(payload)
+        elif event.event_type in {"last_trade_price", "trade"}:
+            state.apply_last_trade(payload)
+        await self._maybe_fire_decision(state, trigger_reason=event.event_type)
+
+    # --- BTC WS --------------------------------------------------------
+
+    async def _btc_loop(self, stop_event: asyncio.Event) -> None:
+        feed = self._btc_feed_factory()
+        # Seed from REST so features are usable before the first tick arrives.
+        tick = await asyncio.to_thread(feed.rest_price)
+        if tick is not None:
+            self.btc_state.record(tick.price, tick.observed_at, quantity=tick.quantity)
+        # Backfill ~24 h of 1-min klines so HTF log returns (1h/4h/24h) are
+        # usable immediately — otherwise the daemon has to live-accumulate
+        # minute bars, which would leave 24h returns at 0.0 for a full day.
+        # Failure-safe: if the REST call fails we proceed with an empty buffer
+        # and HTF fields emit their defaults until live bars fill in.
+        try:
+            bars = await asyncio.to_thread(feed.rest_klines, "1m", 1440)
+            retained = self.btc_state.backfill_minute_bars(bars)
+            logger.info("BTC klines backfilled: fetched=%d retained=%d", len(bars), retained)
+        except Exception as exc:
+            logger.warning("BTC klines backfill failed, HTF features will cold-start: %s", exc)
+        async for tick in self._iter_btc(feed, stop_event):
+            if stop_event.is_set():
+                break
+            self.metrics.btc_ticks += 1
+            self.metrics.last_btc_tick_at = tick.observed_at
+            self.btc_state.record(tick.price, tick.observed_at, quantity=tick.quantity)
+
+    async def _iter_btc(self, feed: BinanceBtcFeed, stop_event: asyncio.Event) -> AsyncIterator[BtcTick]:
+        async for tick in feed.run(stop_event=stop_event):
+            yield tick
+
+    # --- Decision gating ----------------------------------------------
+
+    async def _maybe_fire_decision(
+        self, state: MarketState, trigger_reason: str = "unknown"
+    ) -> None:
+        now = _utc_now()
+        if self._last_decision_at is not None:
+            elapsed = (now - self._last_decision_at).total_seconds()
+            if elapsed < self.config.decision_min_interval_seconds:
+                return
+        if self.metrics.safety_stop_reason is not None:
+            # Kill-switch is active — skip the callback so no new trade
+            # decisions are published. We still update the timer so we only
+            # log once per interval when the switch is hot.
+            self._last_decision_at = now
+            return
+        candidate = self._candidates.get(state.market_id)
+        if candidate is None:
+            return
+        # Re-entrant guard. If the prior tick is still running, drop this one
+        # rather than queueing — a queued tick would just process against
+        # state that's about to be superseded by the next event anyway.
+        if self._decision_lock is None:
+            self._decision_lock = asyncio.Lock()
+        if self._decision_lock.locked():
+            self.metrics.decision_skips_busy += 1
+            return
+        async with self._decision_lock:
+            await self._run_decision(state, candidate, now, trigger_reason)
+
+    async def _run_decision(
+        self,
+        state: MarketState,
+        candidate: MarketCandidate,
+        now: datetime,
+        trigger_reason: str,
+    ) -> None:
+        self._last_decision_at = now
+        self.metrics.decision_ticks += 1
+        self.metrics.last_decision_at = now
+        self.metrics.decision_triggers[trigger_reason] = (
+            self.metrics.decision_triggers.get(trigger_reason, 0) + 1
+        )
+        started = _utc_now()
+        features = state.features(now=now)
+        btc_snapshot = self.btc_state.snapshot(now=now)
+        tte_seconds = self._seconds_to_expiry(candidate.end_date_iso, now=now)
+        # Compute BTC's log-return since THIS market's candle opened so the
+        # scorer's GBM uses Δ_observed (correct) instead of a rolling window.
+        window_len = _FAMILY_WINDOW_SECONDS.get(self.settings.market_family, 0)
+        time_elapsed = max(0, window_len - tte_seconds) if window_len > 0 else 0
+        # Pre-market: the market was discovered before its candle opens (TTE
+        # still larger than the window). Rolling 5m/15m returns must not
+        # stand in for the candle-open drift here — they aren't predictive
+        # of this candle's close-vs-open direction.
+        is_pre_market = window_len > 0 and tte_seconds > window_len
+        candle_open_log_return = 0.0
+        if time_elapsed > 0 and self.btc_state.sample_count > 1:
+            candle_open_log_return = self.btc_state.log_return_over(time_elapsed, now=now)
+        packet = self.research.build_from_features(
+            candidate=candidate,
+            features=features,
+            btc_snapshot=btc_snapshot,
+            seconds_to_expiry=tte_seconds,
+            time_elapsed_in_candle_s=int(time_elapsed),
+            btc_log_return_since_candle_open=candle_open_log_return,
+            is_pre_market=is_pre_market,
+        )
+        assessment = self.quant.score_market(packet)
+        shadow_assessment = self.quant.score_shadow(packet, live=assessment)
+        context = DecisionContext(
+            market_id=state.market_id,
+            candidate=candidate,
+            features=features,
+            btc_snapshot=btc_snapshot,
+            assessment=assessment,
+            metrics=self.metrics,
+            packet=packet,
+            shadow_assessment=shadow_assessment,
+            trigger_reason=trigger_reason,
+        )
+        try:
+            await self._decision_callback(context)
+        except Exception as exc:
+            logger.warning("daemon decision callback failed: %s", exc)
+        elapsed = (_utc_now() - started).total_seconds() * 1000.0
+        self.metrics.last_decision_latency_ms = round(elapsed, 3)
+
+    @staticmethod
+    def _parse_tp_ladder(raw: str) -> list[tuple[float, float]]:
+        """Parse "0.15:0.5,0.30:0.25" into [(0.15, 0.5), (0.30, 0.25)].
+
+        Invalid pairs are silently skipped. Ladder is sorted ascending by
+        PnL-pct so the daemon can walk it left-to-right.
+        """
+        if not raw:
+            return []
+        pairs: list[tuple[float, float]] = []
+        for chunk in raw.split(","):
+            chunk = chunk.strip()
+            if ":" not in chunk:
+                continue
+            left, right = chunk.split(":", 1)
+            try:
+                pct = float(left)
+                frac = float(right)
+            except ValueError:
+                continue
+            if pct <= 0 or not (0.0 < frac <= 1.0):
+                continue
+            pairs.append((pct, frac))
+        pairs.sort(key=lambda item: item[0])
+        return pairs
+
+    @staticmethod
+    def _seconds_to_expiry(end_date_iso: str, now: datetime | None = None) -> int:
+        if not end_date_iso:
+            return 0
+        try:
+            expiry = datetime.fromisoformat(end_date_iso.replace("Z", "+00:00"))
+        except ValueError:
+            return 0
+        reference = now or _utc_now()
+        return max(0, int((expiry - reference).total_seconds()))
+
+    async def _default_decision_callback(
+        self,
+        context: DecisionContext,
+        strategy_id: str = _DEFAULT_STRATEGY_ID,
+    ) -> None:
+        """Emit a ``daemon_tick`` tagged with ``strategy_id``.
+
+        Phase 2 runs multiple scorers per tick; each calls this helper
+        with its own context (containing its own assessment) and its own
+        ``strategy_id`` so analyze_soak can stratify by strategy.
+
+        Shadow-assessment fields are only emitted on the default strategy's
+        tick to avoid duplicate shadow rows when multiple strategies fire
+        for the same market tick.
+        """
+        features = context.features
+        btc = context.btc_snapshot
+        assessment = context.assessment
+        regime = (
+            classify_regime(context.packet).value if context.packet is not None else Regime.UNKNOWN.value
+        )
+        payload: dict[str, Any] = {
+            "strategy_id": strategy_id,
+            "trigger_reason": context.trigger_reason,
+            "market_id": features.market_id,
+            "question": context.candidate.question,
+            "slug": context.candidate.slug,
+            "end_date_iso": context.candidate.end_date_iso,
+            "seconds_to_expiry": context.assessment and self._seconds_to_expiry(context.candidate.end_date_iso),
+            "bid_yes": features.bid_yes,
+            "ask_yes": features.ask_yes,
+            "mid_yes": features.mid_yes,
+            "bid_no": features.bid_no,
+            "ask_no": features.ask_no,
+            "mid_no": features.mid_no,
+            "microprice_yes": features.microprice_yes,
+            "imbalance_top5_yes": features.imbalance_top5_yes,
+            "depth_usd_yes": features.depth_usd_yes,
+            "spread_yes": features.spread_yes,
+            "signed_flow_5s": features.signed_flow_5s,
+            "trade_count_5s": features.trade_count_5s,
+            "last_update_age_seconds": features.last_update_age_seconds,
+            "btc_price": btc.price if btc else None,
+            "btc_realized_vol_30m": btc.realized_vol_30m if btc else None,
+            "btc_log_return_30s": btc.log_return_30s if btc else None,
+            "btc_log_return_5m": btc.log_return_5m if btc else None,
+            "btc_log_return_since_candle_open": context.packet.btc_log_return_since_candle_open if context.packet else None,
+            "time_elapsed_in_candle_s": context.packet.time_elapsed_in_candle_s if context.packet else None,
+            "btc_session": btc.btc_session if btc else None,
+            "btc_log_return_1h": btc.btc_log_return_1h if btc else None,
+            "btc_log_return_4h": btc.btc_log_return_4h if btc else None,
+            "btc_log_return_24h": btc.btc_log_return_24h if btc else None,
+            "btc_minute_bar_count": btc.minute_bar_count if btc else None,
+            "regime": regime,
+            "polymarket_events": context.metrics.polymarket_events,
+            "btc_ticks": context.metrics.btc_ticks,
+            "fair_probability": assessment.fair_probability,
+            "fair_probability_no": assessment.fair_probability_no,
+            "edge_yes": assessment.edge_yes,
+            "edge_no": assessment.edge_no,
+            "suggested_side": assessment.suggested_side.value,
+            "confidence": assessment.confidence,
+            "slippage_bps": assessment.slippage_bps,
+            "expiry_risk": assessment.expiry_risk,
+            # Surface the scorer's verbatim reasons so the dashboard no longer
+            # has to guess which gate fired. reasons_to_abstain is the list we
+            # care about for ABSTAIN rendering; reasons_for_trade is kept for
+            # completeness (e.g. tooltip on YES/NO picks).
+            "reasons_to_abstain": list(assessment.reasons_to_abstain or []),
+            "reasons_for_trade": list(assessment.reasons_for_trade or []),
+            # Expected daily maker-reward yield for $100 resting on the
+            # YES bid at mid — instrumentation for the gamma-trade-lab
+            # selection experiment. 0.0 on markets without rewards (most
+            # BTC short-horizon today). Logged here so analyze_soak can
+            # correlate yield estimates with realised performance before
+            # we wire ranking/filtering into discovery.
+            "estimated_reward_per_100_yes_bid": self._estimate_reward_at_yes_bid(context),
+        }
+        shadow = context.shadow_assessment
+        if shadow is not None and strategy_id == _DEFAULT_STRATEGY_ID:
+            payload["shadow_fair_probability"] = shadow.fair_probability
+            payload["shadow_suggested_side"] = shadow.suggested_side.value
+            payload["shadow_edge_yes"] = shadow.edge_yes
+            payload["shadow_edge_no"] = shadow.edge_no
+        await asyncio.to_thread(self.service.journal.log_event, "daemon_tick", payload)
+
+    def _build_strategies(self, settings: Settings) -> list[StrategyConfig]:
+        """Construct the per-tick strategy list with universe filters bound.
+
+        The MM-universe scanner partitions markets into two disjoint
+        sets — ``self._mm_market_ids`` (the yield-ranked MM universe) and
+        everything else (the BTC discovery universe). When the scanner
+        is on we hand each strategy the matching predicate so MM only
+        runs on its own markets and the directional scorers stay on BTC.
+
+        When the scanner is off (``mm_universe_enabled=False``) every
+        strategy gets ``universe_filter=None`` so the legacy "every
+        strategy on every active market" behaviour is preserved — this
+        is the safe fallback for paper soaks where the MM strategy is
+        being exercised on the existing BTC universe to validate the
+        lifecycle handler in isolation.
+        """
+        configs: list[StrategyConfig] = []
+
+        if settings.mm_enabled and settings.mm_universe_enabled:
+            mm_filter = lambda mid: mid in self._mm_market_ids
+            btc_filter = lambda mid: mid not in self._mm_market_ids
+        else:
+            mm_filter = None
+            btc_filter = None
+
+        configs.append(
+            StrategyConfig(
+                strategy_id=_DEFAULT_STRATEGY_ID,
+                scorer=self.quant,
+                universe_filter=btc_filter,
+            )
+        )
+        if settings.adaptive_enabled:
+            configs.append(
+                StrategyConfig(
+                    strategy_id="adaptive",
+                    scorer=self.adaptive,
+                    universe_filter=btc_filter,
+                )
+            )
+        if settings.penny_enabled:
+            configs.append(
+                StrategyConfig(
+                    strategy_id="penny",
+                    scorer=self.penny,
+                    universe_filter=btc_filter,
+                )
+            )
+        if settings.adaptive_v2_enabled:
+            configs.append(
+                StrategyConfig(
+                    strategy_id="adaptive_v2",
+                    scorer=self.adaptive_v2,
+                    universe_filter=btc_filter,
+                )
+            )
+        if settings.mm_enabled:
+            configs.append(
+                StrategyConfig(
+                    strategy_id="market_maker",
+                    scorer=self.market_maker,
+                    universe_filter=mm_filter,
+                )
+            )
+        return configs
+
+    async def _paper_execute_decision_callback(self, context: DecisionContext) -> None:
+        """Run every registered strategy side-by-side for this tick.
+
+        Each strategy re-scores the packet with its own scorer, emits a
+        ``daemon_tick`` tagged with its ``strategy_id``, and executes its
+        own paper pipeline against its own portfolio slice. Strategies
+        don't share open-position state, cooldowns, or PnL — the
+        ``strategy_id`` dimension on positions/order_attempts keeps them
+        fully isolated.
+
+        The incoming ``context.assessment`` (produced by the decision
+        engine with the fade scorer) is only used as a fallback when the
+        packet is missing; under normal operation each strategy scores
+        from ``context.packet`` directly.
+        """
+        for strategy in self._strategies:
+            # Universe gating: when an MM-universe scan has populated
+            # ``_mm_market_ids``, strategies declare which side they
+            # belong to via ``universe_filter``. Skipping here (rather
+            # than inside the strategy handler) means the strategy
+            # doesn't even emit a daemon_tick for markets outside its
+            # universe — keeps analyze_soak's per-strategy stratification
+            # honest.
+            if strategy.universe_filter is not None and not strategy.universe_filter(
+                context.market_id
+            ):
+                continue
+            await self._run_strategy_tick(context, strategy)
+
+    async def _run_strategy_tick(
+        self,
+        context: DecisionContext,
+        strategy: StrategyConfig,
+    ) -> None:
+        """Score the packet with ``strategy.scorer`` and run the paper
+        pipeline under ``strategy.strategy_id``.
+
+        Splitting this out of ``_paper_execute_decision_callback`` keeps
+        the outer loop small and lets the per-strategy pipeline be tested
+        in isolation (with a fake single-strategy daemon) without the
+        multi-strategy iteration overhead.
+        """
+        if strategy.strategy_id == _DEFAULT_STRATEGY_ID:
+            # The decision engine already scored this packet with the fade
+            # scorer into ``context.assessment``; reuse it rather than
+            # re-scoring. Tests also rely on this so they can inject a
+            # hand-built APPROVED assessment under the default strategy.
+            assessment = context.assessment
+        elif context.packet is not None:
+            assessment = strategy.scorer.score_market(context.packet)
+        else:
+            # Non-default strategy without a packet — regime classification
+            # requires HTF features from the packet, so we can't honestly run.
+            # Only reached by tests that hand-build a DecisionContext with no
+            # packet; production always supplies one.
+            return
+        per_ctx = replace(context, assessment=assessment)
+        # Cache the latest assessment per (strategy, market) so an orphan
+        # close can surface fair_probability_at_close / edge_at_close
+        # instead of emitting nulls.
+        self._last_assessment[(strategy.strategy_id, context.market_id)] = assessment
+        await self._default_decision_callback(per_ctx, strategy.strategy_id)
+        await self._paper_execute_for_strategy(per_ctx, strategy.strategy_id)
+
+    async def _paper_execute_for_strategy(
+        self,
+        context: DecisionContext,
+        strategy_id: str,
+    ) -> None:
+        """Run the full paper pipeline (risk → execute → position mgmt)
+        for a single ``strategy_id``.
+
+        Skips entry if this strategy already has an open position in the
+        market. Manages existing positions through the TP-ladder /
+        trailing-stop / TP / SL / force-exit / TTE-buffer priority chain,
+        each scoped to ``(strategy_id, market_id)``.
+        """
+        if strategy_id == "penny":
+            # Penny-strategy has a different exit surface (fixed TP
+            # multiple + TTE-based force exit) and deliberately skips the
+            # fade/adaptive cooldown / candle-elapsed gates, so it runs
+            # through its own pipeline.
+            await self._handle_penny_strategy(context)
+            return
+        if strategy_id == "market_maker":
+            # Market-maker is structurally different from every other
+            # scorer — it posts a TWO-SIDED resting quote (YES-buy + NO-
+            # buy) and skips the cooldown / TP / SL / trail / TTE-buffer
+            # ladder entirely. Positions accumulate; flatten happens via
+            # the opposite-side fill or the MM-specific TTE force exit.
+            await self._handle_market_maker_strategy(context)
+            return
+        # Pin a single Settings snapshot for this callback — the reload loop
+        # can swap self.settings at any moment, and we want every field read
+        # below (ladder / trail / TP / SL / force-exit / cooldown / candle
+        # window) to reflect the same coherent config. Without this pin a
+        # reload between line 608 and 609 could mix old trail_pct with new
+        # arm_pct for one tick.
+        settings = self.settings
+
+        market_id = context.market_id
+        candidate = context.candidate
+        features = context.features
+        assessment = context.assessment
+        tte_seconds = self._seconds_to_expiry(candidate.end_date_iso)
+
+        orderbook = self._build_orderbook_from_state(market_id, features)
+        if orderbook is None:
+            return  # No usable book yet — skip this tick.
+
+        extras_key = (strategy_id, market_id)
+
+        # Manage an already-open position.
+        # Exit priority (first match wins, checked every tick):
+        #   1. TP ladder (partial closes at +X% PnL)
+        #   2. Trailing stop (full close if current drops `trail_pct` below peak)
+        #   3. Fixed take-profit (full close at +X% PnL)
+        #   4. Fixed stop-loss (full close at -Y% PnL)
+        #   5. TTE exit buffer (full close near expiry at current mid)
+        open_pos = await asyncio.to_thread(
+            self.service.portfolio.get_open_position, market_id, strategy_id
+        )
+        if open_pos is not None:
+            # An open position supersedes any pending maker — it either
+            # just filled (our own maker converted) or was opened by a
+            # prior tick's taker entry. Either way, the pending-maker
+            # slot is stale.
+            self._pending_makers.pop(extras_key, None)
+            # Use the ACTUAL exit-walk VWAP as the trigger price, so the SL /
+            # TP / trail threshold evaluates against the same price we'd
+            # realise on close. Earlier versions used raw top-of-bid, which
+            # produced a painful gap on thin books: SL fired at −20% on a
+            # 1-share ghost bid, then the walk realised −30 to −50% when it
+            # consumed deeper levels. Walking the book once per tick and
+            # reusing that VWAP for both trigger and exit aligns them
+            # perfectly — trigger is exactly what the sim would fill at.
+            # Fallback to mid only when the book is totally empty.
+            entry_price = float(open_pos.entry_price)
+            fallback_mid = (
+                features.mid_yes if open_pos.side == SuggestedSide.YES else features.mid_no
+            )
+            current_price = self._paper_exit_fill(
+                market_id, open_pos.side, float(open_pos.size_usd), entry_price, fallback_mid
+            )
+            if current_price > 0.0 and entry_price > 0.0:
+                pnl_pct = (current_price - entry_price) / entry_price
+                # Bootstrap per-position state on first sight. If the daemon
+                # is being seen post-restart, rehydrate original_size_usd and
+                # tranches_closed from DB-persisted closed tranches so the
+                # ladder doesn't re-fire step 1 on the shrunken remainder.
+                # peak_price can't be recovered — restart the trail fresh from
+                # whatever the current price is (safer than guessing).
+                if extras_key not in self._position_extras:
+                    self._position_extras[extras_key] = self._hydrate_position_extras(open_pos)
+                extras = self._position_extras[extras_key]
+                if current_price > extras["peak_price"]:
+                    extras["peak_price"] = current_price
+                # --- 1. TP ladder (partial close) -------------------------
+                tranches_closed = int(extras["tranches_closed"])
+                if tranches_closed < len(self._tp_ladder):
+                    next_pct, next_frac = self._tp_ladder[tranches_closed]
+                    if pnl_pct >= next_pct:
+                        original_size = float(extras.get("original_size_usd", open_pos.size_usd))
+                        current_size = float(open_pos.size_usd)
+                        target_close_usd = next_frac * original_size
+                        # Never try to close more than what's open. If the
+                        # ladder fractions sum to ≥ 1 the last tranche ends up
+                        # fully closing the remainder.
+                        effective_fraction = min(1.0, target_close_usd / max(current_size, 1e-9))
+                        tranche_size_usd = effective_fraction * current_size
+                        exit_price_walk = self._paper_exit_fill(
+                            market_id, open_pos.side, tranche_size_usd, entry_price, float(current_price)
+                        )
+                        await asyncio.to_thread(
+                            lambda: self.service.portfolio.partial_close_position(
+                                market_id,
+                                effective_fraction,
+                                exit_price_walk,
+                                f"paper_tp_ladder_{tranches_closed + 1}",
+                                strategy_id=strategy_id,
+                            )
+                        )
+                        extras["tranches_closed"] = tranches_closed + 1
+                        # The remaining size has shrunk — any pending SL limit
+                        # was sized for the pre-tranche notional, so cancel it.
+                        # The next tick re-evaluates SL against the fresh size
+                        # and posts a new limit if still in SL territory.
+                        self._pending_sl_exits.pop(extras_key, None)
+                        # Partial closes don't start a cooldown — position is
+                        # still live for the remainder; cooldown only applies
+                        # after a FULL close.
+                        return
+                # --- 2. Trailing stop (full close) ------------------------
+                # Arms only once peak clears entry × (1 + arm_pct); prevents
+                # the trail from locking in a small loss when the peak barely
+                # moved above entry. Independently, the trigger price is floored
+                # at entry: a freshly-armed trail with arm_pct < trail_pct / (1 -
+                # trail_pct) would otherwise place its floor below entry and
+                # could fire as a realised loss on the first pullback.
+                # Confirmation ticks: require N consecutive ticks at-or-below
+                # ``trail_floor`` before firing, filtering single-tick wicks.
+                # Counter resets the moment current_price recovers above floor.
+                trail_pct = float(settings.paper_trailing_stop_pct)
+                arm_pct = float(settings.paper_trail_arm_pct)
+                trail_confirm_ticks = max(1, int(settings.paper_trail_confirmation_ticks))
+                peak = extras["peak_price"]
+                arm_threshold = entry_price * (1.0 + arm_pct)
+                trail_armed = peak >= arm_threshold
+                trail_floor = max(peak * (1.0 - trail_pct), entry_price)
+                if trail_pct > 0.0 and trail_armed:
+                    if current_price <= trail_floor:
+                        ticks_below = float(extras.get("trail_below_floor_ticks", 0.0)) + 1.0
+                        extras["trail_below_floor_ticks"] = ticks_below
+                        if ticks_below >= trail_confirm_ticks:
+                            exit_price_walk = self._paper_exit_fill(
+                                market_id, open_pos.side, float(open_pos.size_usd), entry_price, float(current_price)
+                            )
+                            await self._finalize_paper_close(
+                                open_pos, exit_price_walk, "paper_trailing_stop", tte_seconds, context,
+                                strategy_id=strategy_id,
+                            )
+                            return
+                    elif extras.get("trail_below_floor_ticks", 0.0) > 0.0:
+                        extras["trail_below_floor_ticks"] = 0.0
+                # --- 3 + 4. Fixed TP / SL ---------------------------------
+                # If any ladder tranche has already fired, the remaining slice
+                # is meant to "ride the runner" and be captured by the trail —
+                # firing a second full TP on it defeats the scale-out strategy.
+                # So fixed TP only applies when NO tranche has fired yet (either
+                # no ladder configured, or ladder hasn't hit its first threshold
+                # yet). Stop-loss still applies unconditionally as a safety floor.
+                tp_pct = float(settings.paper_take_profit_pct)
+                # Per-strategy SL override: adaptive_v2 fires earlier than
+                # the global threshold because its setups (overreaction
+                # fades) collapse the bid book during fast moves; tighter
+                # SL keeps the limit-out filling instead of expiring.
+                sl_pct = float(settings.paper_stop_loss_pct)
+                if strategy_id == "adaptive_v2":
+                    override = float(settings.adaptive_v2_stop_loss_pct)
+                    if override > 0.0:
+                        sl_pct = override
+                ladder_has_fired = int(extras["tranches_closed"]) > 0
+                sl_triggered = sl_pct > 0.0 and pnl_pct <= -sl_pct
+                # SL limit-out path. Posts a passive limit at threshold price
+                # and waits up to ``ttl_ticks`` for a fill at-or-better. If
+                # the position recovers above SL territory before TTL, the
+                # pending exit is cancelled (price came back). If TTL expires
+                # unfilled, fall back to the legacy full-book walk so the
+                # position can't get stuck under the limit forever.
+                sl_limit_ttl_ticks = int(settings.paper_sl_limit_ttl_ticks)
+                pending_sl = self._pending_sl_exits.get(extras_key)
+                if pending_sl is not None:
+                    # Always attempt the limit fill first — the limit may have
+                    # been crossed mid-tick by recovering bids even if we're no
+                    # longer technically below the SL threshold this snapshot.
+                    # Mirrors how a real resting limit would have been hit.
+                    limit_fill = self._paper_limit_exit_fill(
+                        market_id, open_pos.side,
+                        float(pending_sl["target_shares"]),
+                        float(pending_sl["limit_price"]),
+                    )
+                    if limit_fill is not None:
+                        self._pending_sl_exits.pop(extras_key, None)
+                        await asyncio.to_thread(
+                            self.service.journal.log_event,
+                            "paper_sl_limit_filled",
+                            {
+                                "strategy_id": strategy_id,
+                                "market_id": market_id,
+                                "limit_price": float(pending_sl["limit_price"]),
+                                "fill_price": float(limit_fill),
+                                "ticks_waited": float(pending_sl["ticks_waited"]),
+                            },
+                        )
+                        await self._finalize_paper_close(
+                            open_pos, limit_fill, "paper_stop_loss", tte_seconds, context,
+                            strategy_id=strategy_id,
+                        )
+                        return
+                    if not sl_triggered:
+                        # Limit didn't fill AND we're back above SL threshold —
+                        # cancel the pending limit so a future SL re-trigger
+                        # posts a fresh one against the then-current state.
+                        self._pending_sl_exits.pop(extras_key, None)
+                        await asyncio.to_thread(
+                            self.service.journal.log_event,
+                            "paper_sl_limit_cancelled",
+                            {
+                                "strategy_id": strategy_id,
+                                "market_id": market_id,
+                                "limit_price": float(pending_sl["limit_price"]),
+                                "reason": "recovered_above_threshold",
+                            },
+                        )
+                        pending_sl = None
+                    else:
+                        pending_sl["ticks_waited"] = float(pending_sl["ticks_waited"]) + 1.0
+                        if pending_sl["ticks_waited"] >= sl_limit_ttl_ticks:
+                            # TTL expired — fall back to the legacy walk close
+                            # rather than camping under the limit while the
+                            # book continues to gap deeper.
+                            self._pending_sl_exits.pop(extras_key, None)
+                            exit_price_walk = self._paper_exit_fill(
+                                market_id, open_pos.side, float(open_pos.size_usd),
+                                entry_price, float(current_price),
+                            )
+                            await asyncio.to_thread(
+                                self.service.journal.log_event,
+                                "paper_sl_limit_expired",
+                                {
+                                    "strategy_id": strategy_id,
+                                    "market_id": market_id,
+                                    "limit_price": float(pending_sl["limit_price"]),
+                                    "fallback_exit_price": float(exit_price_walk),
+                                    "ticks_waited": float(pending_sl["ticks_waited"]),
+                                },
+                            )
+                            await self._finalize_paper_close(
+                                open_pos, exit_price_walk, "paper_stop_loss", tte_seconds, context,
+                                strategy_id=strategy_id,
+                            )
+                            return
+                        # Still pending and still in SL territory — wait.
+                        return
+                if sl_triggered and sl_limit_ttl_ticks > 0 and pending_sl is None:
+                    # First tick in SL territory (or after a cancel-then-recover
+                    # cycle) — post a fresh limit. Next tick handles the fill.
+                    slippage_ticks = int(settings.paper_sl_limit_slippage_ticks)
+                    tick_size = float(settings.execution_price_tick) or 0.01
+                    threshold_price = entry_price * (1.0 - sl_pct)
+                    limit_price = max(0.01, threshold_price - slippage_ticks * tick_size)
+                    target_shares = float(open_pos.size_usd) / max(entry_price, 1e-9)
+                    self._pending_sl_exits[extras_key] = {
+                        "limit_price": float(limit_price),
+                        "ticks_waited": 0.0,
+                        "target_shares": float(target_shares),
+                    }
+                    await asyncio.to_thread(
+                        self.service.journal.log_event,
+                        "paper_sl_limit_posted",
+                        {
+                            "strategy_id": strategy_id,
+                            "market_id": market_id,
+                            "side": open_pos.side.value,
+                            "entry_price": float(entry_price),
+                            "threshold_price": float(threshold_price),
+                            "limit_price": float(limit_price),
+                            "ttl_ticks": sl_limit_ttl_ticks,
+                            "slippage_ticks": slippage_ticks,
+                        },
+                    )
+                    return
+                close_reason: str | None = None
+                if tp_pct > 0.0 and not ladder_has_fired and pnl_pct >= tp_pct:
+                    close_reason = "paper_take_profit"
+                elif sl_triggered:
+                    close_reason = "paper_stop_loss"
+                if close_reason is not None:
+                    exit_price_walk = self._paper_exit_fill(
+                        market_id, open_pos.side, float(open_pos.size_usd), entry_price, float(current_price)
+                    )
+                    await self._finalize_paper_close(
+                        open_pos, exit_price_walk, close_reason, tte_seconds, context,
+                        strategy_id=strategy_id,
+                    )
+                    return
+            # --- 5. Force-exit at T-N seconds -----------------------------
+            # Closes unconditionally before the final-seconds noise band where
+            # the trailing stop tends to fire on spread widening rather than
+            # real adverse moves. Kicks in strictly before the exit buffer so
+            # the two don't race; exit buffer is kept as a safety floor.
+            force_tte = int(settings.position_force_exit_tte_seconds)
+            if force_tte > 0 and tte_seconds <= force_tte and current_price > 0.0:
+                exit_price_walk = self._paper_exit_fill(
+                    market_id, open_pos.side, float(open_pos.size_usd),
+                    float(open_pos.entry_price), float(current_price),
+                )
+                await self._finalize_paper_close(
+                    open_pos, exit_price_walk, "paper_time_based_exit", tte_seconds, context,
+                    strategy_id=strategy_id,
+                )
+                return
+            # --- 6. TTE exit buffer ---------------------------------------
+            exit_buffer = self.service.risk.exit_buffer_seconds_for_tte(tte_seconds)
+            if tte_seconds <= exit_buffer and current_price > 0.0:
+                exit_price_walk = self._paper_exit_fill(
+                    market_id, open_pos.side, float(open_pos.size_usd),
+                    float(open_pos.entry_price), float(current_price),
+                )
+                await self._finalize_paper_close(
+                    open_pos, exit_price_walk, "paper_tte_exit", tte_seconds, context,
+                    strategy_id=strategy_id,
+                )
+            return  # Do not open a duplicate while a position is live.
+        # Clean up extras if no open position exists (e.g., previous TTE close).
+        self._position_extras.pop(extras_key, None)
+        self._pending_sl_exits.pop(extras_key, None)
+
+        # Follow-with-maker branch: a scorer signals "rest a paper-maker
+        # limit instead of taking" by stamping one of these tags on
+        # raw_model_output. Route to the paper-maker lifecycle and return —
+        # the normal risk → execute → taker path doesn't apply.
+        if assessment.raw_model_output in (
+            ADAPTIVE_FOLLOW_MAKER_TAG,
+            FADE_POST_ONLY_TAG,
+            OVERREACTION_POST_ONLY_TAG,
+        ):
+            await self._handle_follow_maker(context, strategy_id)
+            return
+
+        # Assessment is not a follow-maker — drop any stale pending maker
+        # left over from a previous tick when the regime was still trending.
+        if extras_key in self._pending_makers:
+            cancelled = self._pending_makers.pop(extras_key)
+            await asyncio.to_thread(
+                self.service.journal.log_event,
+                "paper_maker_cancelled",
+                {
+                    "market_id": market_id,
+                    "strategy_id": strategy_id,
+                    "side": cancelled.side.value,
+                    "limit_price": cancelled.limit_price,
+                    "reason": "regime_no_longer_follow",
+                },
+            )
+
+        # Enforce entry cooldown after a recent close on this (strategy, market).
+        cooldown_seconds = int(settings.paper_entry_cooldown_seconds)
+        if cooldown_seconds > 0:
+            last_close = self._last_close_at.get(extras_key)
+            if last_close is not None:
+                elapsed = (_utc_now() - last_close).total_seconds()
+                if elapsed < cooldown_seconds:
+                    return
+
+        # Block entry until enough of the candle has elapsed for the drift
+        # signal (btc_log_return_since_candle_open) to carry real information.
+        # Skipped for threshold markets where time_elapsed_in_candle_s is 0.
+        family_window = _FAMILY_WINDOW_SECONDS.get(settings.market_family, 0)
+        if family_window > 0:
+            candle_elapsed = context.packet.time_elapsed_in_candle_s if context.packet else 0
+            min_elapsed = int(settings.min_candle_elapsed_seconds)
+            if min_elapsed > 0 and candle_elapsed < min_elapsed:
+                return
+            max_elapsed = int(settings.max_candle_elapsed_seconds)
+            if max_elapsed > 0 and candle_elapsed > max_elapsed:
+                return
+
+        snapshot = MarketSnapshot(
+            candidate=candidate,
+            orderbook=orderbook,
+            seconds_to_expiry=tte_seconds,
+            recent_price_change_bps=0.0,
+            recent_trade_count=features.trade_count_5s,
+            external_price=context.btc_snapshot.price if context.btc_snapshot else 0.0,
+        )
+        account_state = await asyncio.to_thread(
+            lambda: self.service.portfolio.get_account_state(
+                ExecutionMode.PAPER, strategy_id=strategy_id
+            )
+        )
+        decision = self.service.risk.decide_trade(snapshot, assessment, account_state)
+        # Stamp the decision with the executing strategy so the portfolio
+        # INSERT and downstream analyze_soak can attribute fills correctly.
+        decision = replace(decision, strategy_id=strategy_id)
+        await asyncio.to_thread(self.service.journal.log_event, "trade_decision", decision)
+        if decision.status != DecisionStatus.APPROVED:
+            return
+        result = self.service.execution.execute_trade(
+            decision,
+            orderbook,
+            seconds_to_expiry=tte_seconds,
+            edge=assessment.edge,
+        )
+        # Stamp the strategy_id so the journal's execution_result event
+        # carries it — the dashboard's Paper Activity panel groups fills
+        # by strategy and the API has no other way to recover the slice.
+        result = replace(result, strategy_id=decision.strategy_id)
+        await asyncio.to_thread(self.service.portfolio.record_execution, decision, result)
+        await asyncio.to_thread(self.service.journal.log_event, "execution_result", result)
+
+    def _build_orderbook_from_state(
+        self, market_id: str, features: MarketFeatures
+    ) -> OrderBookSnapshot | None:
+        """Snapshot the live per-market order book from WS state (no REST call)."""
+        state = self._market_states.get(market_id)
+        if state is None:
+            return None
+        yes_book = state.yes_book
+        bid_levels = list(yes_book.bids.sorted_levels()[:10])
+        ask_levels = list(yes_book.asks.sorted_levels()[:10])
+        best_bid = features.bid_yes
+        best_ask = features.ask_yes
+        if not best_bid and not best_ask:
+            return None
+        midpoint = features.mid_yes or best_bid or best_ask
+        return OrderBookSnapshot(
+            bid=best_bid,
+            ask=best_ask,
+            midpoint=midpoint,
+            spread=features.spread_yes,
+            depth_usd=features.depth_usd_yes,
+            last_trade_price=yes_book.last_trade_price or midpoint,
+            two_sided=features.two_sided,
+            bid_levels=bid_levels,
+            ask_levels=ask_levels,
+            bid_no=features.bid_no,
+            ask_no=features.ask_no,
+        )
+
+    def _hydrate_position_extras(self, open_pos) -> dict[str, float]:
+        """Build a fresh per-position extras dict, rehydrating ladder state
+        from the DB so daemon restarts don't corrupt scale-out accounting.
+
+        - ``tranches_closed`` = number of tp_ladder partial-closes already
+          recorded for this position's base order_id.
+        - ``original_size_usd`` = current remaining size + sum of every
+          previously-closed tranche's size.
+        - ``peak_price`` = 0 (rebuilds from this point forward — intentional:
+          we can't reconstruct the high-water mark from closed-position rows).
+        """
+        closed_size = 0.0
+        tp_ladder_count = 0
+        if open_pos.order_id:
+            tranches = self.service.portfolio.list_closed_tranches_for_order(open_pos.order_id)
+            for t in tranches:
+                closed_size += float(t.size_usd)
+                if t.close_reason and t.close_reason.startswith("paper_tp_ladder_"):
+                    tp_ladder_count += 1
+        return {
+            "peak_price": 0.0,
+            "tranches_closed": float(tp_ladder_count),
+            "original_size_usd": float(open_pos.size_usd) + closed_size,
+            "trail_below_floor_ticks": 0.0,
+        }
+
+    async def _close_orphaned_position(
+        self,
+        market_id: str,
+        open_pos: "Any",
+        old_candidate: MarketCandidate,
+    ) -> None:
+        """Force-close a paper position whose market dropped out of the active set.
+
+        Stamps the close at market_end_time − 45 s so the position appears to
+        have exited cleanly before the final-seconds noise band rather than at
+        an arbitrary future wall-clock time.
+        """
+        try:
+            expiry = datetime.fromisoformat(old_candidate.end_date_iso.replace("Z", "+00:00"))
+            close_time = min(expiry - timedelta(seconds=45), _utc_now())
+        except (ValueError, AttributeError):
+            close_time = _utc_now()
+
+        side = open_pos.side
+        fallback_price = (
+            1.0 - old_candidate.implied_probability
+            if side == SuggestedSide.NO
+            else old_candidate.implied_probability
+        )
+        exit_price = self._paper_exit_fill(
+            market_id, side, float(open_pos.size_usd), float(open_pos.entry_price), fallback_price
+        )
+        # Each open position carries its own strategy_id on the DB row, so
+        # routing the close and the in-memory state cleanup to the right
+        # slice is trivial — we just read it off the record.
+        strategy_id = getattr(open_pos, "strategy_id", _DEFAULT_STRATEGY_ID)
+
+        # MM holds multiple legs per (market, strategy) — close by
+        # order_id so each leg gets its own correct realised PnL.
+        # Other strategies use the legacy path (UPDATE all OPEN rows for
+        # the pair) which is functionally identical to closing the single
+        # row they own.
+        if strategy_id == "market_maker" and open_pos.order_id:
+            await asyncio.to_thread(
+                lambda: self.service.portfolio.close_position_by_order_id(
+                    open_pos.order_id,
+                    exit_price,
+                    "paper_orphan_close",
+                    now=close_time,
+                )
+            )
+        else:
+            await asyncio.to_thread(
+                lambda: self.service.portfolio.close_position(
+                    market_id,
+                    exit_price,
+                    "paper_orphan_close",
+                    now=close_time,
+                    strategy_id=strategy_id,
+                )
+            )
+        extras_key = (strategy_id, market_id)
+        self._position_extras.pop(extras_key, None)
+        self._pending_sl_exits.pop(extras_key, None)
+        # Drop any orphaned MM rests for this market so they don't linger
+        # in memory after the market drops from discovery — and persist
+        # any pending reward accrual before we lose the state.
+        if strategy_id == "market_maker":
+            for side_label in ("YES", "NO"):
+                drop_key = (strategy_id, market_id, side_label)
+                pending_rest = self._pending_mm_orders.pop(drop_key, None)
+                if pending_rest is not None:
+                    await self._persist_mm_accrual(drop_key, pending_rest)
+        self._last_close_at[extras_key] = _utc_now()
+        # Backfill the close payload from the most recent scorer output for
+        # this (strategy, market). Orphan closes don't re-score, but skipping
+        # these fields blinds analyze_soak's per-trade adverse-selection view.
+        cached_assessment = self._last_assessment.pop(extras_key, None)
+
+        entry_price = float(open_pos.entry_price)
+        size_usd = float(open_pos.size_usd)
+        shares = size_usd / max(entry_price, 1e-6)
+        fee_bps = float(self.settings.fee_bps)
+        pnl_usd = (exit_price - entry_price) * shares - size_usd * (fee_bps / 10_000.0) * 2.0
+        pnl_pct = (exit_price - entry_price) / entry_price if entry_price > 0 else 0.0
+        opened_at = open_pos.opened_at
+        hold_seconds = (close_time - opened_at).total_seconds() if opened_at else 0.0
+        payload: dict[str, Any] = {
+            "market_id": market_id,
+            "question": old_candidate.question,
+            "slug": old_candidate.slug,
+            "end_date_iso": old_candidate.end_date_iso,
+            "side": side.value,
+            "size_usd": size_usd,
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "realized_pnl": round(pnl_usd, 6),
+            "pnl_pct": round(pnl_pct, 6),
+            "close_reason": "paper_orphan_close",
+            "opened_at": opened_at.isoformat() if opened_at else None,
+            "closed_at": close_time.isoformat(),
+            "hold_seconds": round(hold_seconds, 3),
+            "tte_at_close_seconds": 45,
+            "strategy_id": strategy_id,
+            "fair_probability_at_close": (
+                cached_assessment.fair_probability if cached_assessment is not None else None
+            ),
+            "edge_at_close": (
+                cached_assessment.edge if cached_assessment is not None else None
+            ),
+        }
+        await asyncio.to_thread(self.service.journal.log_event, "position_closed", payload)
+        logger.info(
+            "Orphan close: market %s dropped from active set; closed %s at %.4f (stamped %s).",
+            market_id,
+            side.value,
+            exit_price,
+            close_time.isoformat(),
+        )
+
+    async def _finalize_paper_close(
+        self,
+        open_pos: "Any",
+        exit_price: float,
+        close_reason: str,
+        tte_at_close: int,
+        context: DecisionContext,
+        strategy_id: str = _DEFAULT_STRATEGY_ID,
+    ) -> None:
+        """Close an open paper position and emit a self-contained
+        ``position_closed`` event so analyze_soak can correlate entries,
+        exits, and outcomes from events.jsonl alone (no DB join).
+        """
+        market_id = open_pos.market_id
+        await asyncio.to_thread(
+            lambda: self.service.portfolio.close_position(
+                market_id,
+                exit_price,
+                close_reason,
+                strategy_id=strategy_id,
+            )
+        )
+        extras_key = (strategy_id, market_id)
+        self._position_extras.pop(extras_key, None)
+        self._pending_sl_exits.pop(extras_key, None)
+        self._last_close_at[extras_key] = _utc_now()
+        entry_price = float(open_pos.entry_price)
+        size_usd = float(open_pos.size_usd)
+        shares = size_usd / max(entry_price, 1e-6)
+        fee_bps = float(self.settings.fee_bps)
+        pnl_usd = (float(exit_price) - entry_price) * shares - size_usd * (fee_bps / 10_000.0) * 2.0
+        pnl_pct = (float(exit_price) - entry_price) / entry_price if entry_price > 0 else 0.0
+        opened_at = open_pos.opened_at
+        hold_seconds = (_utc_now() - opened_at).total_seconds() if opened_at else 0.0
+        assessment = context.assessment
+        payload: dict[str, Any] = {
+            "market_id": market_id,
+            "question": context.candidate.question,
+            "slug": context.candidate.slug,
+            "end_date_iso": context.candidate.end_date_iso,
+            "side": open_pos.side.value,
+            "size_usd": size_usd,
+            "entry_price": entry_price,
+            "exit_price": float(exit_price),
+            "realized_pnl": round(pnl_usd, 6),
+            "pnl_pct": round(pnl_pct, 6),
+            "close_reason": close_reason,
+            "opened_at": opened_at.isoformat() if opened_at else None,
+            "closed_at": _utc_now().isoformat(),
+            "hold_seconds": round(hold_seconds, 3),
+            "tte_at_close_seconds": int(tte_at_close),
+            "fair_probability_at_close": assessment.fair_probability,
+            "edge_at_close": assessment.edge,
+            "strategy_id": strategy_id,
+        }
+        await asyncio.to_thread(self.service.journal.log_event, "position_closed", payload)
+
+    async def _handle_penny_strategy(self, context: DecisionContext) -> None:
+        """Full penny-strategy lifecycle for one tick of one market.
+
+        State machine per (strategy_id='penny', market_id):
+        - Open position + bid ≥ entry × tp_multiple → close (penny_take_profit)
+        - Open position + TTE ≤ force_exit_tte       → close (penny_force_exit)
+        - Open position otherwise                    → hold
+        - No open position + assessment APPROVED     → enter via taker
+        - No open position + assessment ABSTAIN      → no-op
+
+        Deliberately bypasses the fade/adaptive gates (cooldown, candle
+        elapsed, trend filter, OFI, vol regime) — penny entries are
+        microstructure-driven, not BTC-drift driven, so those gates would
+        just veto the setups the strategy is designed to catch. Also
+        uses a fixed TP multiple instead of the shared TP ladder, which
+        assumes mid-price entries not 1-5¢ tail trades.
+        """
+        settings = self.settings
+        strategy_id = "penny"
+        market_id = context.market_id
+        candidate = context.candidate
+        features = context.features
+        assessment = context.assessment
+        tte_seconds = self._seconds_to_expiry(candidate.end_date_iso)
+
+        orderbook = self._build_orderbook_from_state(market_id, features)
+        if orderbook is None:
+            return
+
+        open_pos = await asyncio.to_thread(
+            self.service.portfolio.get_open_position, market_id, strategy_id
+        )
+        if open_pos is not None:
+            # Current realisable bid on the side we hold. Fall back to mid
+            # if the book is cold-booted, so we at least have a proxy for
+            # the TTE-based force-exit to fire on.
+            if open_pos.side == SuggestedSide.YES:
+                bid = features.bid_yes or features.mid_yes or 0.0
+            else:
+                bid = features.bid_no or features.mid_no or 0.0
+            entry_price = float(open_pos.entry_price)
+            tp_multiple = float(settings.penny_tp_multiple)
+            sl_multiple = float(settings.penny_stop_loss_multiple)
+            force_exit_tte = int(settings.penny_force_exit_tte_seconds)
+            tp_target = entry_price * tp_multiple
+            sl_target = entry_price * sl_multiple
+            close_reason: str | None = None
+            if bid > 0.0 and bid >= tp_target:
+                close_reason = "penny_take_profit"
+            elif sl_multiple > 0.0 and 0.0 < bid <= sl_target:
+                # Observed 2026-04-24: losers drift from entry 3¢ to a 1¢
+                # floor over 4-8 minutes before the TTE force-exit fires.
+                # Clipping at sl_multiple × entry caps the damage earlier
+                # without meaningfully cutting winners (winners hit TP
+                # fast — 34s in the first observed TP run — so they rarely
+                # spend time this deep in the red).
+                close_reason = "penny_stop_loss"
+            elif force_exit_tte > 0 and tte_seconds <= force_exit_tte:
+                close_reason = "penny_force_exit"
+            if close_reason is not None:
+                exit_price = self._paper_exit_fill(
+                    market_id,
+                    open_pos.side,
+                    float(open_pos.size_usd),
+                    entry_price,
+                    float(bid or entry_price),
+                )
+                await self._finalize_paper_close(
+                    open_pos, exit_price, close_reason, tte_seconds, context,
+                    strategy_id=strategy_id,
+                )
+            return
+
+        # No open position: only enter on an APPROVED penny assessment.
+        if assessment.suggested_side == SuggestedSide.ABSTAIN:
+            return
+        # Respect per-strategy max concurrent open positions so a burst of
+        # penny setups across many markets doesn't overwhelm the book.
+        account_state = await asyncio.to_thread(
+            lambda: self.service.portfolio.get_account_state(
+                ExecutionMode.PAPER, strategy_id=strategy_id
+            )
+        )
+        max_concurrent = int(settings.max_concurrent_positions)
+        if max_concurrent > 0 and account_state.open_positions >= max_concurrent:
+            return
+
+        size_usd = float(settings.penny_size_usd)
+        if size_usd <= 0.0:
+            return
+        asset_id = (
+            candidate.yes_token_id
+            if assessment.suggested_side == SuggestedSide.YES
+            else candidate.no_token_id
+        )
+        # Build a hand-rolled APPROVED decision — we skip the risk engine's
+        # fade-oriented gates (min_edge, trend filter, OFI, vol regime) by
+        # not calling service.risk.decide_trade here. The scorer's own
+        # gates (entry_thresh + min_entry_tte) are authoritative for penny.
+        limit_price = (
+            features.ask_yes if assessment.suggested_side == SuggestedSide.YES else features.ask_no
+        )
+        decision = TradeDecision(
+            market_id=market_id,
+            status=DecisionStatus.APPROVED,
+            side=assessment.suggested_side,
+            size_usd=size_usd,
+            limit_price=float(limit_price or 0.0),
+            rationale=list(assessment.reasons_for_trade),
+            rejected_by=[],
+            asset_id=str(asset_id),
+            order_side=OrderSide.BUY,
+            intent="OPEN",
+            execution_style=ExecutionStyle.FOK_TAKER,
+            post_only=False,
+            strategy_id=strategy_id,
+        )
+        await asyncio.to_thread(self.service.journal.log_event, "trade_decision", decision)
+        result = self.service.execution.execute_trade(
+            decision,
+            orderbook,
+            seconds_to_expiry=tte_seconds,
+            edge=assessment.edge,
+        )
+        result = replace(result, strategy_id=decision.strategy_id)
+        await asyncio.to_thread(self.service.portfolio.record_execution, decision, result)
+        await asyncio.to_thread(self.service.journal.log_event, "execution_result", result)
+
+    def _accrue_mm_quote(
+        self,
+        key: tuple[str, str, str],
+        order: "PaperMakerOrder",
+        candidate: MarketCandidate,
+        features: MarketFeatures,
+        now: datetime,
+    ) -> None:
+        """Advance the reward-accrual state for one resting MM quote.
+
+        Computes the in-band/out-of-band status from the current book mid
+        + the candidate's ``rewards_max_spread_pct``, and the per-day
+        reward rate at the quote location via
+        :func:`estimate_reward_for_size` against the live book on the
+        relevant side. Called once per tick per quote — runs before the
+        place/replace step so the freshly-elapsed period is credited
+        before any potential cancel-and-replace drops the in-memory
+        state.
+
+        Pending USD stays buffered in ``state.pending_reward_usd`` until
+        the quote ends (fill / cancel / force-exit), at which point
+        :meth:`_persist_mm_accrual` flushes a single DB row.
+        """
+        state = self._mm_quote_accrual.get(key)
+        if state is None:
+            return
+        # Compute in-band status from the YES-side mid; NO-side quotes
+        # use the mirrored mid (1 - yes_mid) but the reward-band test is
+        # symmetric so we evaluate against the side's own mid.
+        if order.side is SuggestedSide.YES:
+            mid = features.mid_yes
+            book_levels = features.bid_levels_yes
+        else:
+            mid = features.mid_no
+            book_levels = features.bid_levels_no
+        max_spread = float(candidate.rewards_max_spread_pct)
+        daily_pool = float(candidate.rewards_daily_rate)
+        in_band = (
+            max_spread > 0.0
+            and mid > 0.0
+            and abs(order.limit_price - mid) <= (max_spread / 100.0) + 1e-9
+        )
+        per_day_rate = 0.0
+        if in_band and daily_pool > 0.0:
+            per_day_rate = estimate_reward_for_size(
+                target_price=order.limit_price,
+                midpoint=mid,
+                book_levels=book_levels,
+                max_spread_pct=max_spread,
+                daily_reward_usd=daily_pool,
+                size_usd=order.size_usd,
+            )
+        accrue(
+            state,
+            now=now,
+            daily_reward_usd_at_quote=per_day_rate,
+            in_band=in_band,
+        )
+
+    async def _persist_mm_accrual(
+        self,
+        key: tuple[str, str, str],
+        order: "PaperMakerOrder",
+    ) -> None:
+        """Flush the pending accrual to the ``reward_accruals`` table and
+        drop the in-memory state.
+
+        Called when an MM quote ends: filled, TTL-expired, drift-replaced,
+        scorer-cancelled, or force-exited. The DB write is a single
+        append-only row carrying the lifetime accrual for this specific
+        rest — re-quotes start fresh state.
+        """
+        state = self._mm_quote_accrual.pop(key, None)
+        if state is None:
+            return
+        pending = take_pending(state)
+        if pending <= 0.0:
+            return
+        period_seconds = state.in_band_seconds + state.out_band_seconds
+        await asyncio.to_thread(
+            self.service.portfolio.record_reward_accrual,
+            strategy_id=key[0],
+            market_id=key[1],
+            side=order.side.value,
+            amount_usd=pending,
+            period_seconds=period_seconds,
+            in_band=True,
+        )
+        await asyncio.to_thread(
+            self.service.journal.log_event,
+            "mm_reward_accrued",
+            {
+                "strategy_id": key[0],
+                "market_id": key[1],
+                "side": order.side.value,
+                "limit_price": order.limit_price,
+                "amount_usd": round(pending, 6),
+                "period_seconds": round(period_seconds, 3),
+                "in_band_seconds": round(state.in_band_seconds, 3),
+                "out_band_seconds": round(state.out_band_seconds, 3),
+                "last_daily_rate_usd": round(state.last_daily_rate_usd, 4),
+            },
+        )
+
+    async def _handle_market_maker_strategy(self, context: DecisionContext) -> None:
+        """Two-sided market-making lifecycle for one market on one tick.
+
+        Per ``(strategy_id="market_maker", market_id)``:
+
+        1. **Force-exit guard**: when TTE drops below
+           ``mm_force_exit_tte_seconds``, close every open MM leg at the
+           current bid via ``_paper_exit_fill`` + ``_finalize_paper_close``.
+           No more quoting on this market for this tick.
+
+        2. **Fill check**: each pending leg is checked against the live
+           ask on its side; a crossed leg books a paper fill (recorded
+           as an OPEN ``PositionRecord`` under ``strategy_id="market_maker"``).
+
+        3. **Inventory snapshot**: derived from open positions on this
+           market for this strategy. Hard-caps each side at
+           ``mm_max_inventory_usd``.
+
+        4. **Quote pricing**: :func:`compute_quote_pair` produces the
+           skewed YES-buy and NO-buy prices.
+
+        5. **Per-leg lifecycle**: TTL expiry → cancel; drift over the
+           hysteresis threshold → cancel + replace; otherwise hold.
+
+        Deliberately bypasses the cooldown / TP-ladder / trailing-stop /
+        SL / candle-elapsed gates that the directional strategies use —
+        MM is supposed to quote continuously regardless of recent close
+        history, and the inventory cap plus the force-exit guard are
+        already the relevant safety surface.
+        """
+        settings = self.settings
+        strategy_id = "market_maker"
+        market_id = context.market_id
+        candidate = context.candidate
+        features = context.features
+        assessment = context.assessment
+        tte_seconds = self._seconds_to_expiry(candidate.end_date_iso)
+        now = _utc_now()
+
+        orderbook = self._build_orderbook_from_state(market_id, features)
+        if orderbook is None:
+            return
+
+        # 0. Advance reward accrual for every still-resting MM quote on
+        # this market BEFORE any fill / cancel / replace logic runs. This
+        # ensures the period from the previous tick up to this one gets
+        # credited — popping the quote first would discard the accrual.
+        for side_label in ("YES", "NO"):
+            key = (strategy_id, market_id, side_label)
+            order = self._pending_mm_orders.get(key)
+            if order is None:
+                continue
+            self._accrue_mm_quote(key, order, candidate, features, now)
+
+        # 1. Force exit. MM positions don't have a TP/SL/trail; their
+        # only programmatic exit is the TTE-buffer floor. We close every
+        # leg at the realised bid VWAP — same path the directional exit
+        # ladder uses, but applied to the multi-leg MM position set.
+        force_exit_tte = int(settings.mm_force_exit_tte_seconds)
+        open_legs = await asyncio.to_thread(
+            self.service.portfolio.list_open_positions_for_market,
+            market_id,
+            strategy_id,
+        )
+        if force_exit_tte > 0 and tte_seconds <= force_exit_tte and open_legs:
+            for leg in open_legs:
+                fallback_mid = (
+                    features.mid_yes if leg.side == SuggestedSide.YES else features.mid_no
+                )
+                exit_price = self._paper_exit_fill(
+                    market_id,
+                    leg.side,
+                    float(leg.size_usd),
+                    float(leg.entry_price),
+                    float(fallback_mid),
+                )
+                await self._finalize_mm_leg_close(
+                    leg, exit_price, "mm_force_exit", tte_seconds, context
+                )
+            # Cancel any pending quotes on this market — no more posting.
+            for side_label in ("YES", "NO"):
+                key = (strategy_id, market_id, side_label)
+                pending = self._pending_mm_orders.pop(key, None)
+                if pending is not None:
+                    await self._persist_mm_accrual(key, pending)
+                    await asyncio.to_thread(
+                        self.service.journal.log_event,
+                        "mm_quote_cancelled",
+                        {
+                            "strategy_id": strategy_id,
+                            "market_id": market_id,
+                            "side": pending.side.value,
+                            "limit_price": pending.limit_price,
+                            "reason": "force_exit_tte",
+                        },
+                    )
+            return
+
+        # 2. Fill check — each side independently against its own ask.
+        # Two adverse-selection guards run BEFORE honouring a cross:
+        #
+        #   (a) ``mm_no_fill_tte_seconds``: refuse to fill any quote when
+        #       the market is too close to resolution. Mirrors the open-
+        #       side equivalent of ``mm_force_exit_tte_seconds`` for
+        #       existing positions. Without it, a 30-second-from-resolve
+        #       fill opens a position whose only possible outcome is
+        #       force-close at the resolution price.
+        #
+        #   (b) ``mm_max_fill_drift_pct``: refuse to fill when the current
+        #       mid has moved away from the quote's price by more than
+        #       this %. Catches the "stale-quote-on-resolution" failure
+        #       mode where our 0.695 bid stays put while the market
+        #       crashes to 0.01; an aggressive seller crosses our stale
+        #       limit, we eat the full loss. The 2026-05-02 soak surfaced
+        #       two −$985 single-leg fills caused by exactly this bug.
+        #
+        # Both guards cancel-and-persist the quote so the next tick can
+        # re-quote at the now-current mid if MM remains live.
+        no_fill_tte = int(settings.mm_no_fill_tte_seconds)
+        max_drift_pct = float(settings.mm_max_fill_drift_pct)
+        max_quote_age = int(settings.mm_max_quote_age_seconds)
+        for side_label, fill_side in (("YES", SuggestedSide.YES), ("NO", SuggestedSide.NO)):
+            key = (strategy_id, market_id, side_label)
+            pending = self._pending_mm_orders.get(key)
+            if pending is None:
+                continue
+            quote_age = (now - pending.placed_at).total_seconds()
+
+            # Defense-in-depth: any quote older than ``mm_max_quote_age_seconds``
+            # is force-cancelled regardless of TTL or freshness state.
+            # Belt-and-braces against the universe-exit zombie pattern.
+            if max_quote_age > 0 and quote_age > max_quote_age:
+                self._pending_mm_orders.pop(key, None)
+                await self._persist_mm_accrual(key, pending)
+                await asyncio.to_thread(
+                    self.service.journal.log_event,
+                    "mm_quote_cancelled",
+                    {
+                        "strategy_id": strategy_id,
+                        "market_id": market_id,
+                        "side": pending.side.value,
+                        "limit_price": pending.limit_price,
+                        "reason": "max_quote_age",
+                        "age_seconds": round(quote_age, 2),
+                    },
+                )
+                continue
+
+            if check_fill(pending, features.ask_yes, features.ask_no):
+                # Guard (a): TTE floor on fills.
+                if no_fill_tte > 0 and tte_seconds <= no_fill_tte:
+                    self._pending_mm_orders.pop(key, None)
+                    await self._persist_mm_accrual(key, pending)
+                    await asyncio.to_thread(
+                        self.service.journal.log_event,
+                        "mm_quote_cancelled",
+                        {
+                            "strategy_id": strategy_id,
+                            "market_id": market_id,
+                            "side": pending.side.value,
+                            "limit_price": pending.limit_price,
+                            "reason": "no_fill_tte_floor",
+                            "tte_seconds": int(tte_seconds),
+                            "no_fill_tte_seconds": no_fill_tte,
+                        },
+                    )
+                    continue
+                # Guard (b): mid-drift refusal.
+                quote_mid = features.mid_yes if pending.side is SuggestedSide.YES else features.mid_no
+                if max_drift_pct > 0.0 and quote_mid > 0.0:
+                    drift_pct = abs(pending.limit_price - quote_mid) / quote_mid * 100.0
+                    if drift_pct > max_drift_pct:
+                        self._pending_mm_orders.pop(key, None)
+                        await self._persist_mm_accrual(key, pending)
+                        await asyncio.to_thread(
+                            self.service.journal.log_event,
+                            "mm_quote_cancelled",
+                            {
+                                "strategy_id": strategy_id,
+                                "market_id": market_id,
+                                "side": pending.side.value,
+                                "limit_price": pending.limit_price,
+                                "reason": "fill_drift_guard",
+                                "current_mid": round(quote_mid, 6),
+                                "drift_pct": round(drift_pct, 4),
+                                "max_drift_pct": max_drift_pct,
+                            },
+                        )
+                        continue
+                # Guards passed — honour the fill.
+                await self._fill_paper_mm_leg(pending, context)
+                self._pending_mm_orders.pop(key, None)
+                await self._persist_mm_accrual(key, pending)
+            elif is_expired(pending, now):
+                self._pending_mm_orders.pop(key, None)
+                await self._persist_mm_accrual(key, pending)
+                await asyncio.to_thread(
+                    self.service.journal.log_event,
+                    "mm_quote_cancelled",
+                    {
+                        "strategy_id": strategy_id,
+                        "market_id": market_id,
+                        "side": pending.side.value,
+                        "limit_price": pending.limit_price,
+                        "reason": "ttl_expired",
+                        "ttl_seconds": pending.ttl_seconds,
+                    },
+                )
+
+        # If the scorer abstained for this market this tick, cancel any
+        # remaining pending quotes and stop. Common reasons: market spread
+        # widened past ``mm_max_market_spread`` (toxic flow), spread
+        # collapsed inside ``mm_min_market_spread`` (no spread to capture).
+        if assessment.suggested_side == SuggestedSide.ABSTAIN:
+            for side_label in ("YES", "NO"):
+                key = (strategy_id, market_id, side_label)
+                pending = self._pending_mm_orders.pop(key, None)
+                if pending is not None:
+                    await self._persist_mm_accrual(key, pending)
+                    await asyncio.to_thread(
+                        self.service.journal.log_event,
+                        "mm_quote_cancelled",
+                        {
+                            "strategy_id": strategy_id,
+                            "market_id": market_id,
+                            "side": pending.side.value,
+                            "limit_price": pending.limit_price,
+                            "reason": "scorer_abstained",
+                        },
+                    )
+            return
+
+        # Reward gate: when ``mm_require_rewards`` and this market pays
+        # no maker subsidy, abstain entirely. The scorer can't see the
+        # candidate's reward params — they're on ``MarketCandidate``, not
+        # ``EvidencePacket`` — so the daemon enforces the gate here.
+        if settings.mm_require_rewards and candidate.rewards_daily_rate <= 0.0:
+            return
+
+        # 3. Inventory snapshot derived from the (possibly multi-row)
+        # open-position set for this (strategy, market). Re-read after
+        # any fills above so the skew reflects the freshest state.
+        open_legs = await asyncio.to_thread(
+            self.service.portfolio.list_open_positions_for_market,
+            market_id,
+            strategy_id,
+        )
+        inventory = compute_inventory(
+            open_legs,
+            market_id=market_id,
+            max_inventory_usd=float(settings.mm_max_inventory_usd),
+        )
+
+        # 4. Compute the skewed quote pair. The scorer already vetted
+        # spread / TTE / two-sidedness, but the book may have moved
+        # between the scorer call and this lifecycle call (different
+        # threadpool queue), so we re-validate the book state here.
+        quote_pair = compute_quote_pair(
+            bid_yes=features.bid_yes,
+            ask_yes=features.ask_yes,
+            half_spread=float(settings.mm_target_half_spread),
+            skew=inventory.skew,
+            skew_strength=float(settings.mm_inventory_skew_strength),
+            halt_yes_buy=inventory.halt_yes_buy,
+            halt_no_buy=inventory.halt_no_buy,
+        )
+
+        # 5. Per-leg place / replace. The fade follow-maker uses
+        # SuggestedSide.YES/NO on a single PaperMakerOrder; we mirror
+        # that here, one PaperMakerOrder per side with the side encoded
+        # both as the SuggestedSide enum and the dict key suffix.
+        ttl_seconds = int(settings.mm_quote_ttl_seconds)
+        size_usd = float(settings.mm_size_usd)
+        tick_size = float(settings.execution_price_tick) or 0.01
+        replace_min_price = float(settings.mm_replace_min_ticks) * tick_size
+        replace_min_size_pct = float(settings.mm_replace_min_size_pct) * 100.0
+        for side_label, fill_side, target_price in (
+            ("YES", SuggestedSide.YES, quote_pair.yes_bid),
+            ("NO", SuggestedSide.NO, quote_pair.no_bid),
+        ):
+            key = (strategy_id, market_id, side_label)
+            existing = self._pending_mm_orders.get(key)
+            if target_price is None:
+                # Side halted (inventory cap hit) or book pricing failed.
+                # Cancel any leftover rest on this side.
+                if existing is not None:
+                    self._pending_mm_orders.pop(key, None)
+                    await self._persist_mm_accrual(key, existing)
+                    await asyncio.to_thread(
+                        self.service.journal.log_event,
+                        "mm_quote_cancelled",
+                        {
+                            "strategy_id": strategy_id,
+                            "market_id": market_id,
+                            "side": fill_side.value,
+                            "limit_price": existing.limit_price,
+                            "reason": "side_halted_or_unpriceable",
+                        },
+                    )
+                continue
+            rounded = round(target_price, 6)
+            if existing is not None:
+                price_drift = abs(rounded - existing.limit_price)
+                size_drift_pct = (
+                    abs(size_usd - existing.size_usd) / existing.size_usd * 100.0
+                    if existing.size_usd > 0
+                    else 0.0
+                )
+                if (
+                    price_drift < replace_min_price
+                    and size_drift_pct < replace_min_size_pct
+                ):
+                    continue  # Drift inside the hysteresis band — keep the rest.
+                self._pending_mm_orders.pop(key, None)
+                await self._persist_mm_accrual(key, existing)
+                await asyncio.to_thread(
+                    self.service.journal.log_event,
+                    "mm_quote_cancelled",
+                    {
+                        "strategy_id": strategy_id,
+                        "market_id": market_id,
+                        "side": fill_side.value,
+                        "limit_price": existing.limit_price,
+                        "desired_price": rounded,
+                        "price_delta": round(price_drift, 6),
+                        "reason": "drift_threshold",
+                    },
+                )
+            order = PaperMakerOrder(
+                strategy_id=strategy_id,
+                market_id=market_id,
+                side=fill_side,
+                limit_price=rounded,
+                size_usd=size_usd,
+                placed_at=now,
+                ttl_seconds=ttl_seconds,
+            )
+            self._pending_mm_orders[key] = order
+            # Start fresh accrual state for this rest. ``last_check_at``
+            # is ``now`` so the first tick to see this quote credits zero
+            # and subsequent ticks credit the elapsed period properly.
+            self._mm_quote_accrual[key] = QuoteAccrualState(
+                placed_at=now, last_check_at=now,
+            )
+            await asyncio.to_thread(
+                self.service.journal.log_event,
+                "mm_quote_placed",
+                {
+                    "strategy_id": strategy_id,
+                    "market_id": market_id,
+                    "side": fill_side.value,
+                    "limit_price": rounded,
+                    "size_usd": size_usd,
+                    "ttl_seconds": ttl_seconds,
+                    "mid_yes": quote_pair.mid_yes,
+                    "half_spread": quote_pair.half_spread,
+                    "skew": quote_pair.skew,
+                    "yes_exposure_usd": inventory.yes_exposure_usd,
+                    "no_exposure_usd": inventory.no_exposure_usd,
+                },
+            )
+
+    async def _fill_paper_mm_leg(
+        self,
+        order: PaperMakerOrder,
+        context: DecisionContext,
+    ) -> None:
+        """Convert a crossed MM rest into a recorded position.
+
+        Mirrors :meth:`_fill_paper_maker` but tags each leg with a unique
+        per-side order_id so :meth:`portfolio.close_position_by_order_id`
+        can retire one leg without affecting the other on the force-exit
+        path.
+        """
+        side_suffix = "yes" if order.side is SuggestedSide.YES else "no"
+        order_id = (
+            f"paper-mm-{order.strategy_id}-{order.market_id}-{side_suffix}-"
+            f"{int(order.placed_at.timestamp())}"
+        )
+        filled_shares = order.size_usd / max(order.limit_price, 1e-9)
+        now = _utc_now()
+        decision = TradeDecision(
+            market_id=order.market_id,
+            status=DecisionStatus.APPROVED,
+            side=order.side,
+            size_usd=order.size_usd,
+            limit_price=order.limit_price,
+            rationale=[f"market-maker {side_suffix.upper()} fill at {order.limit_price:.4f}"],
+            rejected_by=[],
+            asset_id="",
+            execution_style=ExecutionStyle.GTC_MAKER,
+            post_only=True,
+            strategy_id=order.strategy_id,
+        )
+        result = ExecutionResult(
+            market_id=order.market_id,
+            success=True,
+            mode=ExecutionMode.PAPER,
+            order_id=order_id,
+            status="FILLED_PAPER",
+            detail=(
+                f"MM paper fill {filled_shares:.6f} shares of {order.side.value} "
+                f"@ {order.limit_price:.4f} [GTC_MAKER]"
+            ),
+            fill_price=order.limit_price,
+            filled_size_shares=filled_shares,
+            remaining_size_shares=0.0,
+            execution_style=ExecutionStyle.GTC_MAKER,
+            executed_at=now,
+            strategy_id=order.strategy_id,
+        )
+        await asyncio.to_thread(self.service.portfolio.record_execution, decision, result)
+        await asyncio.to_thread(self.service.journal.log_event, "execution_result", result)
+        await asyncio.to_thread(
+            self.service.journal.log_event,
+            "mm_quote_filled",
+            {
+                "strategy_id": order.strategy_id,
+                "market_id": order.market_id,
+                "side": order.side.value,
+                "limit_price": order.limit_price,
+                "size_usd": order.size_usd,
+                "filled_shares": round(filled_shares, 6),
+                "order_id": order_id,
+            },
+        )
+
+    async def _finalize_mm_leg_close(
+        self,
+        leg: "Any",
+        exit_price: float,
+        close_reason: str,
+        tte_at_close: int,
+        context: DecisionContext,
+    ) -> None:
+        """Close one MM leg by ``order_id`` (so the symmetric leg stays
+        open) and emit the same ``position_closed`` payload shape that
+        :meth:`_finalize_paper_close` produces.
+
+        The MM strategy holds multiple open positions per ``(market,
+        strategy)`` pair, so the standard ``close_position`` helper isn't
+        usable — it would close every open row for the market. We use
+        ``close_position_by_order_id`` instead.
+        """
+        await asyncio.to_thread(
+            lambda: self.service.portfolio.close_position_by_order_id(
+                leg.order_id, exit_price, close_reason
+            )
+        )
+        entry_price = float(leg.entry_price)
+        size_usd = float(leg.size_usd)
+        shares = size_usd / max(entry_price, 1e-6)
+        fee_bps = float(self.settings.fee_bps)
+        pnl_usd = (
+            (float(exit_price) - entry_price) * shares
+            - size_usd * (fee_bps / 10_000.0) * 2.0
+        )
+        pnl_pct = (
+            (float(exit_price) - entry_price) / entry_price if entry_price > 0 else 0.0
+        )
+        opened_at = leg.opened_at
+        hold_seconds = (_utc_now() - opened_at).total_seconds() if opened_at else 0.0
+        assessment = context.assessment
+        payload: dict[str, Any] = {
+            "market_id": leg.market_id,
+            "question": context.candidate.question,
+            "slug": context.candidate.slug,
+            "end_date_iso": context.candidate.end_date_iso,
+            "side": leg.side.value,
+            "size_usd": size_usd,
+            "entry_price": entry_price,
+            "exit_price": float(exit_price),
+            "realized_pnl": round(pnl_usd, 6),
+            "pnl_pct": round(pnl_pct, 6),
+            "close_reason": close_reason,
+            "opened_at": opened_at.isoformat() if opened_at else None,
+            "closed_at": _utc_now().isoformat(),
+            "hold_seconds": round(hold_seconds, 3),
+            "tte_at_close_seconds": int(tte_at_close),
+            "fair_probability_at_close": assessment.fair_probability,
+            "edge_at_close": assessment.edge,
+            "strategy_id": leg.strategy_id,
+            "order_id": leg.order_id,
+        }
+        await asyncio.to_thread(self.service.journal.log_event, "position_closed", payload)
+
+    async def _handle_follow_maker(
+        self,
+        context: DecisionContext,
+        strategy_id: str,
+    ) -> None:
+        """Drive the paper-maker lifecycle for a follow-with-maker tick.
+
+        State machine per (strategy_id, market_id):
+        - No pending order → compute a discounted-mid limit and park it.
+        - Pending order + current ask crossed the limit → convert to a
+          paper fill by recording an execution against the strategy's
+          portfolio slice.
+        - Pending order + TTL elapsed → cancel and emit a log.
+        - Pending order + material drift (price or size threshold
+          breached) → cancel and re-quote so we don't lose maker-reward
+          eligibility when the mid moves. Thresholds default to 0 = never
+          re-quote (behaviour preserved until operator opts in).
+        - Otherwise → wait.
+
+        Depth filter: when ``paper_follow_min_level_size_shares > 0`` we
+        replace the raw best-bid/ask with the first level carrying at
+        least that many shares before computing the mid anchor. Prevents
+        anchoring on a ghost 1-lot level at the top of the book.
+
+        Cooldown, candle-elapsed, and min_edge gates from the taker path
+        don't apply: the whole point of follow-maker is to rest quietly
+        and only fill on a favourable pullback, so time-based and edge-
+        based filters would just suppress the setup entirely.
+        """
+        settings = self.settings
+        market_id = context.market_id
+        features = context.features
+        assessment = context.assessment
+        key = (strategy_id, market_id)
+        now = _utc_now()
+        pending = self._pending_makers.get(key)
+
+        if pending is not None:
+            if check_fill(pending, features.ask_yes, features.ask_no):
+                await self._fill_paper_maker(pending, context)
+                self._pending_makers.pop(key, None)
+                return
+            if is_expired(pending, now):
+                self._pending_makers.pop(key, None)
+                await asyncio.to_thread(
+                    self.service.journal.log_event,
+                    "paper_maker_cancelled",
+                    {
+                        "market_id": market_id,
+                        "strategy_id": strategy_id,
+                        "side": pending.side.value,
+                        "limit_price": pending.limit_price,
+                        "reason": "ttl_expired",
+                        "ttl_seconds": pending.ttl_seconds,
+                    },
+                )
+                # Fall through to place a fresh maker if the regime still
+                # says follow — the adaptive scorer already vetted that.
+                pending = None
+
+        discount_bps = float(settings.paper_follow_limit_discount_bps)
+        ttl_seconds = int(settings.paper_follow_maker_ttl_seconds)
+        min_level_size = float(settings.paper_follow_min_level_size_shares)
+        bid_yes, ask_yes, bid_no, ask_no = self._depth_filtered_quotes(features, min_level_size)
+        limit_price = maker_limit_price(
+            assessment.suggested_side,
+            bid_yes,
+            ask_yes,
+            bid_no,
+            ask_no,
+            discount_bps,
+        )
+        if limit_price <= 0.0:
+            return  # Book too thin or crossed — skip this tick.
+
+        size_usd = float(settings.max_position_usd)
+
+        # Entry gates for NEW maker placements. The maker-follow path used to
+        # bypass cooldown + entry-price filtering by design ("rest quietly")
+        # but soak data (29 Apr market 2104140) showed 8 consecutive fills
+        # on a crashing market in 4 min, all stopping out — the rapid-fire
+        # falling-knife pattern the cooldown was designed to prevent. Apply
+        # the same gates the RiskEngine uses on the taker path. Existing
+        # pending makers above are still managed (filled/expired/drift) so
+        # quotes posted before the gate fired can still resolve naturally.
+        ask_our_side = ask_yes if assessment.suggested_side == SuggestedSide.YES else ask_no
+        gate_block: str | None = None
+        cooldown_seconds = int(settings.paper_entry_cooldown_seconds)
+        if cooldown_seconds > 0:
+            last_close = self._last_close_at.get(key)
+            if last_close is not None:
+                elapsed = (now - last_close).total_seconds()
+                if elapsed < cooldown_seconds:
+                    gate_block = "cooldown"
+        if gate_block is None and ask_our_side > 0.0:
+            min_entry_price = float(settings.quant_min_entry_price)
+            if min_entry_price > 0.0 and ask_our_side < min_entry_price:
+                gate_block = "min_entry_price"
+            else:
+                max_entry_price = float(settings.quant_max_entry_price)
+                if max_entry_price > 0.0 and ask_our_side > max_entry_price:
+                    gate_block = "max_entry_price"
+        if gate_block is None:
+            depth_mult = float(settings.min_exit_depth_multiplier)
+            if depth_mult > 0.0:
+                exit_depth = self._exit_side_bid_depth_usd(
+                    market_id, assessment.suggested_side
+                )
+                # Fail open when state is unavailable (None); only block when
+                # we can actually measure the depth and it's insufficient.
+                if exit_depth is not None and exit_depth < size_usd * depth_mult:
+                    gate_block = "exit_depth"
+        if gate_block is not None:
+            if pending is not None:
+                # Cancel — we'd otherwise leave a stale quote that could
+                # fill in an entry the gate just rejected.
+                self._pending_makers.pop(key, None)
+                await asyncio.to_thread(
+                    self.service.journal.log_event,
+                    "paper_maker_cancelled",
+                    {
+                        "market_id": market_id,
+                        "strategy_id": strategy_id,
+                        "side": pending.side.value,
+                        "limit_price": pending.limit_price,
+                        "reason": gate_block,
+                    },
+                )
+            return
+
+        if pending is not None and not self._maker_drift_exceeds_threshold(
+            pending,
+            desired_price=limit_price,
+            desired_size_usd=size_usd,
+            price_threshold=float(settings.paper_follow_cancel_price_threshold),
+            size_threshold_pct=float(settings.paper_follow_cancel_size_threshold_pct),
+        ):
+            return  # Keep the existing quote; drift is within tolerance.
+
+        if pending is not None:
+            self._pending_makers.pop(key, None)
+            await asyncio.to_thread(
+                self.service.journal.log_event,
+                "paper_maker_cancelled",
+                {
+                    "market_id": market_id,
+                    "strategy_id": strategy_id,
+                    "side": pending.side.value,
+                    "limit_price": pending.limit_price,
+                    "reason": "drift_threshold",
+                    "desired_price": round(limit_price, 6),
+                    "price_delta": round(abs(limit_price - pending.limit_price), 6),
+                    "size_delta_pct": self._size_delta_pct(pending.size_usd, size_usd),
+                },
+            )
+
+        order = PaperMakerOrder(
+            strategy_id=strategy_id,
+            market_id=market_id,
+            side=assessment.suggested_side,
+            limit_price=round(limit_price, 6),
+            size_usd=size_usd,
+            placed_at=now,
+            ttl_seconds=ttl_seconds,
+        )
+        self._pending_makers[key] = order
+        await asyncio.to_thread(
+            self.service.journal.log_event,
+            "paper_maker_placed",
+            {
+                "market_id": market_id,
+                "strategy_id": strategy_id,
+                "side": order.side.value,
+                "limit_price": order.limit_price,
+                "size_usd": order.size_usd,
+                "ttl_seconds": order.ttl_seconds,
+                "discount_bps": discount_bps,
+                "mid_yes": features.mid_yes,
+                "mid_no": features.mid_no,
+                "min_level_size_shares": min_level_size,
+            },
+        )
+
+    @staticmethod
+    def _depth_filtered_quotes(
+        features: MarketFeatures,
+        min_level_size: float,
+    ) -> tuple[float, float, float, float]:
+        """Return ``(bid_yes, ask_yes, bid_no, ask_no)`` with ghost levels
+        filtered out. Falls back to the raw best when either the side is
+        empty or no level meets ``min_level_size`` — preserves the
+        "skip this tick" contract that :func:`maker_limit_price` relies
+        on when the book is degenerate.
+        """
+        if min_level_size <= 0.0:
+            return features.bid_yes, features.ask_yes, features.bid_no, features.ask_no
+        bid_yes = first_level_with_size(features.bid_levels_yes, min_level_size) or features.bid_yes
+        ask_yes = first_level_with_size(features.ask_levels_yes, min_level_size) or features.ask_yes
+        bid_no = first_level_with_size(features.bid_levels_no, min_level_size) or features.bid_no
+        ask_no = first_level_with_size(features.ask_levels_no, min_level_size) or features.ask_no
+        return bid_yes, ask_yes, bid_no, ask_no
+
+    @staticmethod
+    def _maker_drift_exceeds_threshold(
+        pending: PaperMakerOrder,
+        desired_price: float,
+        desired_size_usd: float,
+        price_threshold: float,
+        size_threshold_pct: float,
+    ) -> bool:
+        """True when the desired quote has drifted far enough from the
+        resting order to justify cancel-and-replace. Both thresholds are
+        inclusive "ignore smaller changes" bands; setting either to 0
+        treats any nonzero drift as material (matches the reference
+        repo's ``should_cancel`` semantics when its 0.5¢ / 10% gates are
+        set tight).
+
+        We cancel on EITHER axis breaching so price-tracking and
+        size-resizing can be tuned independently.
+        """
+        price_delta = abs(desired_price - pending.limit_price)
+        if price_threshold > 0.0 and price_delta >= price_threshold:
+            return True
+        if size_threshold_pct > 0.0 and pending.size_usd > 0.0:
+            pct = abs(desired_size_usd - pending.size_usd) / pending.size_usd * 100.0
+            if pct >= size_threshold_pct:
+                return True
+        return False
+
+    @staticmethod
+    def _size_delta_pct(prev_size_usd: float, desired_size_usd: float) -> float:
+        if prev_size_usd <= 0.0:
+            return 0.0
+        return round(abs(desired_size_usd - prev_size_usd) / prev_size_usd * 100.0, 4)
+
+    @staticmethod
+    def _estimate_reward_at_yes_bid(context: "DecisionContext") -> float:
+        """Daily maker-reward yield per $100 if we were resting on the
+        current YES bid. Returns 0.0 for markets without maker subsidies
+        or when the book is missing. Instrumentation only — the selection
+        loop doesn't consume this yet.
+        """
+        candidate = context.candidate
+        if candidate.rewards_daily_rate <= 0.0:
+            return 0.0
+        features = context.features
+        if features.bid_yes <= 0.0 or features.mid_yes <= 0.0:
+            return 0.0
+        return round(
+            estimate_reward_per_100(
+                target_price=features.bid_yes,
+                midpoint=features.mid_yes,
+                book_levels=features.bid_levels_yes,
+                max_spread_pct=candidate.rewards_max_spread_pct,
+                daily_reward_usd=candidate.rewards_daily_rate,
+            ),
+            4,
+        )
+
+    async def _fill_paper_maker(
+        self,
+        order: PaperMakerOrder,
+        context: DecisionContext,
+    ) -> None:
+        """Convert a crossed paper-maker rest into a recorded position.
+
+        Builds a synthetic APPROVED TradeDecision + FILLED_PAPER
+        ExecutionResult so the existing ``record_execution`` path
+        registers the position under the right ``strategy_id`` with the
+        maker's exact limit price as the entry. The portfolio layer
+        treats the fill identically to a taker fill from that point on —
+        the TP ladder, trailing stop, and exit buffer all apply because
+        the open-position row is keyed on (market_id, strategy_id).
+        """
+        order_id = f"paper-maker-{order.strategy_id}-{order.market_id}-{int(order.placed_at.timestamp())}"
+        filled_shares = order.size_usd / max(order.limit_price, 1e-9)
+        now = _utc_now()
+        decision = TradeDecision(
+            market_id=order.market_id,
+            status=DecisionStatus.APPROVED,
+            side=order.side,
+            size_usd=order.size_usd,
+            limit_price=order.limit_price,
+            rationale=[f"adaptive-follow-maker fill at {order.limit_price:.4f}"],
+            rejected_by=[],
+            asset_id="",
+            execution_style=ExecutionStyle.GTC_MAKER,
+            post_only=True,
+            strategy_id=order.strategy_id,
+        )
+        result = ExecutionResult(
+            market_id=order.market_id,
+            success=True,
+            mode=ExecutionMode.PAPER,
+            order_id=order_id,
+            status="FILLED_PAPER",
+            detail=(
+                f"Paper maker fill {filled_shares:.6f} shares of {order.side.value} "
+                f"@ {order.limit_price:.4f} [GTC_MAKER]"
+            ),
+            fill_price=order.limit_price,
+            filled_size_shares=filled_shares,
+            remaining_size_shares=0.0,
+            execution_style=ExecutionStyle.GTC_MAKER,
+            executed_at=now,
+            strategy_id=order.strategy_id,
+        )
+        await asyncio.to_thread(self.service.portfolio.record_execution, decision, result)
+        await asyncio.to_thread(self.service.journal.log_event, "execution_result", result)
+
+    def _paper_exit_fill(
+        self,
+        market_id: str,
+        side: "SuggestedSide",
+        size_usd: float,
+        entry_price: float,
+        fallback_price: float,
+    ) -> float:
+        """Compute a realistic paper-mode exit fill by walking the live BID book.
+
+        Closing a position means SELLING the token back. For YES positions we
+        sell YES tokens → walk yes_book.bids best-first. For NO positions we
+        sell NO tokens → walk no_book.bids best-first. The fill is the VWAP
+        across the levels consumed by the actual shares we HOLD
+        (``size_usd / entry_price``) — NOT by shares that would be purchased
+        at the current mid. Using current mid over-targets the walk on losing
+        positions (mid fell → more shares "needed" than actually held) and
+        under-targets it on winners, both of which skew the VWAP unrealistically.
+        Falls back to the passed-in ``fallback_price`` (usually the current bid
+        or mid) with slippage when the book has no levels for the closing side.
+        """
+        state = self._market_states.get(market_id)
+        if state is None:
+            return self.service.portfolio.apply_exit_slippage(fallback_price)
+        book = state.yes_book if side == SuggestedSide.YES else state.no_book
+        levels = list(book.bids.sorted_levels())
+        if not levels:
+            return self.service.portfolio.apply_exit_slippage(fallback_price)
+        # Shares actually held = original notional / entry price. This is the
+        # exact count we'd try to offload; walking any other size produces a
+        # fictional VWAP and miscalibrates stop-loss realisation.
+        target_shares = size_usd / max(entry_price, 1e-9)
+        remaining = target_shares
+        notional = 0.0
+        filled = 0.0
+        for price, avail in levels:
+            if remaining <= 0.0 or avail <= 0.0 or price <= 0.0:
+                continue
+            take = min(remaining, avail)
+            notional += price * take
+            filled += take
+            remaining -= take
+        if filled <= 0.0:
+            return self.service.portfolio.apply_exit_slippage(fallback_price)
+        vwap = notional / filled
+        # Apply any additional configured exit slippage on top of the realistic
+        # book-walked price so the two settings compose (walk captures spread,
+        # slippage captures latency / size-beyond-book).
+        return self.service.portfolio.apply_exit_slippage(vwap)
+
+    def _exit_side_bid_depth_usd(
+        self,
+        market_id: str,
+        side: "SuggestedSide",
+        levels: int = 5,
+    ) -> float | None:
+        """Top-N bid-side dollar depth for the side a position would exit on.
+
+        For a YES position the exit walks ``yes_book.bids``; for NO it walks
+        ``no_book.bids``. Returns the sum of ``price × shares`` across the
+        first ``levels`` bid levels — a coarse "can the book absorb me at
+        these prices?" check used by the entry gate to filter setups where
+        the SL limit-out would inevitably expire into a deep walk fallback.
+
+        ``None`` if the market state is unavailable so callers can fail open.
+        """
+        state = self._market_states.get(market_id)
+        if state is None:
+            return None
+        book = state.yes_book if side == SuggestedSide.YES else state.no_book
+        return sum(
+            float(price) * float(size)
+            for price, size in list(book.bids.sorted_levels()[:levels])
+        )
+
+    def _paper_limit_exit_fill(
+        self,
+        market_id: str,
+        side: "SuggestedSide",
+        target_shares: float,
+        limit_price: float,
+    ) -> float | None:
+        """Try to fully exit ``target_shares`` at-or-better than ``limit_price``.
+
+        Walks the bid book taking only levels priced ≥ ``limit_price`` (since
+        bids descend from best to worst, we ``break`` the moment we cross the
+        limit). Returns the slippage-adjusted VWAP if the limit can absorb the
+        full size; ``None`` if the qualifying liquidity is short — caller
+        keeps the order pending and re-checks next tick.
+        """
+        state = self._market_states.get(market_id)
+        if state is None:
+            return None
+        book = state.yes_book if side == SuggestedSide.YES else state.no_book
+        levels = list(book.bids.sorted_levels())
+        if not levels:
+            return None
+        remaining = target_shares
+        notional = 0.0
+        filled = 0.0
+        for price, avail in levels:
+            if price < limit_price:
+                break
+            if remaining <= 0.0 or avail <= 0.0:
+                continue
+            take = min(remaining, avail)
+            notional += price * take
+            filled += take
+            remaining -= take
+            if remaining <= 1e-9:
+                break
+        if remaining > 1e-9 or filled <= 0.0:
+            return None
+        return self.service.portfolio.apply_exit_slippage(notional / filled)
+
+    # --- Heartbeat + maintenance --------------------------------------
+
+    async def _heartbeat_loop(self, stop_event: asyncio.Event) -> None:
+        """Persist the daemon's metrics at a steady cadence.
+
+        The API process has no in-memory view of the daemon so it reads this
+        file to compute heartbeat-age, kill-switch state, and the per-daemon
+        metrics exposed on ``/api/metrics``.
+        """
+        interval = max(0.1, float(self.config.heartbeat_interval_seconds))
+        while not stop_event.is_set():
+            try:
+                auth = self._auth_readonly_ready()
+                self._apply_safety_stop(auth_readonly_ready=auth)
+                btc_snapshot = self.btc_state.snapshot()
+                extra = {
+                    "active_market_ids": self.active_market_ids,
+                    "active_market_slugs": {
+                        mid: c.slug
+                        for mid, c in self._candidates.items()
+                        if c.slug
+                    },
+                    "active_asset_ids": self.active_asset_ids,
+                    "btc_last_price": self.btc_state.last_price,
+                    "btc_seconds_since_last_update": self.btc_state.seconds_since_last_update(),
+                    "btc_session": btc_snapshot.btc_session if btc_snapshot else None,
+                    "auth_readonly_ready": auth,
+                    "safety_stop_reason": self.metrics.safety_stop_reason,
+                    "market_family": self.settings.market_family,
+                    # Per-open-position trail state. Lets the dashboard render the
+                    # Live trailing-stop / TP-ladder state per (strategy, market).
+                    # Nested shape so the dashboard can look up extras by both
+                    # dimensions (a position on adaptive_v2 doesn't share state
+                    # with a position on fade for the same market). Schema:
+                    #   { strategy_id: { market_id: { peak_price, ... } } }
+                    "position_extras": _nest_position_extras(self._position_extras),
+                    # Flat shape kept for backwards compatibility with any
+                    # consumer still indexing by market_id only — collapses all
+                    # strategies onto market_id; if multiple strategies hold the
+                    # same market, last-write wins. Will be removed once all
+                    # consumers read the nested form.
+                    "position_extras_flat": {
+                        market_id: dict(extras)
+                        for (_strategy_id, market_id), extras in self._position_extras.items()
+                    },
+                    "paper_trailing_stop_pct": float(self.settings.paper_trailing_stop_pct),
+                    "paper_trail_arm_pct": float(self.settings.paper_trail_arm_pct),
+                    # Resting paper-maker limits. Lives only in daemon
+                    # memory; the heartbeat is the dashboard's sole window
+                    # into "what limits are riding the book right now".
+                    "pending_makers": _serialize_pending_makers(
+                        self._pending_makers,
+                        _utc_now(),
+                        mm_pending=self._pending_mm_orders,
+                        market_states=self._market_states,
+                    ),
+                    # MM reward bookkeeping. The DB-persisted totals are the
+                    # source of truth; the in-memory pending fields surface
+                    # accrual on currently-resting quotes that hasn't been
+                    # flushed to ``reward_accruals`` yet (a quote rests in
+                    # memory until it cancels / fills, then a single row is
+                    # written). Both numbers are needed for "what's my live
+                    # PnL right now" — sum them.
+                    "mm_reward_persisted_usd": float(
+                        self.service.portfolio.total_reward_accrued("market_maker")
+                        if self.settings.mm_enabled
+                        else 0.0
+                    ),
+                    "mm_reward_pending_usd": round(
+                        sum(
+                            state.pending_reward_usd
+                            for state in self._mm_quote_accrual.values()
+                        ),
+                        6,
+                    ),
+                    "mm_reward_in_band_seconds": round(
+                        sum(
+                            state.in_band_seconds
+                            for state in self._mm_quote_accrual.values()
+                        ),
+                        2,
+                    ),
+                    "mm_reward_out_band_seconds": round(
+                        sum(
+                            state.out_band_seconds
+                            for state in self._mm_quote_accrual.values()
+                        ),
+                        2,
+                    ),
+                }
+                await asyncio.to_thread(self.heartbeat.write, self.metrics, extra)
+            except Exception as exc:
+                logger.warning("daemon heartbeat write failed: %s", exc)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                continue
+
+    async def _mm_freshness_loop(self, stop_event: asyncio.Event) -> None:
+        """Periodically invoke the MM lifecycle handler for every market
+        in ``_mm_market_ids``, regardless of WS event activity.
+
+        Why this exists: the MM lifecycle handler only runs when a
+        Polymarket WS event fires a tick for the relevant market. Quiet
+        markets (long-tail political, off-hours sports, low-volume EPL
+        legs) can go minutes without an event, leaving:
+
+        - TTL-expired quotes lingering in ``_pending_mm_orders`` (no
+          tick → no expiry check),
+        - Reward accrual frozen at zero (no tick → no ``accrue`` call),
+        - The reward-band drift gate not firing (no tick → no
+          cancel/replace).
+
+        The follow-maker strategy has the same problem solved by
+        :meth:`_maker_freshness_loop`; this is the MM equivalent. Each
+        sweep iterates ``self._mm_market_ids``, looks up the live
+        ``MarketState``, and calls :meth:`_maybe_fire_decision` with a
+        ``mm_freshness`` trigger reason. The decision dispatch's
+        per-strategy ``universe_filter`` ensures only the MM strategy
+        actually runs (the BTC scorers' filter rejects MM markets).
+
+        Disabled when ``mm_freshness_interval_seconds`` ≤ 0. The
+        per-tick rate limiter (``decision_min_interval_seconds``) still
+        applies, so a fast-flowing market that already ticked recently
+        won't get a duplicate tick from this loop.
+        """
+        interval = float(self.settings.mm_freshness_interval_seconds or 0.0)
+        if interval <= 0.0:
+            return
+        interval = max(0.5, interval)
+        # Per-market spacing so the global ``decision_min_interval_seconds``
+        # rate limiter doesn't drop every market after the first in a
+        # back-to-back loop. A small buffer above the rate-limit window
+        # ensures each market clears before the next tick fires.
+        per_market_pause = float(self.config.decision_min_interval_seconds) + 0.05
+        while not stop_event.is_set():
+            try:
+                # Snapshot keys upfront so a discovery cycle mutating the
+                # set mid-iteration doesn't trip us.
+                ids = list(self._mm_market_ids)
+                for idx, market_id in enumerate(ids):
+                    state = self._market_states.get(market_id)
+                    if state is None:
+                        continue
+                    await self._maybe_fire_decision(
+                        state, trigger_reason="mm_freshness"
+                    )
+                    if idx + 1 < len(ids):
+                        await asyncio.sleep(per_market_pause)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("MM freshness sweep failed: %s", exc)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                continue
+
+    async def _maker_freshness_loop(self, stop_event: asyncio.Event) -> None:
+        """Periodically re-quote resting paper-maker limits whose desired
+        price has drifted past ``paper_follow_cancel_price_threshold``.
+
+        Why this exists: the event-driven path (``_handle_follow_maker``)
+        only fires when the WS feed emits a tick that re-runs the scorer.
+        On a quiet market that tick can be minutes apart from the prior
+        one — long enough for the mid to drift several cents while our
+        rest sits at a stale price. The next tick that does fire will
+        usually have the ask already inside our limit, locking in a
+        fill at the *worse* price (the fill check in
+        ``_handle_follow_maker`` runs before the drift check).
+
+        This loop closes that gap by sweeping ``_pending_makers`` on a
+        fixed cadence and re-quoting independently of WS triggers.
+        Doesn't run the scorer (regime changes are still owned by the
+        event-driven path) and doesn't check fills (also event-driven).
+        Pure price-tracking — same drift threshold the event path uses.
+
+        Disabled when ``maker_freshness_interval_seconds`` ≤ 0.
+        """
+        interval = float(self.config.maker_freshness_interval_seconds)
+        if interval <= 0.0:
+            return
+        interval = max(0.1, interval)
+        while not stop_event.is_set():
+            try:
+                await self._refresh_pending_makers()
+            except Exception as exc:
+                logger.warning("maker freshness sweep failed: %s", exc)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                continue
+
+    async def _refresh_pending_makers(self) -> None:
+        """One sweep of ``_pending_makers`` — re-quote any rest that has
+        drifted past the price threshold against current book state.
+
+        Snapshots keys upfront so we don't trip on concurrent mutations
+        from the event-driven path. For each key we re-fetch the pending
+        order before mutating; if it has been filled, cancelled, or
+        replaced in between we skip — the event path already handled it.
+        """
+        settings = self.settings
+        price_threshold = float(settings.paper_follow_cancel_price_threshold)
+        size_threshold_pct = float(settings.paper_follow_cancel_size_threshold_pct)
+        if price_threshold <= 0.0 and size_threshold_pct <= 0.0:
+            return  # No re-quote policy on either axis — loop is a no-op.
+        discount_bps = float(settings.paper_follow_limit_discount_bps)
+        ttl_seconds = int(settings.paper_follow_maker_ttl_seconds)
+        min_level_size = float(settings.paper_follow_min_level_size_shares)
+        size_usd = float(settings.max_position_usd)
+
+        for key in list(self._pending_makers.keys()):
+            pending = self._pending_makers.get(key)
+            if pending is None:
+                continue
+            strategy_id, market_id = key
+            state = self._market_states.get(market_id)
+            if state is None:
+                continue
+            features = state.features()
+            bid_yes, ask_yes, bid_no, ask_no = self._depth_filtered_quotes(
+                features, min_level_size
+            )
+            desired_limit = maker_limit_price(
+                pending.side, bid_yes, ask_yes, bid_no, ask_no, discount_bps
+            )
+            if desired_limit <= 0.0:
+                continue  # Book too thin / crossed — leave existing rest alone.
+            if not self._maker_drift_exceeds_threshold(
+                pending,
+                desired_price=desired_limit,
+                desired_size_usd=size_usd,
+                price_threshold=price_threshold,
+                size_threshold_pct=size_threshold_pct,
+            ):
+                continue
+            # Drift exceeded — cancel and replace. Re-check the slot is
+            # still ours before mutating; the event path may have just
+            # filled or cancelled it.
+            if self._pending_makers.get(key) is not pending:
+                continue
+            self._pending_makers.pop(key, None)
+            await asyncio.to_thread(
+                self.service.journal.log_event,
+                "paper_maker_cancelled",
+                {
+                    "market_id": market_id,
+                    "strategy_id": strategy_id,
+                    "side": pending.side.value,
+                    "limit_price": pending.limit_price,
+                    "reason": "freshness_drift",
+                    "desired_price": round(desired_limit, 6),
+                    "price_delta": round(abs(desired_limit - pending.limit_price), 6),
+                    "size_delta_pct": self._size_delta_pct(pending.size_usd, size_usd),
+                },
+            )
+            now = _utc_now()
+            new_order = PaperMakerOrder(
+                strategy_id=strategy_id,
+                market_id=market_id,
+                side=pending.side,
+                limit_price=round(desired_limit, 6),
+                size_usd=size_usd,
+                placed_at=now,
+                ttl_seconds=ttl_seconds,
+            )
+            self._pending_makers[key] = new_order
+            await asyncio.to_thread(
+                self.service.journal.log_event,
+                "paper_maker_placed",
+                {
+                    "market_id": market_id,
+                    "strategy_id": strategy_id,
+                    "side": new_order.side.value,
+                    "limit_price": new_order.limit_price,
+                    "size_usd": new_order.size_usd,
+                    "ttl_seconds": new_order.ttl_seconds,
+                    "discount_bps": discount_bps,
+                    "mid_yes": features.mid_yes,
+                    "mid_no": features.mid_no,
+                    "min_level_size_shares": min_level_size,
+                    "source": "freshness_loop",
+                },
+            )
+
+    async def _emit_startup_settings_events(self) -> None:
+        """Journal the list of migrations applied on this boot plus a
+        snapshot of every editable-field value.
+
+        Downstream tooling (analyze_soak.py, the event log viewer) keys off
+        these two events to establish the pre-change baseline for any
+        settings_changed event that appears later in the same log.
+        """
+        try:
+            applied = getattr(self.service, "migrations_applied", []) or []
+            if applied:
+                await asyncio.to_thread(
+                    self.service.journal.log_event,
+                    "migrations_applied",
+                    {"applied": [m.name for m in applied]},
+                )
+            await asyncio.to_thread(
+                self.service.journal.log_event,
+                "settings_snapshot",
+                {"source": "startup", "values": editable_values_snapshot(self.settings)},
+            )
+        except Exception as exc:  # noqa: BLE001 — never block daemon start
+            logger.warning("failed to emit startup settings events: %s", exc)
+
+    async def _settings_reload_loop(self, stop_event: asyncio.Event) -> None:
+        """Poll ``settings_changes.MAX(id)``; on advance, rebind engines and
+        journal a ``settings_changed`` event with the before/after diff.
+
+        Cheap in the steady state: a single indexed ``MAX(id)`` query per
+        tick. The rebind happens on the same task as the poll so no
+        cross-task coordination on ``self.settings`` is needed — readers on
+        other tasks either see the old object or the new one, never a
+        partial state.
+        """
+        interval = max(0.2, float(self.settings.daemon_settings_reload_interval_seconds))
+        while not stop_event.is_set():
+            try:
+                await asyncio.to_thread(self._maybe_reload_settings)
+            except Exception as exc:  # noqa: BLE001 — keep the loop alive
+                logger.warning("settings reload tick failed: %s", exc)
+                try:
+                    await asyncio.to_thread(
+                        self.service.journal.log_event,
+                        "settings_reload_failed",
+                        {"error": str(exc), "last_seen_id": self._last_settings_id},
+                    )
+                except Exception:
+                    pass
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                continue
+
+    def _maybe_reload_settings(self) -> None:
+        """Synchronous body of ``_settings_reload_loop`` — safe to run from
+        ``asyncio.to_thread`` since every step (``get_max_id``,
+        ``list_changes``, ``get_effective_settings``, engine rebind) is
+        pure Python / SQLite.
+        """
+        store = self.service.settings_store
+        current_max = store.get_max_id()
+        if current_max <= self._last_settings_id:
+            return
+        new_rows = store.list_changes(since_id=self._last_settings_id)
+        if not new_rows:
+            self._last_settings_id = current_max
+            return
+        new_settings = get_effective_settings()
+        diff = diff_editable(self.settings, new_settings)
+        # Even if ``diff`` is empty (e.g. a row that merely re-wrote the
+        # existing value), advance the cursor so we don't keep re-reading
+        # the same row. A ``settings_changed`` event is still emitted so
+        # the audit trail matches the DB rows.
+        changed_fields = list(diff.keys()) or [r.field for r in new_rows]
+        requires_restart = sorted(
+            f for f in changed_fields
+            if EDITABLE_SETTINGS_METADATA.get(f, {}).get("requires_restart")
+        )
+        source_sources = sorted({r.source for r in new_rows})
+        payload = {
+            "source": ",".join(source_sources),
+            "row_ids": [r.id for r in new_rows],
+            "changed": diff,
+            "requires_restart": requires_restart,
+        }
+        try:
+            self.service.journal.log_event("settings_changed", payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("settings_changed journal emit failed: %s", exc)
+        self._apply_settings(new_settings)
+        self._last_settings_id = current_max
+
+    def _apply_settings(self, new_settings: Settings) -> None:
+        """Rebind every place a live reference to ``Settings`` is held.
+
+        Fields copied out at engine init (``paper_entry_slippage_bps``,
+        ``live_trading_enabled``) are refreshed via the engine's ``refresh()``
+        hooks. Cached derived state (``_tp_ladder``, the ``RiskProfile``) is
+        recomputed here.
+
+        Fields flagged ``requires_restart=True`` still get rebound on the
+        Settings object so operators can see the new value reflected in
+        ``/api/settings``, but the engines keep running on whatever callback
+        / balance / market_family they were built with until the next restart.
+        The ``settings_changed`` event's ``requires_restart`` list surfaces
+        this to the operator.
+        """
+        self.settings = new_settings
+        self.quant.settings = new_settings
+        self._tp_ladder = self._parse_tp_ladder(new_settings.paper_tp_ladder)
+        # RiskEngine caches a RiskProfile derived from settings.
+        try:
+            self.service.risk.settings = new_settings
+            self.service.risk.refresh_profile()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("risk.refresh_profile failed: %s", exc)
+        # ExecutionEngine copies slippage / live_trading_enabled at init.
+        try:
+            self.service.execution.settings = new_settings
+            self.service.execution.refresh()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("execution.refresh failed: %s", exc)
+        # Portfolio holds a settings ref so per-strategy bankroll
+        # overrides (``paper_starting_balance_per_strategy``) hot-reload.
+        # The default ``starting_balance_usd`` is still requires_restart
+        # because it's frozen at construction; the per-strategy overrides
+        # via the dict are dynamic.
+        try:
+            self.service.portfolio.settings = new_settings
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("portfolio settings sync failed: %s", exc)
+        # Rebuild the penny scorer so parameter changes (entry_thresh,
+        # min_entry_tte_seconds, reversal-confirmation gate) take effect
+        # without a restart.
+        self.penny = PennyScorer(
+            entry_thresh=float(new_settings.penny_entry_thresh),
+            min_entry_tte_seconds=int(new_settings.penny_min_entry_tte_seconds),
+            min_favorable_move_bps=float(new_settings.penny_min_favorable_move_bps),
+        )
+        # Same pattern for adaptive_v2 (overreaction-fade).
+        self.adaptive_v2 = OverreactionScorer(
+            overreaction_threshold=float(new_settings.adaptive_v2_overreaction_threshold),
+            sensitivity=float(new_settings.adaptive_v2_sensitivity),
+            cost_floor=float(new_settings.adaptive_v2_cost_floor),
+            min_seconds_to_expiry=int(new_settings.adaptive_v2_min_seconds_to_expiry),
+            max_abs_edge=float(new_settings.adaptive_v2_max_abs_edge),
+            post_only=bool(new_settings.adaptive_v2_post_only),
+            ofi_gate_enabled=bool(new_settings.quant_ofi_gate_enabled),
+            ofi_gate_min_abs_flow=float(new_settings.quant_ofi_gate_min_abs_flow),
+            invert=bool(new_settings.adaptive_v2_invert),
+        )
+        self.market_maker = MarketMakerScorer(
+            min_tte_seconds=int(new_settings.mm_min_tte_seconds),
+            min_market_spread=float(new_settings.mm_min_market_spread),
+            max_market_spread=float(new_settings.mm_max_market_spread),
+            require_rewards=bool(new_settings.mm_require_rewards),
+        )
+        # Rebuild the strategy list (with universe filters re-bound to
+        # this DaemonRunner instance so a runtime ``mm_universe_enabled``
+        # flip takes effect on the next tick).
+        self._strategies = self._build_strategies(new_settings)
+
+    async def _maintenance_loop(self, stop_event: asyncio.Event) -> None:
+        """Periodic retention + WAL checkpoint + VACUUM-lite upkeep.
+
+        Runs separately from the decision loop so SQLite's exclusive lock for
+        VACUUM never blocks a tick. First iteration waits the full interval so
+        a freshly started daemon doesn't immediately churn the DB.
+        """
+        interval = max(60.0, float(self.config.maintenance_interval_seconds))
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
+        while not stop_event.is_set():
+            try:
+                summary = await asyncio.to_thread(self._run_maintenance)
+                self.metrics.maintenance_runs += 1
+                self.metrics.last_maintenance_at = _utc_now()
+                self.metrics.last_maintenance_summary = summary
+            except Exception as exc:
+                logger.warning("daemon maintenance run failed: %s", exc)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                continue
+
+    def _run_maintenance(self) -> dict[str, Any]:
+        summary: dict[str, Any] = {}
+        days = int(self.config.prune_history_days)
+        if days > 0:
+            summary["history_pruned"] = self.service.portfolio.prune_history(days)
+        events_pruned = self.service.journal.prune_events_jsonl(
+            self.settings.events_jsonl_max_bytes,
+            keep_tail_bytes=self.settings.events_jsonl_keep_tail_bytes,
+        )
+        summary["events_jsonl_pruned"] = bool(events_pruned)
+        try:
+            wal = self.service.portfolio.wal_checkpoint()
+            summary["wal_checkpoint"] = {
+                "busy": wal[0],
+                "log_pages": wal[1],
+                "checkpointed_pages": wal[2],
+            }
+        except Exception as exc:
+            summary["wal_checkpoint_error"] = str(exc)
+        summary["db_size_bytes"] = self.service.journal.db_size_bytes()
+        summary["events_jsonl_size_bytes"] = self.service.journal.events_jsonl_size_bytes()
+        return summary
+
+    def _auth_readonly_ready(self) -> bool:
+        try:
+            status = self.service.polymarket.get_auth_status()
+        except Exception:
+            return False
+        return bool(status.live_client_constructible)
+
+    def _apply_safety_stop(self, auth_readonly_ready: bool | None) -> None:
+        reason = self.service.safety_stop_reason(
+            auth_readonly_ready=auth_readonly_ready,
+        )
+        if reason is None:
+            if self.metrics.safety_stop_reason is not None:
+                logger.info("daemon kill-switch cleared (was %s)", self.metrics.safety_stop_reason)
+            self.metrics.safety_stop_reason = None
+            self.metrics.safety_stop_at = None
+            return
+        if self.metrics.safety_stop_reason == reason:
+            return
+        self.metrics.safety_stop_reason = reason
+        self.metrics.safety_stop_at = _utc_now()
+        logger.warning("daemon kill-switch fired: %s", reason)
+        try:
+            self.service.journal.log_event("safety_stop", {"reason": reason})
+        except Exception as exc:
+            logger.warning("failed to journal safety_stop: %s", exc)
+
+    # --- Shutdown ------------------------------------------------------
+
+    async def _shutdown_tasks(self, tasks: Iterable[asyncio.Task[None] | None]) -> None:
+        for task in tasks:
+            if task is None:
+                continue
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+
+def run_daemon(settings: Settings, service: AgentService, duration_seconds: float | None = None) -> None:
+    """Synchronous entry point used by the CLI.
+
+    If ``duration_seconds`` is provided the runner stops after that many
+    seconds (useful for smoke tests); otherwise it runs until the process is
+    interrupted.
+    """
+    runner = DaemonRunner(settings=settings, service=service)
+
+    async def _main() -> None:
+        if duration_seconds is not None:
+            await runner.run_for(duration_seconds)
+            return
+        stop_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        import signal
+
+        def _request_stop() -> None:
+            stop_event.set()
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, _request_stop)
+            except NotImplementedError:
+                # Windows / non-mainloop environments.
+                pass
+        await runner.run(stop_event)
+
+    asyncio.run(_main())

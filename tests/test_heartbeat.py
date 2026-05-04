@@ -4,8 +4,8 @@ import json
 import time
 from pathlib import Path
 
-from polymarket_ai_agent.apps.daemon.heartbeat import HeartbeatReader, HeartbeatWriter
-from polymarket_ai_agent.apps.daemon.run import DaemonMetrics
+from polymarket_trading_engine.apps.daemon.heartbeat import HeartbeatReader, HeartbeatWriter
+from polymarket_trading_engine.apps.daemon.run import DaemonMetrics
 
 
 def test_heartbeat_write_produces_atomic_file(tmp_path: Path) -> None:

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from polymarket_ai_agent.connectors.external_feeds import ExternalFeedConnector
-from polymarket_ai_agent.connectors.polymarket import PolymarketConnector
-from polymarket_ai_agent.types import DecisionStatus, SuggestedSide, TradeDecision
+from polymarket_trading_engine.connectors.external_feeds import ExternalFeedConnector
+from polymarket_trading_engine.connectors.polymarket import PolymarketConnector
+from polymarket_trading_engine.types import DecisionStatus, SuggestedSide, TradeDecision
 
 
 class DummyResponse:

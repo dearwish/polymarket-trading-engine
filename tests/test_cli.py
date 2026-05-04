@@ -3,8 +3,8 @@ from __future__ import annotations
 import httpx
 from typer.testing import CliRunner
 
-from polymarket_ai_agent.apps.operator.cli import app
-from polymarket_ai_agent.types import DecisionStatus, ExecutionMode, ExecutionResult, SuggestedSide, TradeDecision
+from polymarket_trading_engine.apps.operator.cli import app
+from polymarket_trading_engine.types import DecisionStatus, ExecutionMode, ExecutionResult, SuggestedSide, TradeDecision
 
 runner = CliRunner()
 
@@ -253,14 +253,14 @@ class StubService:
 
 
 def test_cli_status(monkeypatch) -> None:
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: StubService())
     result = runner.invoke(app, ["status"])
     assert result.exit_code == 0
     assert "trading_mode" in result.stdout
 
 
 def test_cli_auth_check(monkeypatch) -> None:
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: StubService())
     result = runner.invoke(app, ["auth-check"])
     assert result.exit_code == 0
     assert "readonly_ready" in result.stdout
@@ -268,7 +268,7 @@ def test_cli_auth_check(monkeypatch) -> None:
 
 
 def test_cli_doctor(monkeypatch) -> None:
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: StubService())
     result = runner.invoke(app, ["doctor", "--active"])
     assert result.exit_code == 0
     assert "\"readonly\": true" in result.stdout
@@ -277,7 +277,7 @@ def test_cli_doctor(monkeypatch) -> None:
 
 
 def test_cli_live_preflight(monkeypatch) -> None:
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: StubService())
     result = runner.invoke(app, ["live-preflight", "--active"])
     assert result.exit_code == 0
     assert "\"ready\": true" in result.stdout
@@ -285,7 +285,7 @@ def test_cli_live_preflight(monkeypatch) -> None:
 
 
 def test_cli_live_orders(monkeypatch) -> None:
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: StubService())
     result = runner.invoke(app, ["live-orders"])
     assert result.exit_code == 0
     assert "\"count\": 1" in result.stdout
@@ -293,42 +293,42 @@ def test_cli_live_orders(monkeypatch) -> None:
 
 
 def test_cli_live_order(monkeypatch) -> None:
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: StubService())
     result = runner.invoke(app, ["live-order", "live-1"])
     assert result.exit_code == 0
     assert "\"order_id\": \"live-1\"" in result.stdout
 
 
 def test_cli_live_cancel_requires_confirm(monkeypatch) -> None:
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: StubService())
     result = runner.invoke(app, ["live-cancel", "live-1"])
     assert result.exit_code == 1
     assert "confirm-cancel" in result.stdout
 
 
 def test_cli_live_cancel(monkeypatch) -> None:
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: StubService())
     result = runner.invoke(app, ["live-cancel", "live-1", "--confirm-cancel"])
     assert result.exit_code == 0
     assert "\"success\": true" in result.stdout
 
 
 def test_cli_live_trades(monkeypatch) -> None:
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: StubService())
     result = runner.invoke(app, ["live-trades", "--limit", "5"])
     assert result.exit_code == 0
     assert "\"trade_id\": \"trade-1\"" in result.stdout
 
 
 def test_cli_live_trade(monkeypatch) -> None:
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: StubService())
     result = runner.invoke(app, ["live-trade", "trade-1"])
     assert result.exit_code == 0
     assert "\"trade_id\": \"trade-1\"" in result.stdout
 
 
 def test_cli_live_activity(monkeypatch) -> None:
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: StubService())
     result = runner.invoke(app, ["live-activity", "--active"])
     assert result.exit_code == 0
     assert "\"market_id\": \"active-123\"" in result.stdout
@@ -337,21 +337,21 @@ def test_cli_live_activity(monkeypatch) -> None:
 
 
 def test_cli_tracked_live_orders(monkeypatch) -> None:
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: StubService())
     result = runner.invoke(app, ["tracked-live-orders"])
     assert result.exit_code == 0
     assert "\"order_id\": \"live-1\"" in result.stdout
 
 
 def test_cli_refresh_live_orders(monkeypatch) -> None:
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: StubService())
     result = runner.invoke(app, ["refresh-live-orders"])
     assert result.exit_code == 0
     assert "\"status\": \"MATCHED\"" in result.stdout
 
 
 def test_cli_live_reconcile(monkeypatch) -> None:
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: StubService())
     result = runner.invoke(app, ["live-reconcile", "--active"])
     assert result.exit_code == 0
     assert "\"market_id\": \"active-123\"" in result.stdout
@@ -360,7 +360,7 @@ def test_cli_live_reconcile(monkeypatch) -> None:
 
 
 def test_cli_live_watch(monkeypatch) -> None:
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: StubService())
     result = runner.invoke(app, ["live-watch", "--active", "--iterations", "2", "--interval-seconds", "0"])
     assert result.exit_code == 0
     assert "\"readonly\": true" in result.stdout
@@ -369,14 +369,14 @@ def test_cli_live_watch(monkeypatch) -> None:
 
 
 def test_cli_live_requires_confirm(monkeypatch) -> None:
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: StubService())
     result = runner.invoke(app, ["live", "--active"])
     assert result.exit_code == 1
     assert "confirm-live" in result.stdout
 
 
 def test_cli_live_with_confirm(monkeypatch) -> None:
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: StubService())
     result = runner.invoke(app, ["live", "--active", "--confirm-live"])
     assert result.exit_code == 0
     assert "\"order_id\": \"live-1\"" in result.stdout
@@ -384,7 +384,7 @@ def test_cli_live_with_confirm(monkeypatch) -> None:
 
 
 def test_cli_simulate(monkeypatch) -> None:
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: StubService())
     result = runner.invoke(app, ["simulate", "123"])
     assert result.exit_code == 0
     assert "\"readonly\": true" in result.stdout
@@ -392,21 +392,21 @@ def test_cli_simulate(monkeypatch) -> None:
 
 
 def test_cli_scan(monkeypatch) -> None:
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: StubService())
     result = runner.invoke(app, ["scan", "--limit", "1"])
     assert result.exit_code == 0
     assert "Discovered Markets" in result.stdout
 
 
 def test_cli_manage(monkeypatch) -> None:
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: StubService())
     result = runner.invoke(app, ["manage"])
     assert result.exit_code == 0
     assert "ttl_expired" in result.stdout
 
 
 def test_cli_close(monkeypatch) -> None:
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: StubService())
     result = runner.invoke(app, ["close", "123", "--reason", "manual_close"])
     assert result.exit_code == 0
     assert "manual_close" in result.stdout
@@ -417,7 +417,7 @@ def test_cli_scan_handles_http_errors(monkeypatch) -> None:
         def discover_markets(self):
             raise httpx.ConnectError("dns failed")
 
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: FailingService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: FailingService())
     result = runner.invoke(app, ["scan", "--limit", "1"])
     assert result.exit_code == 1
     assert "Request failed" in result.stdout
@@ -428,14 +428,14 @@ def test_cli_analyze_handles_runtime_errors(monkeypatch) -> None:
         def analyze_market(self, market_id):
             raise RuntimeError("market data unavailable")
 
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: FailingService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: FailingService())
     result = runner.invoke(app, ["analyze", "123"])
     assert result.exit_code == 1
     assert "Operation failed" in result.stdout
 
 
 def test_cli_run_loop(monkeypatch) -> None:
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: StubService())
     result = runner.invoke(app, ["run-loop", "123", "--iterations", "2", "--interval-seconds", "0"])
     assert result.exit_code == 0
     assert "\"iterations_requested\": 2" in result.stdout
@@ -443,7 +443,7 @@ def test_cli_run_loop(monkeypatch) -> None:
 
 
 def test_cli_simulate_loop(monkeypatch) -> None:
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: StubService())
     result = runner.invoke(app, ["simulate-loop", "123", "--iterations", "2", "--interval-seconds", "0"])
     assert result.exit_code == 0
     assert "\"readonly\": true" in result.stdout
@@ -451,28 +451,28 @@ def test_cli_simulate_loop(monkeypatch) -> None:
 
 
 def test_cli_paper_with_active_market(monkeypatch) -> None:
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: StubService())
     result = runner.invoke(app, ["paper", "--active"])
     assert result.exit_code == 0
     assert "active-123" in result.stdout
 
 
 def test_cli_simulate_with_active_market(monkeypatch) -> None:
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: StubService())
     result = runner.invoke(app, ["simulate", "--active"])
     assert result.exit_code == 0
     assert "active-123" in result.stdout
 
 
 def test_cli_run_loop_with_active_market(monkeypatch) -> None:
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: StubService())
     result = runner.invoke(app, ["run-loop", "--active", "--iterations", "1", "--interval-seconds", "0"])
     assert result.exit_code == 0
     assert "active-123" in result.stdout
 
 
 def test_cli_simulate_loop_with_active_market(monkeypatch) -> None:
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: StubService())
     result = runner.invoke(app, ["simulate-loop", "--active", "--iterations", "1", "--interval-seconds", "0"])
     assert result.exit_code == 0
     assert "active-123" in result.stdout
@@ -490,7 +490,7 @@ def test_cli_run_loop_stops_early_on_safety_stop(monkeypatch) -> None:
         def safety_stop_reason(self):
             return "daily_loss_limit" if self.calls >= 1 else None
 
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: SafetyStopService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: SafetyStopService())
     result = runner.invoke(app, ["run-loop", "123", "--iterations", "3", "--interval-seconds", "0"])
     assert result.exit_code == 0
     assert "\"stopped_early\": true" in result.stdout
@@ -499,14 +499,14 @@ def test_cli_run_loop_stops_early_on_safety_stop(monkeypatch) -> None:
 
 
 def test_cli_paper_requires_market_or_active(monkeypatch) -> None:
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: StubService())
     result = runner.invoke(app, ["paper"])
     assert result.exit_code == 1
     assert "Provide a market_id or pass --active." in result.stdout
 
 
 def test_cli_simulate_requires_market_or_active(monkeypatch) -> None:
-    monkeypatch.setattr("polymarket_ai_agent.apps.operator.cli._service", lambda: StubService())
+    monkeypatch.setattr("polymarket_trading_engine.apps.operator.cli._service", lambda: StubService())
     result = runner.invoke(app, ["simulate"])
     assert result.exit_code == 1
     assert "Provide a market_id or pass --active." in result.stdout

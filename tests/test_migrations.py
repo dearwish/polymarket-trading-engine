@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from polymarket_ai_agent.engine.migrations import (
+from polymarket_trading_engine.engine.migrations import (
     AppliedMigration,
     MigrationFailed,
     MigrationRunner,
@@ -109,7 +109,7 @@ def test_broken_migration_raises_and_records_failure(tmp_path: Path, monkeypatch
 
     sys.path.insert(0, str(tmp_path))
     monkeypatch.setattr(
-        "polymarket_ai_agent.engine.migrations._MIGRATION_NAME_RE",
+        "polymarket_trading_engine.engine.migrations._MIGRATION_NAME_RE",
         # allow the existing name shape
         __import__("re").compile(r"^\d{8}T\d{6}-[a-z0-9][a-z0-9\-]*$"),
     )
@@ -157,7 +157,7 @@ def test_failed_then_fixed_migration_reattempts(tmp_path: Path) -> None:
         # source is picked up.
         broken_path.write_text("def upgrade(conn):\n    conn.execute('CREATE TABLE ok (id INT)')\n")
         for modname in list(sys.modules):
-            if modname.startswith("polymarket_ai_agent_migrations_") or modname == "fix_migrations":
+            if modname.startswith("polymarket_trading_engine_migrations_") or modname == "fix_migrations":
                 del sys.modules[modname]
 
         applied = MigrationRunner(db, migrations_pkg="fix_migrations").run()

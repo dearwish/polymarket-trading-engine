@@ -1,17 +1,17 @@
-# Polymarket AI Agent
+# Polymarket Trading Engine
 
-Event-driven BTC trading agent for Polymarket's short-horizon markets (`btc_5m`, `btc_15m`, `btc_1h`, `btc_daily_threshold`). Architecturally split into three layers:
+Event-driven Polymarket trading system. Multi-strategy by design — short-horizon BTC scorers (`btc_5m`, `btc_15m`, `btc_1h`, `btc_daily_threshold`) plus an adaptive/overreaction/penny family and a maker-rewards market-maker module. Architecturally split into three layers:
 
-- **Deterministic quant scoring** (closed-form Black-Scholes + GBM + microstructure) — the hot path. Originally designed to route through an LLM (hence "AI"); the LLM path is still wired as an optional veto-only advisor, but the default decision path is fully deterministic and runs in ~2 ms per tick.
-- **Event-driven execution** — Polymarket CLOB websocket + Binance BTC websocket, persistent per-market state, maker-first router with taker fallback, paper fills via VWAP book walk, live orders via `py-clob-client`.
-- **Operator-facing CLI + FastAPI backend + React dashboard** — designed for safe paper trading first, then tightly gated live trading (requires `TRADING_MODE=live`, `LIVE_TRADING_ENABLED=true`, valid auth, preflight pass, and `--confirm-live`).
+- **Deterministic multi-strategy scoring** (closed-form Black-Scholes + GBM + microstructure for the directional scorers; reward-yield + inventory-skew for the maker) — the hot path. The LLM path is wired as an optional veto-only advisor; the default decision path is fully deterministic and runs in ~2 ms per tick.
+- **Event-driven execution** — Polymarket CLOB websocket + Binance BTC websocket, persistent per-market state, maker-first router with taker fallback, paper fills via VWAP book walk, live orders via `py-clob-client`. Per-strategy paper bankrolls for honest side-by-side soak comparison.
+- **Operator-facing CLI + FastAPI backend + React dashboard** with DB-owned runtime settings and a live-reload settings store — designed for safe paper trading first, then tightly gated live trading (requires `TRADING_MODE=live`, `LIVE_TRADING_ENABLED=true`, valid auth, preflight pass, and `--confirm-live`).
 
 ## Current Status
 
 Production paper-trading system with 328 tests. Works end-to-end: WebSocket discovery → quant scoring → risk gating → paper execution → position tracking → dashboard.
 
-- Python package under `src/polymarket_ai_agent`
-- operator CLI via `polymarket-ai-agent`
+- Python package under `src/polymarket_trading_engine`
+- operator CLI via `polymarket-trading-engine`
 - settings/config loading from `.env`
 - Polymarket market discovery and order book snapshot connector (top-10 levels per side)
 - authenticated read-only Polymarket account diagnostics
@@ -49,8 +49,8 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 cp .env.example .env
-polymarket-ai-agent status
-polymarket-ai-agent scan --limit 5
+polymarket-trading-engine status
+polymarket-trading-engine scan --limit 5
 ```
 
 ## Makefile Shortcuts
@@ -204,7 +204,7 @@ WS_SSL_VERIFY=true  # set false if a proxy/VPN presents a self-signed cert
 
 ## Quant Scoring (Phase 2)
 
-`QuantScoringEngine` ([src/polymarket_ai_agent/engine/quant_scoring.py](./src/polymarket_ai_agent/engine/quant_scoring.py)) runs on every daemon tick:
+`QuantScoringEngine` ([src/polymarket_trading_engine/engine/quant_scoring.py](./src/polymarket_trading_engine/engine/quant_scoring.py)) runs on every daemon tick:
 
 - **for `btc_1h` / up-or-down markets**: drift-less GBM over τ with short-term momentum tilt — `fair_yes = Φ(log_return_5m / σ√τ × damping)` plus top-5 imbalance nudge
 - **for `btc_daily_threshold` / above-$K markets**: Black-Scholes distance-to-strike — `fair_yes = Φ(ln(S/K) / σ√τ × damping)`, where the strike is parsed from the question
@@ -261,7 +261,7 @@ Operator-tunable settings (`MIN_EDGE`, `PAPER_STOP_LOSS_PCT`, every `QUANT_*` ga
 ### `.env` vs. DB ownership
 
 - `.env` keeps only **deploy-time** concerns: secrets (`OPENROUTER_API_KEY`, `POLYMARKET_PRIVATE_KEY`), network (URLs, chain id), WS lifecycle, paths, retention cadence, and the reload-loop interval `DAEMON_SETTINGS_RELOAD_INTERVAL_SECONDS`.
-- Every other runtime tunable is **DB-owned**. See the canonical list in [src/polymarket_ai_agent/initial_settings.py](./src/polymarket_ai_agent/initial_settings.py) — 50+ fields spanning thresholds, paper exit ladder, quant gates, and shadow scorer.
+- Every other runtime tunable is **DB-owned**. See the canonical list in [src/polymarket_trading_engine/initial_settings.py](./src/polymarket_trading_engine/initial_settings.py) — 50+ fields spanning thresholds, paper exit ladder, quant gates, and shadow scorer.
 
 ### Editing settings
 
@@ -270,10 +270,10 @@ Three write paths, all of which land as rows in `settings_changes`:
 ```bash
 # Dashboard Settings tab → PUT /api/settings (source='api')
 # CLI
-polymarket-ai-agent settings set min_edge 0.08 --reason "EU session"
-polymarket-ai-agent settings get min_edge
-polymarket-ai-agent settings list
-polymarket-ai-agent settings history --field min_edge
+polymarket-trading-engine settings set min_edge 0.08 --reason "EU session"
+polymarket-trading-engine settings get min_edge
+polymarket-trading-engine settings list
+polymarket-trading-engine settings history --field min_edge
 ```
 
 The daemon's `_settings_reload_loop` polls `MAX(id)` on `settings_changes` every `DAEMON_SETTINGS_RELOAD_INTERVAL_SECONDS` (default 2 s). On advance it re-reads effective settings, rebinds every engine that caches a reference (`QuantScoringEngine`, `RiskEngine.refresh_profile()`, `ExecutionEngine.refresh()`, the parsed TP ladder), and mirrors a `settings_changed` event to `events.jsonl` with the before/after diff.
@@ -292,9 +292,9 @@ Fields marked `requires_restart: true` in `EDITABLE_SETTINGS_METADATA` (currentl
 
 ### Schema migrations
 
-Knex-style framework in [src/polymarket_ai_agent/engine/migrations.py](./src/polymarket_ai_agent/engine/migrations.py):
+Knex-style framework in [src/polymarket_trading_engine/engine/migrations.py](./src/polymarket_trading_engine/engine/migrations.py):
 
-- Files in `src/polymarket_ai_agent/migrations/` named `YYYYMMDDTHHMMSS-<dashed-description>.py`. Each exports `upgrade(conn: sqlite3.Connection) -> None`.
+- Files in `src/polymarket_trading_engine/migrations/` named `YYYYMMDDTHHMMSS-<dashed-description>.py`. Each exports `upgrade(conn: sqlite3.Connection) -> None`.
 - Every service boot runs `MigrationRunner.run()` first (inside `AgentService.__init__`). Applied files are recorded in a `migrations` table with `status`, `applied_at`, `duration_ms`, and `error` on failure.
 - Failed migration halts boot and persists the traceback so the operator can see what blew up. Fix the file, restart, and the runner UPSERTs a successful re-run over the failed row.
 - All DB schema goes through migrations — the legacy `PortfolioEngine._init_db()` and `Journal._init_db()` DDL was absorbed by `20260421T130000-create-baseline-schema.py` (idempotent on upgrades). Engines now assert their tables exist and raise a clear error if migrations didn't run.
@@ -307,7 +307,7 @@ make backup DEST=data/backups/soak-A-$(date +%Y%m%d).db
 
 # Start scenario B: tweak initial_settings.py baseline if desired, then:
 rm data/agent.db
-polymarket-ai-agent daemon   # re-seeds from baseline
+polymarket-trading-engine daemon   # re-seeds from baseline
 
 # Compare later:
 python scripts/analyze_soak.py --settings-timeline --db data/backups/soak-A-....db
@@ -334,7 +334,7 @@ Risk gates now resolve per family instead of operating off a single global scala
 
 The daemon is an append-heavy writer; both `data/agent.db` and `logs/events.jsonl` will grow without bound on a busy deployment. Phase 4 adds the following defaults:
 
-- Schema is owned by the [migrations framework](#schema-migrations) — no more inline `CREATE TABLE IF NOT EXISTS` in engine constructors. Per-connection pragmas are applied via a shared `configure_connection(conn)` helper at [src/polymarket_ai_agent/engine/db.py](./src/polymarket_ai_agent/engine/db.py).
+- Schema is owned by the [migrations framework](#schema-migrations) — no more inline `CREATE TABLE IF NOT EXISTS` in engine constructors. Per-connection pragmas are applied via a shared `configure_connection(conn)` helper at [src/polymarket_trading_engine/engine/db.py](./src/polymarket_trading_engine/engine/db.py).
 - `PRAGMA journal_mode=WAL` + `synchronous=NORMAL` + `temp_store=MEMORY` on every connection
 - explicit indexes on every hot lookup column (positions.status, positions.market_id+status, positions.closed_at, order_attempts.recorded_at, order_attempts.market_id, live_orders.status, live_orders.updated_at, reports.created_at, settings_changes.field, settings_changes.changed_at)
 - `Journal.read_recent_events` uses a 64KB backwards-chunk tail-read, so peeking at the last N lines of a multi-GB JSONL no longer OOMs
@@ -349,7 +349,7 @@ The agent ships with the pieces needed to run unattended on a single VPS:
 - **Daemon heartbeat** — every `DAEMON_HEARTBEAT_INTERVAL_SECONDS` the daemon writes `data/daemon_heartbeat.json` with its full `DaemonMetrics` (counters, latency, active markets, safety-stop reason). The operator API reads the same file to surface it in `/api/metrics` and `/api/healthz` without needing a shared process.
 - **Kill-switch** — `safety_stop_reason` covers `daily_loss_limit`, `rejected_order_limit`, `consecutive_loss_limit` (N losing closes in a row, configured via `MAX_CONSECUTIVE_LOSSES`), `auth_not_ready` (live mode only), and `daemon_heartbeat_stale`. When a stop fires the daemon journals a `safety_stop` event and stops firing decision callbacks until the condition clears.
 - **Maintenance loop** — separate from the decision loop, runs every `DAEMON_MAINTENANCE_INTERVAL_SECONDS` (default 1 hour). Prunes history older than `DAEMON_PRUNE_HISTORY_DAYS`, auto-prunes `events.jsonl`, runs `pragma wal_checkpoint(TRUNCATE)`, and refreshes DB / events size gauges.
-- **Backups via VACUUM INTO** — `polymarket-ai-agent backup data/backups/` (or `make backup DEST=...`) produces a consistent, compacted snapshot while the daemon is still writing.
+- **Backups via VACUUM INTO** — `polymarket-trading-engine backup data/backups/` (or `make backup DEST=...`) produces a consistent, compacted snapshot while the daemon is still writing.
 - **Metrics & health endpoints** — `GET /api/metrics` (or `?format=prometheus`) and `GET /api/healthz` return the signals an uptime monitor + Prometheus scraper need.
 - **Deployment docs** — [docs/DEPLOYMENT.md](./docs/DEPLOYMENT.md) has ready-to-copy systemd units for the daemon, a nightly `VACUUM INTO` + rsync timer, a logrotate config, and kill-switch alerting guidance.
 
@@ -378,7 +378,7 @@ GET /api/metrics?format=prometheus
 
 ## Execution Router (Phase 3)
 
-`ExecutionRouter` ([src/polymarket_ai_agent/engine/execution/router.py](./src/polymarket_ai_agent/engine/execution/router.py)) chooses between maker and taker on every approved decision:
+`ExecutionRouter` ([src/polymarket_trading_engine/engine/execution/router.py](./src/polymarket_trading_engine/engine/execution/router.py)) chooses between maker and taker on every approved decision:
 
 - `GTC_MAKER` with `post_only=True` when `TTE > EXECUTION_MAKER_MIN_TTE_SECONDS` and `edge > EXECUTION_MAKER_MIN_EDGE`
 - otherwise `FOK_TAKER` crossing the best opposite level

@@ -16,18 +16,18 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from polymarket_ai_agent.apps.daemon.run import (
+from polymarket_trading_engine.apps.daemon.run import (
     DaemonConfig,
     DaemonRunner,
     DecisionContext,
     StrategyConfig,
 )
-from polymarket_ai_agent.config import Settings
-from polymarket_ai_agent.engine.btc_state import BtcSnapshot
-from polymarket_ai_agent.engine.market_state import MarketState
-from polymarket_ai_agent.engine.migrations import MigrationRunner
-from polymarket_ai_agent.service import AgentService
-from polymarket_ai_agent.types import (
+from polymarket_trading_engine.config import Settings
+from polymarket_trading_engine.engine.btc_state import BtcSnapshot
+from polymarket_trading_engine.engine.market_state import MarketState
+from polymarket_trading_engine.engine.migrations import MigrationRunner
+from polymarket_trading_engine.service import AgentService
+from polymarket_trading_engine.types import (
     MarketAssessment,
     MarketCandidate,
     SuggestedSide,

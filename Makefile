@@ -5,7 +5,7 @@ VENV ?= .venv
 BIN := $(VENV)/bin
 PIP := $(BIN)/pip
 PYTEST := $(BIN)/pytest
-CLI := $(BIN)/polymarket-ai-agent
+CLI := $(BIN)/polymarket-trading-engine
 ITERATIONS ?= 10
 INTERVAL ?= 15
 
@@ -47,7 +47,7 @@ doctor: install
 	$(CLI) doctor --active
 
 api-dev: install
-	$(BIN)/uvicorn polymarket_ai_agent.apps.api.main:app --host 127.0.0.1 --port 8000 --reload
+	$(BIN)/uvicorn polymarket_trading_engine.apps.api.main:app --host 127.0.0.1 --port 8000 --reload
 
 web-install:
 	cd web && npm install

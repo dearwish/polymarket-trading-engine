@@ -14,10 +14,10 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
-from polymarket_ai_agent.config import Settings
-from polymarket_ai_agent.connectors.polymarket import PolymarketConnector
-from polymarket_ai_agent.engine.market_maker.scanner import score_mm_market
-from polymarket_ai_agent.types import MarketCandidate
+from polymarket_trading_engine.config import Settings
+from polymarket_trading_engine.connectors.polymarket import PolymarketConnector
+from polymarket_trading_engine.engine.market_maker.scanner import score_mm_market
+from polymarket_trading_engine.types import MarketCandidate
 
 
 def _candidate(

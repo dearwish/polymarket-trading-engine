@@ -7,8 +7,8 @@ decision surface.
 """
 from __future__ import annotations
 
-from polymarket_ai_agent.engine.penny_scoring import PENNY_STRATEGY_TAG, PennyScorer
-from polymarket_ai_agent.types import EvidencePacket, SuggestedSide
+from polymarket_trading_engine.engine.penny_scoring import PENNY_STRATEGY_TAG, PennyScorer
+from polymarket_trading_engine.types import EvidencePacket, SuggestedSide
 
 
 def _packet(**overrides) -> EvidencePacket:

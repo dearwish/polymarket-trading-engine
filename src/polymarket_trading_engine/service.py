@@ -1,0 +1,822 @@
+from __future__ import annotations
+
+import json
+import uuid
+from collections.abc import Iterable
+
+from polymarket_trading_engine.config import Settings
+from polymarket_trading_engine.connectors.external_feeds import ExternalFeedConnector
+from polymarket_trading_engine.connectors.polymarket import PolymarketConnector
+from polymarket_trading_engine.engine.execution import ExecutionEngine, ExecutionRouter
+from polymarket_trading_engine.engine.journal import Journal
+from polymarket_trading_engine.engine.migrations import MigrationRunner
+from polymarket_trading_engine.engine.portfolio import PortfolioEngine
+from polymarket_trading_engine.engine.research import ResearchEngine
+from polymarket_trading_engine.engine.risk import RiskEngine
+from polymarket_trading_engine.engine.scoring import ScoringEngine
+from polymarket_trading_engine.engine.settings_store import SettingsStore
+from polymarket_trading_engine.types import (
+    AccountState,
+    ExecutionMode,
+    MarketAssessment,
+    MarketSnapshot,
+    OrderBookSnapshot,
+    PositionAction,
+    PositionRecord,
+    Report,
+    SuggestedSide,
+    utc_now,
+)
+
+
+class AgentService:
+    def __init__(self, settings: Settings):
+        # Migrations own all DB schema — run them FIRST, before any engine
+        # that touches the DB is constructed. Engines now assume the
+        # expected tables exist (see PortfolioEngine._init_db / Journal._init_db
+        # sanity checks). Also creates settings_changes + seeds the baseline
+        # on a fresh DB.
+        #
+        # AgentService trusts the caller's ``settings`` verbatim. Callers that
+        # want DB overrides layered on top (i.e. the production daemon/CLI
+        # entrypoints) should call ``get_effective_settings()`` themselves
+        # *after* constructing AgentService — migrations have run by then so
+        # the baseline rows are visible. Tests that pass an explicit
+        # ``settings`` object get their explicit values preserved.
+        self.migrations_applied = MigrationRunner(settings.db_path).run()
+        self.settings = settings
+        self.polymarket = PolymarketConnector(settings)
+        self.external = ExternalFeedConnector()
+        self.research = ResearchEngine()
+        self.scoring = ScoringEngine(settings)
+        self.risk = RiskEngine(settings)
+        self.journal = Journal(
+            settings.db_path,
+            settings.events_path,
+            events_jsonl_max_bytes=settings.events_jsonl_max_bytes,
+            events_jsonl_keep_tail_bytes=settings.events_jsonl_keep_tail_bytes,
+        )
+        self.portfolio = PortfolioEngine(
+            settings.db_path,
+            settings.paper_starting_balance_usd,
+            exit_slippage_bps=settings.paper_exit_slippage_bps,
+            fee_bps=settings.fee_bps,
+            settings=settings,
+        )
+        self.settings_store = SettingsStore(settings.db_path)
+        # Seed the order-id counter from the DB so paper-order IDs remain
+        # unique across daemon restarts (otherwise 000001 reappears every run).
+        self.execution = ExecutionEngine(
+            ExecutionMode(settings.trading_mode),
+            paper_entry_slippage_bps=settings.paper_entry_slippage_bps,
+            live_trading_enabled=settings.live_trading_enabled,
+            live_executor=self.polymarket.execute_live_trade,
+            router=ExecutionRouter(settings),
+            settings=settings,
+            initial_counter=self.portfolio.max_paper_order_counter(),
+        )
+
+    def discover_markets(self):
+        markets = self.polymarket.discover_markets()
+        # Polymarket's closed=false filter lags behind resolution; guard per family.
+        # Floor must be < family lifetime so 5m/15m markets aren't filtered entirely.
+        family_min_tte = {
+            "btc_5m": 30,
+            "btc_15m": 60,
+            "btc_1h": 120,
+            "btc_daily_threshold": 300,
+        }
+        min_tte = family_min_tte.get(self.settings.market_family, 300)
+        active = [
+            m for m in markets
+            if self.polymarket.estimate_seconds_to_expiry(m.end_date_iso) >= min_tte
+        ]
+        self.journal.log_event("discover_markets", {"count": len(active)})
+        return active
+
+    def get_active_market_id(self) -> str:
+        market = self.polymarket.discover_active_market()
+        if not market:
+            raise RuntimeError("No active market matched the configured market family.")
+        self.journal.log_event("active_market", {"market_id": market.market_id})
+        return market.market_id
+
+    def build_market_snapshot(self, market_id: str) -> MarketSnapshot:
+        candidate = self.polymarket.get_market(market_id)
+        orderbook = self.polymarket.get_orderbook_snapshot(candidate.yes_token_id)
+        seconds_to_expiry = self.polymarket.estimate_seconds_to_expiry(candidate.end_date_iso)
+        external_price = self.external.get_btc_price()
+        snapshot = MarketSnapshot(
+            candidate=candidate,
+            orderbook=OrderBookSnapshot(
+                bid=orderbook.bid,
+                ask=orderbook.ask,
+                midpoint=orderbook.midpoint,
+                spread=orderbook.spread,
+                depth_usd=orderbook.depth_usd,
+                last_trade_price=orderbook.last_trade_price,
+                two_sided=orderbook.two_sided,
+                bid_levels=list(orderbook.bid_levels),
+                ask_levels=list(orderbook.ask_levels),
+            ),
+            seconds_to_expiry=seconds_to_expiry,
+            recent_price_change_bps=(orderbook.midpoint - candidate.implied_probability) * 10_000,
+            recent_trade_count=0,
+            external_price=external_price,
+        )
+        self.journal.log_event("market_snapshot", snapshot)
+        return snapshot
+
+    def analyze_market(self, market_id: str) -> tuple[MarketSnapshot, MarketAssessment]:
+        snapshot = self.build_market_snapshot(market_id)
+        packet = self.research.build_evidence_packet(snapshot)
+        self.journal.log_event("evidence_packet", packet)
+        assessment = self.scoring.score_market(packet)
+        self.journal.log_event("market_assessment", assessment)
+        return snapshot, assessment
+
+    def _latest_tick_assessment(self, market_id: str) -> MarketAssessment | None:
+        """Build a ``MarketAssessment`` from the most recent ``daemon_tick``
+        payload for ``market_id``, or ``None`` when no tick is available.
+
+        Lets read-only surfaces (dashboard panels) avoid re-running the
+        scoring engine — which would round-trip to OpenRouter when the key
+        is set — on every refresh. The daemon writes one tick per decision
+        so this is always the freshest assessment we can offer.
+        """
+        events = self.journal.read_recent_events(limit=2000)
+        for event in reversed(events):
+            if event.get("event_type") != "daemon_tick":
+                continue
+            payload = event.get("payload", {})
+            if str(payload.get("market_id", "")) != str(market_id):
+                continue
+            side_raw = str(payload.get("suggested_side") or "ABSTAIN")
+            try:
+                side = SuggestedSide(side_raw)
+            except ValueError:
+                side = SuggestedSide.ABSTAIN
+            fair = float(payload.get("fair_probability") or 0.5)
+            return MarketAssessment(
+                market_id=str(market_id),
+                fair_probability=fair,
+                fair_probability_no=round(1.0 - fair, 6),
+                confidence=float(payload.get("confidence") or 0.0),
+                suggested_side=side,
+                expiry_risk=str(payload.get("expiry_risk") or "UNKNOWN"),
+                reasons_for_trade=list(payload.get("reasons_for_trade") or []),
+                reasons_to_abstain=list(payload.get("reasons_to_abstain") or []),
+                edge=float(payload.get("edge_yes" if side is SuggestedSide.YES else "edge_no") or 0.0),
+                edge_yes=float(payload.get("edge_yes") or 0.0),
+                edge_no=float(payload.get("edge_no") or 0.0),
+                raw_model_output="daemon-tick",
+                slippage_bps=float(payload.get("slippage_bps") or 0.0),
+            )
+        return None
+
+    def _prepare_trade(self, market_id: str, mode: ExecutionMode, skip_scoring: bool = False):
+        """Build snapshot + assessment + decision for ``market_id``.
+
+        ``skip_scoring`` short-circuits the LLM-capable scoring engine in
+        favour of the most recent ``daemon_tick``-derived assessment. Used by
+        read-only dashboard paths so they don't trigger an OpenRouter call on
+        every poll.
+        """
+        if skip_scoring:
+            cached = self._latest_tick_assessment(market_id)
+            if cached is not None:
+                snapshot = self.build_market_snapshot(market_id)
+                account_state = self.portfolio.get_account_state(mode)
+                decision = self.risk.decide_trade(snapshot, cached, account_state)
+                return snapshot, cached, decision, account_state
+        snapshot, assessment = self.analyze_market(market_id)
+        account_state = self.portfolio.get_account_state(mode)
+        decision = self.risk.decide_trade(snapshot, assessment, account_state)
+        return snapshot, assessment, decision, account_state
+
+    def paper_trade(self, market_id: str):
+        snapshot, assessment, decision, _account_state = self._prepare_trade(market_id, ExecutionMode.PAPER)
+        self.journal.log_event("trade_decision", decision)
+        result = self.execution.execute_trade(
+            decision,
+            snapshot.orderbook,
+            seconds_to_expiry=snapshot.seconds_to_expiry,
+            edge=assessment.edge,
+        )
+        self.portfolio.record_execution(decision, result)
+        self.journal.log_event("execution_result", result)
+        return snapshot, assessment, decision, result
+
+    def simulate_market(self, market_id: str):
+        snapshot, assessment, decision, _account_state = self._prepare_trade(market_id, ExecutionMode.PAPER)
+        self.journal.log_event("simulation_decision", decision)
+        return snapshot, assessment, decision
+
+    def live_preflight(self, market_id: str | None = None, skip_scoring: bool = False) -> dict:
+        resolved_market_id = market_id or self.get_active_market_id()
+        auth = self._auth_status_dict(self.polymarket.probe_live_readiness())
+        snapshot, assessment, decision, account_state = self._prepare_trade(
+            resolved_market_id, ExecutionMode.LIVE, skip_scoring=skip_scoring
+        )
+        blockers: list[str] = []
+        if self.settings.trading_mode != ExecutionMode.LIVE.value:
+            blockers.append("trading_mode_not_live")
+        if not self.settings.live_trading_enabled:
+            blockers.append("live_trading_disabled")
+        if not auth["readonly_ready"]:
+            blockers.append("auth_not_ready")
+        safety_stop = self.safety_stop_reason(account_state)
+        if safety_stop:
+            blockers.append(safety_stop)
+        if decision.status.value != "APPROVED":
+            blockers.extend(decision.rejected_by or ["decision_not_approved"])
+        ready = not blockers
+        preflight = {
+            "readonly": True,
+            "market_id": resolved_market_id,
+            "ready": ready,
+            "blockers": blockers,
+            "auth": auth,
+            "market": {
+                "question": snapshot.candidate.question,
+                "slug": snapshot.candidate.slug,
+                "condition_id": snapshot.candidate.condition_id,
+                "implied_probability": snapshot.candidate.implied_probability,
+                "liquidity_usd": snapshot.candidate.liquidity_usd,
+                "volume_24h_usd": snapshot.candidate.volume_24h_usd,
+                "seconds_to_expiry": snapshot.seconds_to_expiry,
+                "yes_token_id": snapshot.candidate.yes_token_id,
+                "no_token_id": snapshot.candidate.no_token_id,
+            },
+            "orderbook": {
+                "bid": snapshot.orderbook.bid,
+                "ask": snapshot.orderbook.ask,
+                "midpoint": snapshot.orderbook.midpoint,
+                "spread": snapshot.orderbook.spread,
+                "depth_usd": snapshot.orderbook.depth_usd,
+                "last_trade_price": snapshot.orderbook.last_trade_price,
+                "two_sided": snapshot.orderbook.two_sided,
+            },
+            "decision": {
+                "status": decision.status.value,
+                "side": decision.side.value,
+                "size_usd": decision.size_usd,
+                "limit_price": decision.limit_price,
+                "asset_id": decision.asset_id,
+                "rejected_by": decision.rejected_by,
+            },
+            "assessment": {
+                "fair_probability": assessment.fair_probability,
+                "confidence": assessment.confidence,
+                "edge": assessment.edge,
+                "suggested_side": assessment.suggested_side.value,
+            },
+            "account_state": {
+                "available_usd": account_state.available_usd,
+                "open_positions": account_state.open_positions,
+                "daily_realized_pnl": account_state.daily_realized_pnl,
+                "rejected_orders": account_state.rejected_orders,
+            },
+        }
+        self.journal.log_event("live_preflight", preflight)
+        return preflight
+
+    def live_trade(self, market_id: str):
+        preflight = self.live_preflight(market_id)
+        if preflight["blockers"]:
+            raise RuntimeError(f"Live preflight failed: {', '.join(preflight['blockers'])}")
+        snapshot, assessment, decision, _account_state = self._prepare_trade(market_id, ExecutionMode.LIVE)
+        self.journal.log_event("trade_decision", decision)
+        result = self.execution.execute_trade(
+            decision,
+            snapshot.orderbook,
+            seconds_to_expiry=snapshot.seconds_to_expiry,
+            edge=assessment.edge,
+        )
+        self.portfolio.record_execution(decision, result)
+        self.journal.log_event("execution_result", result)
+        return snapshot, assessment, decision, result
+
+    def tracked_live_orders(self, limit: int = 50) -> dict:
+        return {
+            "readonly": True,
+            "count": len(self.portfolio.list_live_orders(limit=limit)),
+            "orders": self.portfolio.list_live_orders(limit=limit),
+        }
+
+    def refresh_live_order_tracking(self, limit: int = 50) -> dict:
+        auth = self._auth_status_dict(self.polymarket.probe_live_readiness())
+        if not auth["readonly_ready"]:
+            raise RuntimeError("Authenticated live order refresh requires readonly_ready auth.")
+        tracked = self.portfolio.list_live_orders(limit=limit)
+        refreshed: list[dict] = []
+        summary = {"active": 0, "terminal": 0, "errors": 0}
+        for item in tracked:
+            try:
+                current = self.polymarket.get_live_order(item["order_id"])
+                status = current.get("status") or item["status"]
+                detail = json.dumps(current)
+                self.portfolio.update_live_order(item["order_id"], status=status, detail=detail)
+                normalized = {**current, "terminal": self.portfolio.is_terminal_live_order_status(str(status))}
+                if normalized["terminal"]:
+                    summary["terminal"] += 1
+                else:
+                    summary["active"] += 1
+                refreshed.append(normalized)
+            except Exception as exc:
+                summary["errors"] += 1
+                refreshed.append({**item, "refresh_error": str(exc)})
+        payload = {
+            "readonly": True,
+            "count": len(refreshed),
+            "orders": refreshed,
+            "summary": summary,
+        }
+        self.journal.log_event("live_order_refresh", payload)
+        return payload
+
+    def run_cycle(self, market_id: str) -> dict:
+        actions = self.manage_open_positions()
+        snapshot, assessment, decision, result = self.paper_trade(market_id)
+        cycle = {
+            "managed_actions": [
+                {"market_id": action.market_id, "action": action.action, "reason": action.reason}
+                for action in actions
+            ],
+            "paper_trade": {
+                "market_id": snapshot.candidate.market_id,
+                "decision_status": decision.status.value,
+                "decision_side": decision.side.value,
+                "execution_status": result.status,
+                "execution_success": result.success,
+                "fill_price": result.fill_price,
+            },
+        }
+        self.journal.log_event("cycle_result", cycle)
+        return cycle
+
+    def run_simulation_cycle(self, market_id: str) -> dict:
+        snapshot, assessment, decision = self.simulate_market(market_id)
+        cycle = {
+            "market_id": snapshot.candidate.market_id,
+            "question": snapshot.candidate.question,
+            "market_implied_probability": snapshot.candidate.implied_probability,
+            "fair_probability": assessment.fair_probability,
+            "confidence": assessment.confidence,
+            "edge": assessment.edge,
+            "suggested_side": assessment.suggested_side.value,
+            "decision_status": decision.status.value,
+            "decision_side": decision.side.value,
+            "limit_price": decision.limit_price,
+            "size_usd": decision.size_usd,
+            "rejected_by": decision.rejected_by,
+            "readonly": True,
+        }
+        self.journal.log_event("simulation_cycle", cycle)
+        return cycle
+
+    def manage_open_positions(self) -> list[PositionAction]:
+        actions: list[PositionAction] = []
+        due_positions = self.portfolio.positions_due_for_close(self.settings.paper_position_ttl_seconds)
+        for position in due_positions:
+            snapshot = self.build_market_snapshot(position.market_id)
+            exit_price = self.portfolio.estimate_exit_price(
+                position,
+                snapshot.orderbook,
+                self.settings.paper_exit_slippage_bps,
+            )
+            action = self.portfolio.close_position(
+                position.market_id,
+                exit_price=exit_price,
+                reason="ttl_expired",
+            )
+            self.journal.log_event("position_action", action)
+            actions.append(action)
+        return actions
+
+    def close_position(self, market_id: str, reason: str = "manual_close") -> PositionAction:
+        existing = self.portfolio.get_open_position(market_id)
+        if not existing:
+            action = PositionAction(market_id=market_id, action="NOOP", reason="Position not open.")
+            self.journal.log_event("position_action", action)
+            return action
+        snapshot = self.build_market_snapshot(market_id)
+        if ExecutionMode(self.settings.trading_mode) == ExecutionMode.LIVE:
+            return self._close_live_position(existing, snapshot, reason)
+        exit_price = self.portfolio.estimate_exit_price(
+            existing,
+            snapshot.orderbook,
+            self.settings.paper_exit_slippage_bps,
+        )
+        action = self.portfolio.close_position(
+            market_id,
+            exit_price=exit_price,
+            reason=reason,
+        )
+        self.journal.log_event("position_action", action)
+        return action
+
+    def _close_live_position(
+        self,
+        position: PositionRecord,
+        snapshot: MarketSnapshot,
+        reason: str,
+    ) -> PositionAction:
+        """Post a SELL-side counter order to exit a live position.
+
+        Preflight checks (auth, live enablement) run here rather than via
+        :py:meth:`live_preflight` because this is an exit action: we must close
+        even when opening-side risk gates would reject (e.g. daily loss limit
+        already hit).
+        """
+        auth = self.polymarket.probe_live_readiness()
+        if not auth.readonly_ready:
+            raise RuntimeError("Live close requires authenticated readonly-ready client.")
+        if not self.settings.live_trading_enabled:
+            raise RuntimeError("Live close requires LIVE_TRADING_ENABLED=true.")
+        close_decision = self.risk.build_close_decision(position, snapshot)
+        result = self.execution.execute_trade(
+            close_decision,
+            snapshot.orderbook,
+            seconds_to_expiry=snapshot.seconds_to_expiry,
+            edge=0.0,
+        )
+        self.journal.log_event("close_live_decision", close_decision)
+        self.journal.log_event("close_live_result", result)
+        if result.success and result.fill_price > 0.0:
+            action = self.portfolio.close_position(
+                position.market_id,
+                exit_price=result.fill_price,
+                reason=reason,
+            )
+        else:
+            action = PositionAction(
+                market_id=position.market_id,
+                action="LIVE_CLOSE_POSTED",
+                reason=f"{reason}: {result.status} {result.detail}".strip(),
+            )
+        self.journal.log_event("position_action", action)
+        return action
+
+    def generate_operator_report(self, session_id: str | None = None) -> Report:
+        reports = self.journal.read_reports()
+        recent_events = self.journal.read_recent_events(limit=10)
+        open_positions = self.portfolio.list_open_positions()
+        closed_positions = self.portfolio.list_closed_positions(limit=5)
+        items = [f"{row[2]} | {row[0]} | {row[1]}" for row in reports]
+        items.extend(
+            [
+                f"EVENT | {event['logged_at']} | {event['event_type']} | {self._format_event_payload(event['payload'])}"
+                for event in recent_events
+            ]
+        )
+        items.extend(
+            [
+                f"OPEN | {position.market_id} | {position.side.value} | size={position.size_usd:.2f} | entry={position.entry_price:.4f}"
+                for position in open_positions
+            ]
+        )
+        items.extend(
+            [
+                f"CLOSED | {position.market_id} | pnl={position.realized_pnl:.4f} | reason={position.close_reason or 'n/a'}"
+                for position in closed_positions
+            ]
+        )
+        if not items:
+            items = ["No stored reports yet. Run paper or analyze commands first."]
+        report = Report(
+            session_id=session_id or str(uuid.uuid4()),
+            generated_at=utc_now(),
+            summary=f"Open positions: {len(open_positions)} | recently closed: {len(closed_positions)}",
+            items=items,
+        )
+        self.journal.save_report(report.session_id, report.summary)
+        return report
+
+    @staticmethod
+    def _format_event_payload(payload: dict) -> str:
+        if "question" in payload and "decision_status" in payload and payload.get("readonly") is True:
+            rejected_by = payload.get("rejected_by") or []
+            rejected_text = ",".join(rejected_by) if rejected_by else "none"
+            return (
+                f"{payload['question']} | implied={payload.get('market_implied_probability', 0.0):.4f} "
+                f"| fair={payload.get('fair_probability', 0.0):.4f} "
+                f"| conf={payload.get('confidence', 0.0):.2f} "
+                f"| edge={payload.get('edge', 0.0):.4f} "
+                f"| suggested={payload.get('suggested_side', 'n/a')} "
+                f"| decision={payload['decision_status']} "
+                f"| rejected_by={rejected_text}"
+            )
+        if "fair_probability" in payload and "confidence" in payload and "edge" in payload:
+            return (
+                f"market_id={payload.get('market_id', 'n/a')} "
+                f"| fair={payload['fair_probability']:.4f} "
+                f"| conf={payload['confidence']:.2f} "
+                f"| edge={payload['edge']:.4f} "
+                f"| suggested={payload.get('suggested_side', 'n/a')}"
+            )
+        if "status" in payload and "rejected_by" in payload:
+            rejected_by = payload.get("rejected_by") or []
+            rejected_text = ",".join(rejected_by) if rejected_by else "none"
+            return (
+                f"market_id={payload.get('market_id', 'n/a')} "
+                f"| status={payload['status']} "
+                f"| side={payload.get('side', 'n/a')} "
+                f"| size={payload.get('size_usd', 0.0):.2f} "
+                f"| rejected_by={rejected_text}"
+            )
+        if "candidate" in payload and "orderbook" in payload:
+            candidate = payload["candidate"]
+            orderbook = payload["orderbook"]
+            return (
+                f"{candidate.get('question', 'n/a')} "
+                f"| midpoint={orderbook.get('midpoint', 0.0):.4f} "
+                f"| spread={orderbook.get('spread', 0.0):.4f} "
+                f"| depth={orderbook.get('depth_usd', 0.0):.2f} "
+                f"| two_sided={orderbook.get('two_sided', True)} "
+                f"| ttl={payload.get('seconds_to_expiry', -1)}s"
+            )
+        if "market_id" in payload:
+            return f"market_id={payload['market_id']}"
+        if "count" in payload:
+            return f"count={payload['count']}"
+        if "paper_trade" in payload:
+            return f"paper_trade_status={payload['paper_trade'].get('execution_status', 'unknown')}"
+        return ",".join(sorted(payload.keys()))[:120]
+
+    def status(self) -> dict:
+        auth_status = self.polymarket.probe_live_readiness()
+        account_state = self.portfolio.get_account_state(ExecutionMode(self.settings.trading_mode))
+        safety_stop_reason = self.safety_stop_reason(account_state)
+        funded_balance = auth_status.balance if auth_status.balance is not None else None
+        effective_available_usd = funded_balance if auth_status.readonly_ready and funded_balance is not None else account_state.available_usd
+        return {
+            "trading_mode": self.settings.trading_mode,
+            "market_family": self.settings.market_family,
+            "live_trading_enabled": self.settings.live_trading_enabled,
+            "loop_seconds": self.settings.loop_seconds,
+            "openrouter_configured": bool(self.settings.openrouter_api_key),
+            "db_path": str(self.settings.db_path),
+            "events_path": str(self.settings.events_path),
+            "open_positions": account_state.open_positions,
+            "available_usd": effective_available_usd,
+            "paper_available_usd": account_state.available_usd,
+            "funded_balance_usd": funded_balance,
+            "available_usd_source": "funded_balance" if effective_available_usd == funded_balance and funded_balance is not None else "paper_balance",
+            "daily_realized_pnl": account_state.daily_realized_pnl,
+            "rejected_orders": account_state.rejected_orders,
+            "daily_loss_limit_reached": account_state.daily_realized_pnl <= -self.settings.max_daily_loss_usd,
+            "safety_stop_reason": safety_stop_reason,
+            "paper_position_ttl_seconds": self.settings.paper_position_ttl_seconds,
+            "auth": {
+                **self._auth_status_dict(auth_status),
+            },
+        }
+
+    def auth_status(self) -> dict:
+        return self._auth_status_dict(self.polymarket.probe_live_readiness())
+
+    def doctor(self, market_id: str | None = None) -> dict:
+        resolved_market_id = market_id or self.get_active_market_id()
+        auth = self._auth_status_dict(self.polymarket.probe_live_readiness())
+        snapshot, assessment, decision = self.simulate_market(resolved_market_id)
+        return {
+            "readonly": True,
+            "market_id": resolved_market_id,
+            "auth": auth,
+            "market": {
+                "question": snapshot.candidate.question,
+                "slug": snapshot.candidate.slug,
+                "implied_probability": snapshot.candidate.implied_probability,
+                "liquidity_usd": snapshot.candidate.liquidity_usd,
+                "volume_24h_usd": snapshot.candidate.volume_24h_usd,
+                "seconds_to_expiry": snapshot.seconds_to_expiry,
+            },
+            "orderbook": {
+                "bid": snapshot.orderbook.bid,
+                "ask": snapshot.orderbook.ask,
+                "midpoint": snapshot.orderbook.midpoint,
+                "spread": snapshot.orderbook.spread,
+                "depth_usd": snapshot.orderbook.depth_usd,
+                "last_trade_price": snapshot.orderbook.last_trade_price,
+                "two_sided": snapshot.orderbook.two_sided,
+            },
+            "simulation": {
+                "fair_probability": assessment.fair_probability,
+                "confidence": assessment.confidence,
+                "edge": assessment.edge,
+                "suggested_side": assessment.suggested_side.value,
+                "decision_status": decision.status.value,
+                "decision_side": decision.side.value,
+                "size_usd": decision.size_usd,
+                "limit_price": decision.limit_price,
+                "rejected_by": decision.rejected_by,
+            },
+        }
+
+    def live_orders(self) -> dict:
+        auth = self._auth_status_dict(self.polymarket.probe_live_readiness())
+        if not auth["readonly_ready"]:
+            raise RuntimeError("Authenticated live order inspection requires readonly_ready auth.")
+        orders = self.polymarket.list_live_orders()
+        return {
+            "readonly": True,
+            "count": len(orders),
+            "orders": orders,
+        }
+
+    def live_order_status(self, order_id: str) -> dict:
+        auth = self._auth_status_dict(self.polymarket.probe_live_readiness())
+        if not auth["readonly_ready"]:
+            raise RuntimeError("Authenticated live order inspection requires readonly_ready auth.")
+        order = self.polymarket.get_live_order(order_id)
+        return {
+            "readonly": True,
+            "order": order,
+        }
+
+    def cancel_live_order(self, order_id: str) -> dict:
+        auth = self._auth_status_dict(self.polymarket.probe_live_readiness())
+        if not auth["readonly_ready"]:
+            raise RuntimeError("Authenticated live order cancellation requires readonly_ready auth.")
+        order = self.polymarket.get_live_order(order_id)
+        result = self.polymarket.cancel_live_order(order_id)
+        payload = {
+            "readonly": False,
+            "order": order,
+            "cancellation": result,
+        }
+        self.journal.log_event("live_order_cancel", payload)
+        return payload
+
+    def live_trades(self, market_id: str | None = None, limit: int = 20) -> dict:
+        auth = self._auth_status_dict(self.polymarket.probe_live_readiness())
+        if not auth["readonly_ready"]:
+            raise RuntimeError("Authenticated live trade inspection requires readonly_ready auth.")
+        trades = self.polymarket.list_live_trades(market_id=market_id, limit=limit)
+        return {
+            "readonly": True,
+            "count": len(trades),
+            "trades": trades,
+        }
+
+    def live_trade_status(self, trade_id: str, market_id: str | None = None, limit: int = 100) -> dict:
+        auth = self._auth_status_dict(self.polymarket.probe_live_readiness())
+        if not auth["readonly_ready"]:
+            raise RuntimeError("Authenticated live trade inspection requires readonly_ready auth.")
+        trade = self.polymarket.get_live_trade(trade_id, market_id=market_id, limit=limit)
+        return {
+            "readonly": True,
+            "trade": trade,
+        }
+
+    def live_activity(
+        self,
+        market_id: str | None = None,
+        trade_limit: int = 20,
+        skip_scoring: bool = False,
+    ) -> dict:
+        auth = self._auth_status_dict(self.polymarket.probe_live_readiness())
+        if not auth["readonly_ready"]:
+            raise RuntimeError("Authenticated live activity inspection requires readonly_ready auth.")
+        preflight = self.live_preflight(market_id, skip_scoring=skip_scoring)
+        orders = self.polymarket.list_live_orders()
+        trades = self.polymarket.list_live_trades(market_id=preflight["market_id"], limit=trade_limit)
+        market_trades = self.polymarket.list_market_trades(
+            market_id=str(preflight["market"].get("condition_id") or ""),
+            limit=trade_limit,
+        )
+        tracked_orders = self.portfolio.list_live_orders(limit=50)
+        trade_counts = self._trade_side_counts(
+            market_trades,
+            yes_token_id=str(preflight["market"].get("yes_token_id") or ""),
+            no_token_id=str(preflight["market"].get("no_token_id") or ""),
+        )
+        payload = {
+            "readonly": True,
+            "market_id": preflight["market_id"],
+            "auth": auth,
+            "preflight": preflight,
+            "last_poll": {
+                "polled_at": utc_now().isoformat(),
+                "time_remaining_seconds": preflight["market"]["seconds_to_expiry"],
+                "time_remaining_minutes": round(preflight["market"]["seconds_to_expiry"] / 60, 1),
+                "market_trade_count": len(market_trades),
+                "trade_counts": trade_counts,
+            },
+            "open_orders": {
+                "count": len(orders),
+                "orders": orders,
+            },
+            "tracked_orders": {
+                "count": len(tracked_orders),
+                "active_count": len(self.portfolio.list_active_live_orders(limit=50)),
+                "terminal_count": len(self.portfolio.list_terminal_live_orders(limit=50)),
+                "orders": tracked_orders,
+            },
+            "recent_trades": {
+                "count": len(trades),
+                "trades": trades,
+            },
+        }
+        self.journal.log_event("live_activity", payload)
+        return payload
+
+    @staticmethod
+    def _trade_side_counts(trades: Iterable[dict], yes_token_id: str = "", no_token_id: str = "") -> dict:
+        counts = {"yes": 0, "no": 0, "other": 0, "total": 0}
+        for trade in trades:
+            counts["total"] += 1
+            asset_id = str(trade.get("asset_id") or "")
+            side = str(trade.get("side") or "").strip().upper()
+            outcome = str(trade.get("outcome") or "").strip().upper()
+            if outcome == "YES":
+                counts["yes"] += 1
+            elif outcome == "NO":
+                counts["no"] += 1
+            elif yes_token_id and asset_id == yes_token_id:
+                counts["yes"] += 1
+            elif no_token_id and asset_id == no_token_id:
+                counts["no"] += 1
+            elif side == "YES":
+                counts["yes"] += 1
+            elif side == "NO":
+                counts["no"] += 1
+            else:
+                counts["other"] += 1
+        return counts
+
+    def live_reconcile(self, market_id: str | None = None, trade_limit: int = 20, order_limit: int = 50) -> dict:
+        auth = self._auth_status_dict(self.polymarket.probe_live_readiness())
+        if not auth["readonly_ready"]:
+            raise RuntimeError("Authenticated live reconciliation requires readonly_ready auth.")
+        preflight = self.live_preflight(market_id)
+        tracked = self.refresh_live_order_tracking(limit=order_limit)
+        trades = self.live_trades(market_id=preflight["market_id"], limit=trade_limit)
+        payload = {
+            "readonly": True,
+            "market_id": preflight["market_id"],
+            "auth": auth,
+            "preflight": preflight,
+            "tracked_orders": tracked,
+            "recent_trades": trades,
+        }
+        self.journal.log_event("live_reconcile", payload)
+        return payload
+
+    def safety_stop_reason(
+        self,
+        account_state: AccountState | None = None,
+        heartbeat_age_seconds: float | None = None,
+        auth_readonly_ready: bool | None = None,
+    ) -> str | None:
+        """Return a non-null reason if the daemon should halt trading.
+
+        Daemon-wide kill-switch reasons only — these halt EVERY strategy.
+        ``daily_loss_limit`` is now enforced per-strategy by RiskEngine
+        (uses the strategy-scoped ``account_state.daily_realized_pnl``),
+        so a single losing scorer no longer freezes the whole daemon.
+
+        The optional keyword args let callers layer in operational signals
+        they already have — e.g. the daemon passes its heartbeat age so the
+        API / CLI can share the same determination.
+        """
+        state = account_state or self.portfolio.get_account_state(ExecutionMode(self.settings.trading_mode))
+        if state.rejected_orders >= self.settings.max_rejected_orders:
+            return "rejected_order_limit"
+        max_streak = int(self.settings.max_consecutive_losses)
+        if max_streak > 0 and self.portfolio.get_consecutive_losses(limit=max_streak) >= max_streak:
+            return "consecutive_loss_limit"
+        if (
+            auth_readonly_ready is False
+            and ExecutionMode(self.settings.trading_mode) == ExecutionMode.LIVE
+        ):
+            return "auth_not_ready"
+        if (
+            heartbeat_age_seconds is not None
+            and heartbeat_age_seconds > float(self.settings.daemon_heartbeat_stale_seconds)
+        ):
+            return "daemon_heartbeat_stale"
+        return None
+
+    @staticmethod
+    def _auth_status_dict(auth_status) -> dict:
+        return {
+            "private_key_configured": auth_status.private_key_configured,
+            "funder_configured": auth_status.funder_configured,
+            "signature_type": auth_status.signature_type,
+            "live_client_constructible": auth_status.live_client_constructible,
+            "missing": auth_status.missing,
+            "wallet_address": auth_status.wallet_address,
+            "api_credentials_derived": auth_status.api_credentials_derived,
+            "server_ok": auth_status.server_ok,
+            "readonly_ready": auth_status.readonly_ready,
+            "probe_attempted": auth_status.probe_attempted,
+            "collateral_address": auth_status.collateral_address,
+            "balance": auth_status.balance,
+            "allowance": auth_status.allowance,
+            "open_orders_count": auth_status.open_orders_count,
+            "open_orders_markets": auth_status.open_orders_markets,
+            "diagnostics_collected": auth_status.diagnostics_collected,
+            "errors": auth_status.errors,
+        }

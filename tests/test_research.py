@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from polymarket_ai_agent.engine.research import ResearchEngine
+from polymarket_trading_engine.engine.research import ResearchEngine
 
 
 def test_research_engine_builds_evidence_packet(market_snapshot) -> None:

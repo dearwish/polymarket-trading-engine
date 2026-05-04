@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from polymarket_ai_agent.config import EDITABLE_SETTINGS_METADATA
-from polymarket_ai_agent.initial_settings import INITIAL_SETTINGS_BASELINE
+from polymarket_trading_engine.config import EDITABLE_SETTINGS_METADATA
+from polymarket_trading_engine.initial_settings import INITIAL_SETTINGS_BASELINE
 
 
 def test_baseline_keyset_matches_editable_metadata() -> None:

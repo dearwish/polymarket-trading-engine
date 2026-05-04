@@ -8,10 +8,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from polymarket_ai_agent.config import Settings
-from polymarket_ai_agent.engine.adaptive_scoring import AdaptiveScorer
-from polymarket_ai_agent.engine.quant_scoring import QuantScoringEngine
-from polymarket_ai_agent.types import EvidencePacket, SuggestedSide
+from polymarket_trading_engine.config import Settings
+from polymarket_trading_engine.engine.adaptive_scoring import AdaptiveScorer
+from polymarket_trading_engine.engine.quant_scoring import QuantScoringEngine
+from polymarket_trading_engine.types import EvidencePacket, SuggestedSide
 
 
 def _settings(tmp_path: Path) -> Settings:
@@ -116,7 +116,7 @@ def test_adaptive_delegates_to_fade_in_trending_up(tmp_path: Path) -> None:
     # Must NOT use the maker-routing tag anymore — the daemon's
     # paper-maker lifecycle should never fire from adaptive until we
     # re-architect the follow branch.
-    from polymarket_ai_agent.engine.adaptive_scoring import ADAPTIVE_FOLLOW_MAKER_TAG
+    from polymarket_trading_engine.engine.adaptive_scoring import ADAPTIVE_FOLLOW_MAKER_TAG
     assert adaptive_result.raw_model_output != ADAPTIVE_FOLLOW_MAKER_TAG
 
 
@@ -135,7 +135,7 @@ def test_adaptive_delegates_to_fade_in_trending_down(tmp_path: Path) -> None:
     adaptive_result = adaptive.score_market(packet)
     assert adaptive_result.suggested_side == fade_result.suggested_side
     assert adaptive_result.edge == fade_result.edge
-    from polymarket_ai_agent.engine.adaptive_scoring import ADAPTIVE_FOLLOW_MAKER_TAG
+    from polymarket_trading_engine.engine.adaptive_scoring import ADAPTIVE_FOLLOW_MAKER_TAG
     assert adaptive_result.raw_model_output != ADAPTIVE_FOLLOW_MAKER_TAG
 
 

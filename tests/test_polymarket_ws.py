@@ -1,4 +1,4 @@
-from polymarket_ai_agent.connectors.polymarket_ws import PolymarketMarketStream, PolymarketUserStream
+from polymarket_trading_engine.connectors.polymarket_ws import PolymarketMarketStream, PolymarketUserStream
 
 
 def test_market_stream_parses_event_message() -> None:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from polymarket_ai_agent.engine.market_state import MarketState
+from polymarket_trading_engine.engine.market_state import MarketState
 
 
 def _ts(seconds: float) -> datetime:

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from polymarket_ai_agent.engine.migrations import MigrationRunner
-from polymarket_ai_agent.engine.settings_store import SettingsStore
+from polymarket_trading_engine.engine.migrations import MigrationRunner
+from polymarket_trading_engine.engine.settings_store import SettingsStore
 
 
 def _fresh_db(tmp_path: Path) -> Path:

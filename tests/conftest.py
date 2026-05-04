@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from polymarket_ai_agent.config import Settings
-from polymarket_ai_agent.types import (
+from polymarket_trading_engine.config import Settings
+from polymarket_trading_engine.types import (
     MarketAssessment,
     MarketCandidate,
     MarketSnapshot,
@@ -26,7 +26,7 @@ def _isolate_env_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture()
 def settings(tmp_path: Path) -> Settings:
-    from polymarket_ai_agent.engine.migrations import MigrationRunner
+    from polymarket_trading_engine.engine.migrations import MigrationRunner
 
     s = Settings(
         openrouter_api_key="",
