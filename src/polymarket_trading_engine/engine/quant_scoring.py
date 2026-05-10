@@ -60,7 +60,17 @@ class QuantScoringEngine:
         # edge; with-trend and ranging trades use the normal threshold.
         gate_reason: str | None = None
         if side is not SuggestedSide.ABSTAIN:
-            gate_reason = self._regime_gate(packet, side, chosen_edge)
+            min_elapsed = int(self.settings.quant_min_candle_elapsed_seconds)
+            if (
+                min_elapsed > 0
+                and packet.time_elapsed_in_candle_s > 0
+                and packet.time_elapsed_in_candle_s < min_elapsed
+            ):
+                gate_reason = (
+                    f"Candle phase: {packet.time_elapsed_in_candle_s}s elapsed < min {min_elapsed}s."
+                )
+            else:
+                gate_reason = self._regime_gate(packet, side, chosen_edge)
             if gate_reason:
                 side = SuggestedSide.ABSTAIN
                 chosen_edge = 0.0
@@ -126,20 +136,23 @@ class QuantScoringEngine:
         z = drift / max(expected_stdev, 1e-9) if expected_stdev > 0 else 0.0
         damping = float(self.settings.quant_drift_damping)
         fair_from_drift = _normal_cdf(z * damping) if drift != 0.0 else 0.5
+        # Drift-only inversion. The imbalance tilt is applied AFTER the flip so
+        # book pressure always pushes fair_yes in its natural direction
+        # regardless of `quant_invert_drift`. Soak attribution showed
+        # against-imbalance trades lost -$0.51/trade vs +$0.83 with-imbalance —
+        # inverting the tilt alongside drift was systematically fading the
+        # book's most reliable signal.
+        inverted = bool(self.settings.quant_invert_drift)
+        if inverted:
+            fair_from_drift = 1.0 - fair_from_drift
         imbalance = max(-1.0, min(1.0, float(packet.imbalance_top5_yes)))
         tilt = imbalance * float(self.settings.quant_imbalance_tilt)
         fair_yes = fair_from_drift + tilt
-        # Mean-reversion inversion test: flip fair_yes if the flag is set.
-        # Applied post-tilt so both drift and imbalance signals reverse sign
-        # consistently. Only affects output; all intermediate math stays the same.
-        inverted = bool(self.settings.quant_invert_drift)
-        if inverted:
-            fair_yes = 1.0 - fair_yes
         fair_yes = max(0.01, min(0.99, fair_yes))
         reasons = [
             f"z={z:+.2f} drift={drift:+.5f} σ_per_s={sigma_per_second:.6f} expected_stdev={expected_stdev:.5f}",
             f"imbalance tilt={tilt:+.4f} base_fair={fair_from_drift:.4f} fair_yes={fair_yes:.4f}"
-            + (" [inverted]" if inverted else ""),
+            + (" [drift inverted]" if inverted else ""),
         ]
         return fair_yes, reasons
 

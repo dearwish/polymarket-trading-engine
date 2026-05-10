@@ -13,13 +13,15 @@ from polymarket_trading_engine.engine.settings_store import SettingsStore
 
 
 TARGETS: dict[str, object] = {
-    # Fixed stop-loss: effectively disabled. Binary payoff bounds max loss to entry cost.
-    "paper_stop_loss_pct": 0.95,
+    # Tightened from 0.95 (effectively-disabled) to 0.40: post-tuning soak showed
+    # win-rate climbed but avg PnL per trade got 2-2.5x worse — losers ran to near-full
+    # position loss. Cap individual loss tail while still giving signals time to play out.
+    "paper_stop_loss_pct": 0.40,
     # Trailing stop: arm later (let position prove itself), trail wider (don't trim winners).
     "paper_trail_arm_pct": 0.15,
     "paper_trailing_stop_pct": 0.40,
-    # Adaptive v2 also disables fixed SL via its per-strategy override.
-    "adaptive_v2_stop_loss_pct": 0.95,
+    # Adaptive v2 mirrors the shared SL.
+    "adaptive_v2_stop_loss_pct": 0.40,
     # Entry filter: edge in [0.15, 0.20) bucket lost on both strategies (adverse selection
     # during breakouts). Edge >= 0.20 was the only profitable bucket. Raise the floor.
     "min_edge": 0.20,

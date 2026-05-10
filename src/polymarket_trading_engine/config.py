@@ -249,6 +249,17 @@ class Settings(BaseSettings):
     # same short-horizon momentum thesis that flipped fade from −16% ROI
     # to break-even should apply here too.
     adaptive_v2_invert: bool = False
+    # Top-5 book-imbalance gate. When enabled, abstain on entries where the
+    # book pressure opposes the chosen side with magnitude
+    # ``≥ adaptive_v2_imbalance_gate_min_abs``. Soak attribution showed the
+    # against-pressure bucket bled -$0.17/trade vs +$0.66 with-pressure.
+    # Mirrors the OFI gate already shared with the quant scorer.
+    adaptive_v2_imbalance_gate_enabled: bool = False
+    adaptive_v2_imbalance_gate_min_abs: float = 0.10
+    # Skip adaptive_v2 entries during the first N seconds of the candle.
+    # Soak attribution: candle_phase=0-60s lost -$0.82/trade — the largest
+    # single kill bucket for this strategy. 0 disables.
+    adaptive_v2_min_candle_elapsed_seconds: int = 0
 
     # Market-maker strategy. Posts a two-sided quote (YES-buy + NO-buy)
     # around the book mid, captures the spread when both legs fill, and
@@ -475,6 +486,14 @@ class Settings(BaseSettings):
     # predictor per Cont et al. 2014. Only fires when |flow| >= min_abs_flow.
     quant_ofi_gate_enabled: bool = False
     quant_ofi_gate_min_abs_flow: float = 30.0
+
+    # Skip entries during the first N seconds of the 15-minute candle. The
+    # drift-since-candle-open signal is unstable when the candle has barely
+    # opened — soak attribution showed candle_phase=0-60s lost -$0.31/trade
+    # vs +$0.35 in the 60-300s bucket. Only applies when the packet carries
+    # a non-zero ``time_elapsed_in_candle_s``; threshold markets are unaffected.
+    # 0 disables.
+    quant_min_candle_elapsed_seconds: int = 0
 
     # Volatility regime gate: raise edge bar or abstain in high-vol conditions
     # where GBM fair-value estimates are less reliable (wider confidence intervals).
@@ -763,6 +782,27 @@ EDITABLE_SETTINGS_METADATA: dict[str, dict[str, Any]] = {
     "adaptive_v2_invert": {
         "label": "Adaptive V2 Invert (continuation instead of reversion)",
         "type": "boolean",
+        "group": "thresholds",
+    },
+    "adaptive_v2_imbalance_gate_enabled": {
+        "label": "Adaptive V2 Imbalance Gate Enabled",
+        "type": "boolean",
+        "group": "thresholds",
+    },
+    "adaptive_v2_imbalance_gate_min_abs": {
+        "label": "Adaptive V2 Imbalance Gate Min |Imbalance|",
+        "type": "number",
+        "min": 0,
+        "max": 1,
+        "step": 0.01,
+        "group": "thresholds",
+    },
+    "adaptive_v2_min_candle_elapsed_seconds": {
+        "label": "Adaptive V2 Min Candle Elapsed (s)",
+        "type": "number",
+        "min": 0,
+        "max": 900,
+        "step": 1,
         "group": "thresholds",
     },
     "mm_enabled": {
@@ -1083,6 +1123,7 @@ EDITABLE_SETTINGS_METADATA: dict[str, dict[str, Any]] = {
     "quant_max_entry_price": {"label": "Max Entry Price", "type": "number", "min": 0, "max": 1, "step": 0.01, "group": "thresholds"},
     "quant_ofi_gate_enabled": {"label": "OFI Gate Enabled", "type": "boolean", "group": "thresholds"},
     "quant_ofi_gate_min_abs_flow": {"label": "OFI Gate Min |Flow|", "type": "number", "min": 0, "max": 10000, "step": 1, "group": "thresholds"},
+    "quant_min_candle_elapsed_seconds": {"label": "Quant Min Candle Elapsed (s)", "type": "number", "min": 0, "max": 900, "step": 1, "group": "thresholds"},
     "quant_vol_regime_enabled": {"label": "Vol Regime Enabled", "type": "boolean", "group": "thresholds"},
     "quant_vol_regime_high_threshold": {"label": "Vol Regime High Threshold", "type": "number", "min": 0, "max": 1, "step": 0.0005, "group": "thresholds"},
     "quant_vol_regime_extreme_threshold": {"label": "Vol Regime Extreme Threshold", "type": "number", "min": 0, "max": 1, "step": 0.0005, "group": "thresholds"},

@@ -239,6 +239,25 @@ def test_imbalance_tilts_fair_value(tmp_path: Path) -> None:
     assert bullish > baseline
 
 
+def test_imbalance_tilt_keeps_natural_sign_when_drift_inverted(tmp_path: Path) -> None:
+    """The imbalance tilt should always push fair_yes in the natural direction
+    regardless of ``quant_invert_drift``. Soak attribution showed that
+    inverting the tilt alongside drift was the single biggest loss source
+    (against-pressure trades bled $0.51/trade on fade)."""
+    settings = _settings(tmp_path, quant_invert_drift=True, quant_imbalance_tilt=0.10)
+    engine = QuantScoringEngine(settings)
+    # Strong YES book pressure should raise fair_yes even with drift inverted —
+    # imbalance is a continuation signal, not a contrarian one.
+    bullish = engine.score_market(_packet(imbalance_top5_yes=0.8)).fair_probability
+    bearish = engine.score_market(_packet(imbalance_top5_yes=-0.8)).fair_probability
+    assert bullish > bearish
+    # And without drift, the inverted base is still 0.5 so the tilt direction
+    # is purely the imbalance sign.
+    neutral = engine.score_market(_packet(imbalance_top5_yes=0.0)).fair_probability
+    assert abs(neutral - 0.5) < 1e-6
+    assert bullish > neutral > bearish
+
+
 def test_edge_subtracts_ask_and_costs(tmp_path: Path) -> None:
     settings = _settings(tmp_path, quant_slippage_baseline_bps=0.0, quant_slippage_spread_coef=0.0, fee_bps=0.0)
     engine = QuantScoringEngine(settings)

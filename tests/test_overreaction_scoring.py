@@ -353,6 +353,79 @@ def test_ofi_gate_disabled_by_default() -> None:
     assert result.suggested_side == SuggestedSide.YES
 
 
+def test_imbalance_gate_blocks_when_pressure_opposes_side() -> None:
+    """Strong NO-side book pressure (imbalance_top5_yes < 0) opposes a YES
+    bet — abstain. Mirrors the OFI gate; targets the same against-flow
+    population the soak attribution flagged."""
+    scorer = OverreactionScorer(
+        overreaction_threshold=0.02, sensitivity=10.0,
+        imbalance_gate_enabled=True, imbalance_gate_min_abs=0.10,
+    )
+    # Mid dropped → bet YES, but heavy NO-side book pressure → abstain.
+    packet = _packet(
+        recent_price_change_bps=-400.0, btc_log_return_5m=0.0,
+        imbalance_top5_yes=-0.5,
+    )
+    result = scorer.score_market(packet)
+    assert result.suggested_side == SuggestedSide.ABSTAIN
+    assert any("Imbalance gate" in r for r in result.reasons_to_abstain)
+
+
+def test_imbalance_gate_allows_when_pressure_aligns_with_side() -> None:
+    scorer = OverreactionScorer(
+        overreaction_threshold=0.02, sensitivity=10.0,
+        imbalance_gate_enabled=True, imbalance_gate_min_abs=0.10,
+    )
+    # Mid dropped → bet YES; heavy YES pressure → allow.
+    packet = _packet(
+        recent_price_change_bps=-400.0, btc_log_return_5m=0.0,
+        imbalance_top5_yes=0.5,
+    )
+    result = scorer.score_market(packet)
+    assert result.suggested_side == SuggestedSide.YES
+    assert not any("Imbalance gate" in r for r in result.reasons_to_abstain)
+
+
+def test_imbalance_gate_passes_when_below_threshold() -> None:
+    scorer = OverreactionScorer(
+        overreaction_threshold=0.02, sensitivity=10.0,
+        imbalance_gate_enabled=True, imbalance_gate_min_abs=0.30,
+    )
+    packet = _packet(
+        recent_price_change_bps=-400.0, btc_log_return_5m=0.0,
+        imbalance_top5_yes=-0.10,
+    )
+    result = scorer.score_market(packet)
+    assert result.suggested_side == SuggestedSide.YES
+
+
+def test_imbalance_gate_disabled_by_default() -> None:
+    scorer = OverreactionScorer(overreaction_threshold=0.02, sensitivity=10.0)
+    packet = _packet(
+        recent_price_change_bps=-400.0, btc_log_return_5m=0.0,
+        imbalance_top5_yes=-0.9,
+    )
+    result = scorer.score_market(packet)
+    assert result.suggested_side == SuggestedSide.YES
+
+
+def test_min_candle_elapsed_blocks_early_candle_entries() -> None:
+    scorer = OverreactionScorer(
+        overreaction_threshold=0.02, sensitivity=10.0,
+        min_candle_elapsed_seconds=60,
+    )
+    early = _packet(
+        recent_price_change_bps=-400.0, btc_log_return_5m=0.0,
+        time_elapsed_in_candle_s=30,
+    )
+    assert scorer.score_market(early).suggested_side == SuggestedSide.ABSTAIN
+    late = _packet(
+        recent_price_change_bps=-400.0, btc_log_return_5m=0.0,
+        time_elapsed_in_candle_s=120,
+    )
+    assert scorer.score_market(late).suggested_side == SuggestedSide.YES
+
+
 def test_invert_flips_upward_overreaction_to_yes() -> None:
     """With ``invert=True``, an upward overshoot bets YES (continuation)
     instead of NO (reversion). Mirrors quant_invert_drift on fade after

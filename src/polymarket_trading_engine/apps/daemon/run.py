@@ -408,6 +408,9 @@ class DaemonRunner:
             ofi_gate_enabled=bool(settings.quant_ofi_gate_enabled),
             ofi_gate_min_abs_flow=float(settings.quant_ofi_gate_min_abs_flow),
             invert=bool(settings.adaptive_v2_invert),
+            imbalance_gate_enabled=bool(settings.adaptive_v2_imbalance_gate_enabled),
+            imbalance_gate_min_abs=float(settings.adaptive_v2_imbalance_gate_min_abs),
+            min_candle_elapsed_seconds=int(settings.adaptive_v2_min_candle_elapsed_seconds),
         )
         self.market_maker = MarketMakerScorer(
             min_tte_seconds=int(settings.mm_min_tte_seconds),
@@ -3443,6 +3446,9 @@ class DaemonRunner:
             ofi_gate_enabled=bool(new_settings.quant_ofi_gate_enabled),
             ofi_gate_min_abs_flow=float(new_settings.quant_ofi_gate_min_abs_flow),
             invert=bool(new_settings.adaptive_v2_invert),
+            imbalance_gate_enabled=bool(new_settings.adaptive_v2_imbalance_gate_enabled),
+            imbalance_gate_min_abs=float(new_settings.adaptive_v2_imbalance_gate_min_abs),
+            min_candle_elapsed_seconds=int(new_settings.adaptive_v2_min_candle_elapsed_seconds),
         )
         self.market_maker = MarketMakerScorer(
             min_tte_seconds=int(new_settings.mm_min_tte_seconds),

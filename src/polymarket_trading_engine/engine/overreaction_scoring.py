@@ -73,6 +73,9 @@ class OverreactionScorer:
         ofi_gate_enabled: bool = False,
         ofi_gate_min_abs_flow: float = 0.0,
         invert: bool = False,
+        imbalance_gate_enabled: bool = False,
+        imbalance_gate_min_abs: float = 0.10,
+        min_candle_elapsed_seconds: int = 0,
     ):
         self.overreaction_threshold = overreaction_threshold
         self.sensitivity = sensitivity
@@ -101,6 +104,15 @@ class OverreactionScorer:
         # than they revert, so the original mean-reversion thesis was the
         # wrong sign of the signal.
         self.invert = invert
+        # Top-5 book-imbalance gate. Abstains when the chosen side opposes
+        # book pressure with magnitude ≥ ``imbalance_gate_min_abs``. Soak
+        # attribution: against-pressure trades bled -$0.17/trade vs +$0.66
+        # with-pressure. Asymmetric — never blocks with-pressure entries.
+        self.imbalance_gate_enabled = imbalance_gate_enabled
+        self.imbalance_gate_min_abs = imbalance_gate_min_abs
+        # Candle-phase floor: skip the first N seconds of the candle.
+        # Drift-since-open and pm_move signals are unstable at cold start.
+        self.min_candle_elapsed_seconds = min_candle_elapsed_seconds
 
     def score_market(self, packet: EvidencePacket) -> MarketAssessment:
         """Return an APPROVED assessment when the packet shows a
@@ -132,6 +144,23 @@ class OverreactionScorer:
                 (
                     f"Overreaction: TTE {packet.seconds_to_expiry}s < min "
                     f"{self.min_seconds_to_expiry}s — reversion can't fire in time."
+                ),
+            )
+
+        # Candle-phase floor: drift-since-open and pm_move are noisy when
+        # the candle has barely opened. Only fires when the packet carries
+        # a non-zero ``time_elapsed_in_candle_s`` (threshold markets pass
+        # zero and skip this check).
+        if (
+            self.min_candle_elapsed_seconds > 0
+            and packet.time_elapsed_in_candle_s > 0
+            and packet.time_elapsed_in_candle_s < self.min_candle_elapsed_seconds
+        ):
+            return _with_reason(
+                base,
+                (
+                    f"Overreaction: candle elapsed {packet.time_elapsed_in_candle_s}s "
+                    f"< min {self.min_candle_elapsed_seconds}s."
                 ),
             )
 
@@ -188,6 +217,22 @@ class OverreactionScorer:
                     return _with_reason(
                         base,
                         f"OFI gate: flow {flow:+.1f} opposes {side.value}.",
+                    )
+
+        # Imbalance gate: abstain when top-5 book pressure opposes the
+        # chosen side with magnitude ≥ ``imbalance_gate_min_abs``.
+        # ``imbalance_top5_yes > 0`` means YES side has more depth (bullish
+        # pressure); opposes a NO bet.
+        if self.imbalance_gate_enabled and self.imbalance_gate_min_abs > 0.0:
+            imb = float(packet.imbalance_top5_yes)
+            if abs(imb) >= self.imbalance_gate_min_abs:
+                yes_pressure = imb > 0.0
+                if (side is SuggestedSide.YES and not yes_pressure) or (
+                    side is SuggestedSide.NO and yes_pressure
+                ):
+                    return _with_reason(
+                        base,
+                        f"Imbalance gate: top5 {imb:+.3f} opposes {side.value}.",
                     )
 
         # Fair-probability for the SCORER's frame — the direction we're

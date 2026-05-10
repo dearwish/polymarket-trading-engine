@@ -111,10 +111,22 @@ INITIAL_SETTINGS_BASELINE: dict[str, Any] = {
     "adaptive_v2_sensitivity": 10.0,
     "adaptive_v2_cost_floor": 0.005,
     "adaptive_v2_min_seconds_to_expiry": 60,
-    "adaptive_v2_max_abs_edge": 0.30,
+    # Tightened from 0.30 (2026-05-09 attribution): high-edge bucket
+    # held the worst PnL for adaptive_v2 — overshoots ≥ 0.15 are
+    # typically real BTC moves leaking through, not mid noise.
+    "adaptive_v2_max_abs_edge": 0.15,
     "adaptive_v2_post_only": True,
     "adaptive_v2_stop_loss_pct": 0.10,
     "adaptive_v2_invert": True,
+    # Imbalance gate: abstain when book pressure opposes the chosen side
+    # with magnitude ≥ 0.10. Soak attribution showed against-pressure
+    # bled -$0.17/trade vs +$0.66 with-pressure on adaptive_v2.
+    "adaptive_v2_imbalance_gate_enabled": True,
+    "adaptive_v2_imbalance_gate_min_abs": 0.10,
+    # Per-scorer candle-elapsed floor. 0 disables — the global
+    # ``min_candle_elapsed_seconds`` already gates btc_15m at 60s; this
+    # exists for finer-grained control if needed.
+    "adaptive_v2_min_candle_elapsed_seconds": 0,
     # Market-maker strategy (V1). Off by default; flip ``mm_enabled`` true
     # to soak it side-by-side with the directional scorers. Defaults are
     # the conservative starting point: $1 per leg, 2¢ half-spread, 10¢
@@ -155,7 +167,10 @@ INITIAL_SETTINGS_BASELINE: dict[str, Any] = {
     # --- Quant scorer gates ---
     "quant_invert_drift": True,
     "quant_drift_damping": 0.5,
-    "quant_max_abs_edge": 0.25,
+    # Tightened from 0.25 (2026-05-09 attribution): edge=[0.20, 0.25)
+    # bucket lost -$0.71/trade — high-conviction picks are systematically
+    # the worst PnL.
+    "quant_max_abs_edge": 0.20,
     "quant_trend_filter_enabled": True,
     "quant_trend_filter_min_abs_return": 0.003,
     "quant_trend_opposed_strong_min_edge": 0.25,
@@ -164,7 +179,11 @@ INITIAL_SETTINGS_BASELINE: dict[str, Any] = {
     "quant_min_entry_price": 0.32,
     "quant_max_entry_price": 0.50,
     "quant_ofi_gate_enabled": True,
-    "quant_ofi_gate_min_abs_flow": 25.0,
+    # Tightened from 25.0 (2026-05-09 attribution): adverse-flow trades
+    # in the [5, 25) range bled -$0.39/trade. Lowering the threshold
+    # is asymmetric — only blocks against-flow entries, never with-flow.
+    "quant_ofi_gate_min_abs_flow": 5.0,
+    "quant_min_candle_elapsed_seconds": 0,
     "quant_vol_regime_enabled": True,
     "quant_vol_regime_high_threshold": 0.005,
     "quant_vol_regime_extreme_threshold": 0.008,
