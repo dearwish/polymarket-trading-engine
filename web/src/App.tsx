@@ -1767,9 +1767,94 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
   // strategies with zero closed positions don't appear (they have no
   // curve to draw anyway).
   const [equityStrategy, setEquityStrategy] = useState<string>("all");
-  const equityStrategies = (equityCurve?.per_strategy_series ?? []).map((s) => s.strategy_id);
   const selectedSeries = equityCurve?.per_strategy_series?.find((s) => s.strategy_id === equityStrategy);
   const selectedSeriesPoints = selectedSeries?.points ?? [];
+
+  // Single source of truth for strategy filtering across every panel on this
+  // page. ``strategyEnabled`` mirrors the backend's per-strategy gate (fade
+  // is always on; everything else gates on ``{id}_enabled``). ``selectedOk``
+  // additionally honors the dropdown — ``"all"`` overlays every enabled
+  // strategy, a specific id narrows every panel to that one.
+  const enabledMap = settings?.values ?? {};
+  // strategy_id → settings flag. Most strategies use ``{id}_enabled`` but
+  // market_maker is the odd one out (``mm_enabled``); fade is structurally
+  // always on and has no toggle.
+  const STRATEGY_ENABLE_FLAG: Record<string, string | null> = {
+    fade: null,
+    adaptive: "adaptive_enabled",
+    adaptive_v2: "adaptive_v2_enabled",
+    penny: "penny_enabled",
+    market_maker: "mm_enabled",
+  };
+  const strategyEnabled = (s: string): boolean => {
+    if (!(s in STRATEGY_ENABLE_FLAG)) {
+      // Unknown strategy id — fall back to the ``{id}_enabled`` convention
+      // so a future scorer that follows the pattern doesn't get hidden.
+      const flag = enabledMap[`${s}_enabled`];
+      return flag !== false;
+    }
+    const flagKey = STRATEGY_ENABLE_FLAG[s];
+    if (flagKey === null) return true;
+    return enabledMap[flagKey] !== false;
+  };
+  const selectedOk = (s: string | null | undefined): boolean => {
+    const sid = s ?? "fade";
+    if (!strategyEnabled(sid)) return false;
+    return equityStrategy === "all" || sid === equityStrategy;
+  };
+  // Dropdown options: union of every strategy we have evidence of (closed
+  // curve, summary row, live tick, open position), filtered to the ones
+  // currently enabled. Stable order so the visual grouping is predictable.
+  const STRATEGY_ORDER = ["fade", "adaptive", "adaptive_v2", "penny", "market_maker"];
+  const knownStrategies = new Set<string>();
+  for (const row of summary?.per_strategy ?? []) knownStrategies.add(row.strategy_id);
+  for (const s of equityCurve?.per_strategy_series ?? []) knownStrategies.add(s.strategy_id);
+  for (const perStrat of Object.values(marketStrategyLookup)) {
+    for (const sid of Object.keys(perStrat)) knownStrategies.add(sid);
+  }
+  for (const p of openPositions) knownStrategies.add(p.strategy_id ?? "fade");
+  const displayStrategies = [...knownStrategies]
+    .filter(strategyEnabled)
+    .sort((a, b) => {
+      const ia = STRATEGY_ORDER.indexOf(a);
+      const ib = STRATEGY_ORDER.indexOf(b);
+      return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+    });
+
+  // Strategy-scoped views used by the metrics panel. When "all" we hand back
+  // the API-level summary (already enabled-only on the backend); when a
+  // specific strategy is chosen we project from per_strategy + closed
+  // positions list (the API doesn't break out daily PnL per strategy).
+  const selectedStrategyRow = equityStrategy === "all"
+    ? null
+    : summary?.per_strategy?.find((r) => r.strategy_id === equityStrategy) ?? null;
+  const dailyForSelected = (() => {
+    if (equityStrategy === "all") return null;
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    const startMs = start.getTime();
+    return positions
+      .filter((p) => (p.strategy_id ?? "fade") === equityStrategy)
+      .filter((p) => p.closed_at && new Date(p.closed_at).getTime() >= startMs)
+      .reduce((sum, p) => sum + p.realized_pnl, 0);
+  })();
+  const metricsTotalPnl = equityStrategy === "all"
+    ? summary?.total_realized_pnl
+    : selectedStrategyRow?.total_realized_pnl;
+  const metricsDailyPnl = equityStrategy === "all"
+    ? summary?.daily_realized_pnl
+    : dailyForSelected;
+  const metricsClosed = equityStrategy === "all"
+    ? summary?.closed_positions
+    : selectedStrategyRow?.closed_positions ?? 0;
+  const metricsExposure = equityStrategy === "all"
+    ? summary?.open_position_notional
+    : selectedStrategyRow?.open_notional;
+
+  // Visible position lists for the bottom panels.
+  const visibleOpenPositions = openPositions.filter((p) => selectedOk(p.strategy_id));
+  const visibleClosedPositions = positions.filter((p) => selectedOk(p.strategy_id));
+
   return (
     <section className="grid detail-grid">
       <article className="panel">
@@ -1784,7 +1869,7 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
                 style={{ fontSize: "12px" }}
               >
                 <option value="all">all (overlay)</option>
-                {equityStrategies.map((sid) => (
+                {displayStrategies.map((sid) => (
                   <option key={sid} value={sid}>{sid}</option>
                 ))}
               </select>
@@ -1808,17 +1893,20 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
       <article className="panel">
         <div className="panel-header">
           <h2>Portfolio Metrics</h2>
-          <span>Realized performance</span>
+          <span>{equityStrategy === "all" ? "Realized performance" : `Strategy: ${equityStrategy}`}</span>
         </div>
         <dl>
-          <div><dt>Total Realized PnL</dt><dd>{formatMoney(summary?.total_realized_pnl)}</dd></div>
-          <div><dt>Daily Realized PnL</dt><dd>{formatMoney(summary?.daily_realized_pnl)}</dd></div>
-          <div><dt>Closed Positions</dt><dd>{summary?.closed_positions ?? 0}</dd></div>
-          <div><dt>Exposure</dt><dd>{formatMoney(summary?.open_position_notional)}</dd></div>
+          <div><dt>Total Realized PnL</dt><dd>{formatMoney(metricsTotalPnl)}</dd></div>
+          <div><dt>Daily Realized PnL</dt><dd>{formatMoney(metricsDailyPnl)}</dd></div>
+          <div><dt>Closed Positions</dt><dd>{metricsClosed ?? 0}</dd></div>
+          <div><dt>Exposure</dt><dd>{formatMoney(metricsExposure)}</dd></div>
         </dl>
       </article>
 
-      {summary?.per_strategy && summary.per_strategy.length > 0 && (
+      {(() => {
+        const filteredPerStrategy = (summary?.per_strategy ?? []).filter((row) => selectedOk(row.strategy_id));
+        if (!filteredPerStrategy.length) return null;
+        return (
         <article className="panel full-span">
           <div className="panel-header">
             <h2>Per-Strategy Stats</h2>
@@ -1839,7 +1927,7 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
                 </tr>
               </thead>
               <tbody>
-                {summary.per_strategy.map((row) => {
+                {filteredPerStrategy.map((row) => {
                   const pnlCls = row.total_realized_pnl >= 0 ? "positive" : "negative";
                   const sign = row.total_realized_pnl >= 0 ? "+" : "";
                   return (
@@ -1859,7 +1947,8 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
             </table>
           </div>
         </article>
-      )}
+        );
+      })()}
 
       {(() => {
         const activeIds: string[] = hb?.active_market_ids ?? [];
@@ -1868,26 +1957,11 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
         // happened to fire last collapsing them all into one row.
         type Row = { marketId: string; strategyId: string; tick: DaemonTickPayload };
         const rows: Row[] = [];
-        // Stable strategy order so the visual grouping matches the rest
-        // of the dashboard (fade column first, penny last).
-        const STRATEGY_ORDER = ["fade", "adaptive", "penny"];
-        // Drop rows for strategies that are currently disabled in settings —
-        // the lookup keeps the last-known tick for ~5000-event window, which
-        // can persist for several minutes after a strategy is toggled off.
-        // Filtering by current enable-state hides them immediately. Fade is
-        // always on (no enable flag); the others gate on their *_enabled
-        // setting (default true when missing so legacy daemons aren't hidden).
-        const enabledMap = settings?.values ?? {};
-        const strategyEnabled = (s: string): boolean => {
-          if (s === "fade") return true;
-          const flag = enabledMap[`${s}_enabled`];
-          return flag !== false;
-        };
         for (const marketId of activeIds) {
           const perStrategy = marketStrategyLookup[marketId];
           if (!perStrategy) continue;
           const strategyIds = Object.keys(perStrategy)
-            .filter(strategyEnabled)
+            .filter(selectedOk)
             .sort((a, b) => {
               const ia = STRATEGY_ORDER.indexOf(a);
               const ib = STRATEGY_ORDER.indexOf(b);
@@ -1905,11 +1979,12 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
         }
         if (!rows.length) return null;
         const distinctMarkets = new Set(rows.map((r) => r.marketId)).size;
+        const distinctStrategies = new Set(rows.map((r) => r.strategyId)).size;
         return (
           <article className="panel full-span">
             <div className="panel-header">
               <h2>Last Signal</h2>
-              <span>{distinctMarkets} active market{distinctMarkets === 1 ? "" : "s"} × {STRATEGY_ORDER.filter((s) => rows.some((r) => r.strategyId === s)).length} strategies</span>
+              <span>{distinctMarkets} active market{distinctMarkets === 1 ? "" : "s"} × {distinctStrategies} strateg{distinctStrategies === 1 ? "y" : "ies"}</span>
             </div>
             <div className="table-wrap">
               <table>
@@ -1967,9 +2042,31 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
         // Show even when there are no open positions.
         const activeIds: string[] = hb?.active_market_ids ?? [];
         const slugOverrides: Record<string, string> = hb?.active_market_slugs ?? {};
-        const seen = new Set<string>(activeIds);
-        const allIds = [...activeIds];
-        for (const position of openPositions) {
+        // Only show markets that (a) have at least one tick from an enabled
+        // strategy AND (b) are in the active market_family. ``active_market_ids``
+        // pins markets the daemon is managing (e.g. open mm_universe positions on
+        // long-dated political markets) regardless of strategy enable state, and
+        // the dashboard's ~5000-event tick cache holds stale fade ticks long
+        // after mm gets disabled. Gating on TTE ≤ 15min naturally excludes any
+        // non-family market — every BTC 15m candle has TTE ≤ 900s by definition;
+        // mm_universe markets (e.g. "Iran peace deal by 2026") have TTE in days.
+        // NOTE: 900 hard-coded for the btc_15m family. Make this derive from the
+        // configured market_family if/when we run multiple families.
+        const FAMILY_TTE_CEILING = 900;
+        const strategyHasMarket = (id: string): boolean => {
+          const perStrategy = marketStrategyLookup[id];
+          if (!perStrategy) return false;
+          for (const [sid, tick] of Object.entries(perStrategy)) {
+            if (!selectedOk(sid)) continue;
+            if (tick.seconds_to_expiry <= FAMILY_TTE_CEILING) return true;
+          }
+          return false;
+        };
+        const filteredActiveIds = activeIds.filter(strategyHasMarket);
+        const filteredOpenPositions = openPositions.filter((p) => selectedOk(p.strategy_id));
+        const seen = new Set<string>(filteredActiveIds);
+        const allIds = [...filteredActiveIds];
+        for (const position of filteredOpenPositions) {
           if (!seen.has(position.market_id)) {
             seen.add(position.market_id);
             allIds.push(position.market_id);
@@ -2077,9 +2174,9 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
       <article className="panel full-span">
         <div className="panel-header">
           <h2>Open Positions</h2>
-          <span>{openPositions.length} currently held</span>
+          <span>{visibleOpenPositions.length} currently held</span>
         </div>
-        {openPositions.length === 0 ? (
+        {visibleOpenPositions.length === 0 ? (
           <div className="empty-state">No open positions.</div>
         ) : (
           <div className="table-wrap">
@@ -2099,7 +2196,7 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
                 </tr>
               </thead>
               <tbody>
-                {openPositions.map((position) => {
+                {visibleOpenPositions.map((position) => {
                   const tick = marketLookup[position.market_id];
                   const mark = currentTokenPrice(tick, position.side);
                   let unrealizedCell: ReactNode;
@@ -2198,8 +2295,8 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
                 // Build base + tranche labels once per render from the full
                 // list so T1/T2 ordering is chronological regardless of the
                 // reversed display order.
-                const tradeIdMap = buildTradeIdMap(positions.map((p) => p.order_id));
-                return [...positions].reverse().map((position) => {
+                const tradeIdMap = buildTradeIdMap(visibleClosedPositions.map((p) => p.order_id));
+                return [...visibleClosedPositions].reverse().map((position) => {
                   const pnlPct = position.size_usd > 0 ? (position.realized_pnl / position.size_usd) : 0;
                   const pnlCls = position.realized_pnl >= 0 ? "positive" : "negative";
                   const sign = position.realized_pnl >= 0 ? "+" : "";
@@ -2238,7 +2335,7 @@ function PortfolioPage({ summary, positions, openPositions, equityCurve, daemonT
               })()}
             </tbody>
           </table>
-          {!positions.length && <div className="empty-state">No closed positions yet.</div>}
+          {!visibleClosedPositions.length && <div className="empty-state">No closed positions yet.</div>}
         </div>
       </article>
       {timelineOrderId && (
